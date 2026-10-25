@@ -846,7 +846,7 @@ class RootChain extends ChangeNotifier {
           'P645_NDEL=7 P645_DEL_RUN_MS=2500 P645_CONC=1 P645_ANON_MB=8 P645_FREEZE=1 P645_V8=1 '
           'P645_DRAIN_WAIT_MS=25000 P645_PIPE512=64 P645_SOCKS=64 P645_SOCK_MB=8 P645_UHID=0 '
           'P645_MODE=4 P645_ANON2_MB=1024 P645_PIPE_DRAIN=1 P645_PIPE_K=4 P645_SCAN_STOP=1 '
-          'P645_THRESH=32 P645_RING_GO=0 P645_FORCE_LEFT=$selinuxAlias P645_LOG=$logPath';
+          'P645_THRESH=32 P645_RING_GO=0 P645_FORCE_LEFT=${calib.selinuxZeroTargetHex} P645_LOG=$logPath';
       _log('[permissive] run ${run + 1}: 开打（约 30–60s）');
       final r = await ShizukuShell.run(
         'cd $workDir && chmod 755 x645 && $env ./x645 2>&1; echo "RC=\$?"',

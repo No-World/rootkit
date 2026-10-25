@@ -1,5 +1,20 @@
 # 变更记录
 
+## v1.0.16 — 2026-10-25
+- **修复：跑完链后相机崩溃 / 系统服务连环崩（本次核心）**
+  根因：零写原语是 8 字节 store，之前直接写 `selinux_state` 基址，会连带清零 +1 的 `initialized`
+  ⇒ 内核报 `security_sid_to_context_core: called before initializing` ⇒ **binder 取不到安全上下文**，
+  于是系统服务成片失效：相机 HAL `CamX::Actuator::AcquireResources` 空指针（provider 段错误→
+  `cameraserver` 把 22 个 device 全摘→相机 App 闪退）、`com.android.phone` 报
+  `selinux_android_setcontext failed` 自杀、输入法/应用 `start timeout` 被 AM 杀。
+  且**软重启不清内核**，所以「重启也修不好」，必须硬重启。
+- 修法：零写落点从 `selinux_state` 改为 **`selinux_state − 7`**，8 字节覆盖 `[base−7 … base]`，
+  最后一个字节恰好是 `enforcing`，`initialized`(+1) 与 `status_page`(+8) 完好；
+  base−7…base−1 是 `avc_latest_notif_update.notif_lock`（未持锁全 0，本机未开 DEBUG_SPINLOCK/LOCKDEP）
+  ⇒ 零写对它是 no-op。**做完仍是 Permissive（`getenforce`=Permissive），但 binder/AVC 正常工作。**
+- 真机验证：同 boot 内 `dmesg` 的 `before initializing|failed to get security context` 从「成片」降到 **0**，
+  相机正常出预览（devices=23），后续阶段与整链不受影响。
+
 ## v1.0.14 — 2026-10-25
 - **GitHub 图标改用 flutter_svg 真 SVG 渲染**：`assets/github.svg`（simple-icons 的 GitHub mark）
   + `SvgPicture.asset(colorFilter: srcIn)`，跟随主题色、任意尺寸清晰（替代手写的 CustomPainter 解析器）

@@ -121,6 +121,13 @@ cp android/key.properties.example android/key.properties    # 填自己的 keyst
 
 ## 5. 已知限制
 
+- **跑完链后个别系统 App 异常**（v1.0.15 及更早的已知问题，**v1.0.16 已修**）：
+  相机闪退、电话自杀、输入法/应用「启动超时」。根因是 permissive 的 8 字节零写把
+  `selinux_state.initialized`（+1）一起清零，导致 binder 取不到 SELinux 上下文。
+  修复后零写落点改为 `selinux_state − 7`，只清 `enforcing`。
+  若你用的是旧版并已中招：**硬重启**恢复（软重启只重启 zygote，内核状态不变，无效）。
+
+
 - **单轮成功率 ≈65%**：唯一的统计性失败是"命中后 landing 失败 → 内核 panic 重启"（实测约 35%/轮）；
   重启后需 `pm install -r` 重装（APK 常驻 `/data/local/tmp/rk_latest.apk`，约 30 秒），然后重跑。
 - 命中率受屏幕/温度/射频影响（App 每轮前会自动点屏 + 开飞行模式）；

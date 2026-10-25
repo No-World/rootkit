@@ -8,7 +8,7 @@ import 'shizuku.dart';
 import 'github_icon.dart';
 
 /// 版本号（与 pubspec 的 version 保持一致）
-const String kAppVersion = '1.0.15';
+const String kAppVersion = '1.0.16';
 
 /// 项目主页（AppBar 与选项里都可一键跳转）
 const String kRepoUrl = 'https://github.com/No-World/rootkit';
