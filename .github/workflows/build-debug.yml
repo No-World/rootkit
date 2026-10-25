@@ -1,0 +1,62 @@
+name: build-debug
+run-name: debug ${{ github.ref_name }}（仅编译校验，不签名不发布）
+
+# 编译校验版：PR / 任意分支（含 main）/ 手动触发
+# 产物包名 com.noworld.rootkit.debug（可与正式版共存），用 debug key 签名，不碰 release 签名 Secrets
+# 正式版构建只在打 tag 时由 build-release.yml 执行
+on:
+  pull_request:
+  push:
+    branches: [ '**' ]   # 只跟分支；tag 由 build-release.yml 负责，避免同一 tag 触发两份构建
+  workflow_dispatch:
+
+concurrency:
+  group: build-debug-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.5'
+          channel: stable
+          cache: true
+
+      # debug 变体同样需要签名，AGP 默认用 ~/.android/debug.keystore（DN: CN=Android Debug）。
+      # 可选：固定 debug 签名 key —— 不提供时 runner 每次生成新 key ⇒ 覆盖安装会签名冲突。
+      # 注意：secrets 上下文不能在 steps[*].if 里用（会整份 workflow 校验失败），要用 env 中转。
+      - name: Use stable debug keystore (optional)
+        env:
+          DEBUG_KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+        if: env.DEBUG_KEYSTORE_B64 != ''
+        run: |
+          mkdir -p ~/.android
+          echo "$DEBUG_KEYSTORE_B64" | base64 -d > ~/.android/debug.keystore
+          ls -la ~/.android/debug.keystore
+
+      - run: flutter pub get
+
+      - name: Build debug APK (arm64)
+        run: flutter build apk --debug --target-platform android-arm64
+
+      - name: Show package info
+        run: |
+          APK=build/app/outputs/flutter-apk/app-debug.apk
+          ls -la "$APK"
+          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          $BT/aapt2 dump packagename "$APK" || true
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: RootKit-debug-apk
+          path: build/app/outputs/flutter-apk/app-debug.apk
+          retention-days: 14

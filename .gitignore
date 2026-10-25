@@ -1,0 +1,41 @@
+# Flutter / Dart
+.dart_tool/
+.packages
+.pub-cache/
+.pub/
+build/
+*.iml
+.flutter-plugins
+.flutter-plugins-dependencies
+
+# Android
+android/.gradle/
+android/local.properties
+android/app/.cxx/
+android/captures/
+*.jks.bak
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 运行产物 / 日志
+*.log
+
+# 原生载荷（含 exploit / KSU LKM / 符号表），不入公开仓库；由 scripts/prepare_assets.sh 在本地生成
+
+# 构建产物校验/签名辅助
+*.apk.md5
+
+# ★ 本仓库按项目所有者要求【公开且保留原生载荷】（x645/pc/ml2/ksupatch/koquery/ksu_template/module.ko/kallsyms）
+# 但签名私钥与口令**永不入库**
+*.jks
+*.jks.bak
+android/key.properties
+android/keystore/
+
+# 收款码（隐私）：仓库只保留中性占位图；真实图放 qr_*.real.png 由本地/CI 注入
+assets/qr_*.real.png

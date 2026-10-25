@@ -1,0 +1,104 @@
+name: build-release
+run-name: release ${{ github.event.release.tag_name || inputs.tag }}（签名 + 挂 Release）
+
+# 正式版：**先在 GitHub 发布 Release**（release published）→ 本工作流构建、签名并把 APK 挂到那个 Release
+# 也不再随 push tag 触发：tag 只是里程碑，发布动作由人决定（Release 页面写清更新内容后再发）
+# push main 的编译校验交给 build-debug.yml
+# 签名从 Secrets 读取（KEYSTORE_B64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD）
+on:
+  release:
+    types: [ published ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要构建并挂载的 tag（例如 v1.0.14）'
+        required: true
+
+# softprops/action-gh-release 需要写权限；缺这段在部分仓库会 403
+permissions:
+  contents: write
+
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.5'
+          channel: stable
+          cache: true
+
+      # 载荷（x645/pc/ml2/ksupatch/koquery/ksu_template/module.ko/kallsyms）已在仓库 assets/ 下
+      - name: Decode keystore
+        run: |
+          mkdir -p android/keystore
+          echo "${{ secrets.KEYSTORE_B64 }}" | base64 -d > android/keystore/rootkit-release.jks
+          echo "KEYSTORE_PATH=keystore/rootkit-release.jks" >> $GITHUB_ENV
+
+      # 收款码不入库（隐私）：仓库里是中性占位图，官方构建时用 Secrets 覆盖
+      - name: Inject donation QRs (optional)
+        env:
+          QR_WECHAT_B64: ${{ secrets.QR_WECHAT_B64 }}
+          QR_ALIPAY_B64: ${{ secrets.QR_ALIPAY_B64 }}
+        run: |
+          [ -n "${QR_WECHAT_B64:-}" ] && echo "$QR_WECHAT_B64" | base64 -d > assets/qr_wechat.png
+          [ -n "${QR_ALIPAY_B64:-}" ] && echo "$QR_ALIPAY_B64" | base64 -d > assets/qr_alipay.png
+          md5sum assets/qr_*.png
+
+      - run: flutter pub get
+
+      - name: Build release APK (arm64)
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: flutter build apk --release --target-platform android-arm64
+
+      - name: Verify signature
+        run: |
+          APK=build/app/outputs/flutter-apk/app-release.apk
+          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          $BT/apksigner verify --verbose "$APK" | head -8
+          $BT/apksigner verify --print-certs "$APK" | grep -E "DN|SHA-256" || true
+
+      - name: Rename artifact (带上 tag/分支名)
+        run: |
+          SRC=build/app/outputs/flutter-apk/app-release.apk
+          OUT="build/RootKit-${{ github.event.release.tag_name || inputs.tag }}.apk"
+          cp "$SRC" "$OUT"
+          echo "APK_OUT=$OUT" >> $GITHUB_ENV
+          md5sum "$OUT" | tee "$OUT.md5"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: RootKit-release-apk
+          path: |
+            build/RootKit-*.apk
+            build/RootKit-*.apk.md5
+          retention-days: 90
+          if-no-files-found: error
+
+      # 把 APK 挂到触发本次构建的那个 Release（不重新生成 notes，保留人工写的更新说明）
+      - name: Attach APK to GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.event.release.tag_name || inputs.tag }}
+          files: |
+            ${{ env.APK_OUT }}
+            ${{ env.APK_OUT }}.md5
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+          draft: false
