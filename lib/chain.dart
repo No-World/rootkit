@@ -122,6 +122,8 @@ class RootChain extends ChangeNotifier {
   // 开打前清理后台（默认关闭）。动机：后台 App 多时 pipe 页预算被占（F_SETPIPE_SZ=EPERM）、
   // 页回收竞争变强 ⇒ 落位失败 ⇒ panic。恢复：软重启/正常重启即可，进程本来就会重建。
   bool optKillBg = false;
+  /// 严格温度闸：>44°C 先等降温（panic 代价远大于等待代价）
+  bool optStrictTemp = true;
 
   Future<void> loadOptions() async {
     final a = await ShizukuShell.getPref('opt.wifiOff');
@@ -134,10 +136,13 @@ class RootChain extends ChangeNotifier {
     if (d != null) optCleanup = d == '1';
     final e2 = await ShizukuShell.getPref('opt.killBg');
     if (e2 != null) optKillBg = e2 == '1';
+    final f2 = await ShizukuShell.getPref('opt.strictTemp');
+    if (f2 != null) optStrictTemp = f2 == '1';
     notifyListeners();
   }
 
-  Future<void> setOptions({bool? wifiOff, bool? tap, bool? stayOn, bool? cleanup, bool? killBg}) async {
+  Future<void> setOptions({bool? wifiOff, bool? tap, bool? stayOn, bool? cleanup,
+      bool? killBg, bool? strictTemp}) async {
     if (wifiOff != null) {
       optWifiOff = wifiOff;
       await ShizukuShell.setPref('opt.wifiOff', wifiOff ? '1' : '0');
@@ -157,6 +162,10 @@ class RootChain extends ChangeNotifier {
     if (cleanup != null) {
       optCleanup = cleanup;
       await ShizukuShell.setPref('opt.cleanup', cleanup ? '1' : '0');
+    }
+    if (strictTemp != null) {
+      optStrictTemp = strictTemp;
+      await ShizukuShell.setPref('opt.strictTemp', strictTemp ? '1' : '0');
     }
     _advice();
     notifyListeners();
@@ -1332,6 +1341,7 @@ class RootChain extends ChangeNotifier {
       }
       await _killBackground('permissive');
       await _envProbe('permissive');
+      await _shotMeta('permissive');
       _log('[permissive] run ${run + 1}: 开打（约 30–60s）');
       final r = await ShizukuShell.run(
         'cd $workDir && chmod 755 x645 && $env ./x645 2>&1; echo "RC=\$?"',
@@ -1608,6 +1618,7 @@ class RootChain extends ChangeNotifier {
     }
     await ShizukuShell.run(_prepCmd());
     await ShizukuShell.run('pkill -x x645'); // 清掉上一发可能残留的孤儿，避免两份并发污染判据
+    await _shotMeta(stage.name);
     _log('[${stage.name}] 开打 tries=$tries');
     final r = await ShizukuShell.run(
       'cd $workDir && $env ./x645 2>&1; echo "RC=\$?"',
@@ -1928,8 +1939,13 @@ class RootChain extends ChangeNotifier {
   /// 温度分档（UI 与日志共用）：0=最佳 1=可用 2=偏高
   static int tempTier(int mC) => mC <= _tempBestMc ? 0 : (mC <= _tempOkMc ? 1 : 2);
 
+  static const int _strictMc = 44000;   // 严格档上限
+  static const int _strictTries = 18;   // 3 分钟
+
   Future<void> _cooldownGate() async {
-    for (var i = 0; i < _tempGateTries; i++) {
+    final limitMc = optStrictTemp ? _strictMc : _tempOkMc;
+    final tries = optStrictTemp ? _strictTries : _tempGateTries;
+    for (var i = 0; i < tries; i++) {
       final zoneName = readTempZoneName();
       final raw = readTempMc();      // 直读文件，不 spawn shell
       if (raw == 0) {
@@ -1939,24 +1955,43 @@ class RootChain extends ChangeNotifier {
       health['T'] = '$raw';
       notifyListeners();
       final c = (raw / 1000).toStringAsFixed(1);
-      if (tempTier(raw) == 2) {
-        _log('[temp] 机身 ${c}°C（$zoneName）偏高（>55°C），等 10s 降温'
-            '（第 ${i + 1}/$_tempGateTries 次）');
+      if (raw > limitMc) {
+        _log('[temp] 机身 ${c}°C（$zoneName）偏高（>${limitMc ~/ 1000}°C），等 10s 降温'
+            '（第 ${i + 1}/$tries 次）');
         await ShizukuShell.run('input keyevent 224 2>/dev/null');
         await _sleep(10000);
         continue;
       }
-      if (tempTier(raw) == 1) {
-        _log('[temp] 机身 ${c}°C（$zoneName）可用（40–55°C），开打');
+      if (raw > _tempBestMc) {
+        _log('[temp] 机身 ${c}°C（$zoneName）可用（${_tempBestMc ~/ 1000}–${limitMc ~/ 1000}°C），开打');
       } else if (i > 0) {
         _log('[temp] ${c}°C（$zoneName）最佳（≤40°C），开打');
       }
+      return;
+    }
+    if (optStrictTemp) {
+      // 严格档等满也只是"没等到最佳状态"，照打但提醒（原来是直接放弃本轮）
+      final raw2 = readTempMc();
+      _log('[temp] 等满 ${tries * 10 ~/ 60} 分钟仍在 ${(raw2 / 1000).toStringAsFixed(1)}°C：'
+          '照打，但 panic 概率会升高');
       return;
     }
     _log('[temp] ✗ 等满 ${_tempGateTries * 10 ~/ 60} 分钟仍 >55°C，放弃本轮（过热时打必崩）');
     lastError = '机身温度过高（>55°C 持续 ${_tempGateTries * 10 ~/ 60} 分钟未降）：'
         '先关屏静置 10–15 分钟再跑；过热时命中率≈0 且极易 panic';
     _stop = true;
+  }
+
+  /// 每发打之前落一行元数据，方便事后把 panic 与温度/内存关联起来
+  Future<void> _shotMeta(String stage) async {
+    final t = readTempMc();
+    final r = await ShizukuShell.run(
+        'echo "stage=$stage temp_mc=$t uptime=\$(cut -d. -f1 /proc/uptime) '
+        'memfree=\$(grep MemFree /proc/meminfo | tr -s " " | cut -d" " -f2) '
+        'procs=\$(ls /proc | grep -cE "^[0-9]")\n'
+        'ts=\$(date +%H:%M:%S)" >> /data/local/tmp/rk/meta.log 2>/dev/null');
+    // 失败无所谓，纯诊断用
+    if (r.code != 0) return;
   }
 
   Future<bool> _ksuSuReady() async {

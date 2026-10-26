@@ -922,6 +922,20 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                   SwitchListTile(
                     dense: true,
                     contentPadding: EdgeInsets.zero,
+                    value: chain.optStrictTemp,
+                    title: const Text('严格温度（>44°C 先等降温）',
+                        style: TextStyle(fontSize: 14)),
+                    subtitle: const Text('实测每发的 panic 概率约 38%，'
+                        '降温能明显降低；等满 3 分钟仍降不下来就照打',
+                        style: TextStyle(fontSize: 11)),
+                    onChanged: (v) async {
+                      await chain.setOptions(strictTemp: v);
+                      if (ctx2.mounted) setSt(() {});
+                    },
+                  ),
+                  SwitchListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
                     value: chain.optKillBg,
                     title: const Text('运行前清理第三方后台',
                         style: TextStyle(fontSize: 14)),
