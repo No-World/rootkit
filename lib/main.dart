@@ -366,22 +366,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               ),
             ),
             const SizedBox(height: 7),
-            Padding(
-              padding: const EdgeInsets.only(bottom: 4),
-              child: Text(
-                  _shizuku
-                      ? (chain.devState.isEmpty
-                          ? '现状：正在探测…'
-                          : '现状：${chain.devState}')
-                      : 'Shizuku 未授权：点右上角盾牌图标授权后自动探测设备状态',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                      fontSize: 10.5,
-                      color: _shizuku
-                          ? const Color(0xFF4FA3E3)
-                          : const Color(0xFFD8A13A))),
-            ),
+            if (!_shizuku)
+              const Padding(
+                padding: EdgeInsets.only(bottom: 4),
+                child: Text('Shizuku 未授权：点右上角盾牌图标授权后自动探测设备状态',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontSize: 10.5, color: Color(0xFFD8A13A))),
+              ),
             _healthRow(),
             if (chain.lastError != null) ...[
               const SizedBox(height: 5),
@@ -398,6 +390,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
+  /// 状态条：**一行看完**设备现状（原来"现状"那行已并进来）
+  ///
+  /// 顺序按"越靠前越容易出问题"排：温度 → 内存/slab → SELinux → 模块/KSU 管理器/su/资产 → 内核。
+  /// 全部来自 5s 轮询的 health，不需要打开 App 后再点开始。
   Widget _healthRow() {
     final h = chain.health;
     final items = <String>[];
@@ -408,6 +404,22 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     if ((h['P'] ?? '').isNotEmpty) items.add('posix ${h['P']}');
     if ((h['C'] ?? '').isNotEmpty) items.add('cred ${h['C']}');
     if ((h['E'] ?? '').isNotEmpty) items.add(h['E']!);
+    // 下面这几项原来在"现状：…"那一行，现在并进同一条状态带
+    final ksu = int.tryParse((h['K'] ?? '0').trim()) ?? 0;
+    final pwn = int.tryParse((h['G'] ?? '0').trim()) ?? 0;
+    if (ksu > 0) {
+      items.add('KSU 已加载');
+    } else if (pwn > 0) {
+      items.add('root 模块 $pwn');
+    } else {
+      items.add('KSU 未加载');
+    }
+    items.add(chain.ksuAppInstalled
+        ? '管理器 ${chain.ksuAppVersion.isEmpty ? "已装" : "v${chain.ksuAppVersion}"}'
+        : '管理器 未装');
+    items.add((h['S'] ?? '0').trim() == '1' ? 'su ✓' : 'su ✗');
+    if ((h['A'] ?? '').isNotEmpty) items.add('资产 ${h['A']}/4');
+    if (chain.lastResetType.toLowerCase().contains('panic')) items.add('上次 panic');
     final kv = chain.calib.kernelVersion;
     if (kv.isNotEmpty) {
       items.add('内核 ${kv.split('-').take(2).join('-')}');

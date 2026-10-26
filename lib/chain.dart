@@ -73,6 +73,7 @@ class RootChain extends ChangeNotifier {
   bool ksuDirReady = false;                    // /data/adb/ksu 是否已初始化（模块加载后才可能出现）
   String suPath = '';                          // su 实际所在路径（空 = 都没有）
   String ksuAppVersion = '';                   // KernelSU 管理器版本（versionName）
+  String lastResetType = '';                   // sys.resettype：上次关机/重启类型（abnormal:AP_S_PANIC 等）
   String devState = '';                        // 一句话设备现状（用于界面）
   Timer? _healthTimer;                        // 5s 主动刷新状态区
   bool _healthBusy = false;                   // 防重入
@@ -894,7 +895,9 @@ class RootChain extends ChangeNotifier {
         r' echo KSUAPP=$(pm list packages 2>/dev/null | grep -c me.weishu.kernelsu);'
         r' echo KSUDIR=$(ls -d /data/adb/ksu 2>/dev/null | head -1);'
         r' echo SUWHICH=$(command -v su 2>/dev/null || ls /data/adb/ksu/bin/su 2>/dev/null || echo);'
-        r' echo KSUV=$(dumpsys package me.weishu.kernelsu 2>/dev/null | sed -n "s/.*versionName=//p" | head -1);');
+        r' echo KSUV=$(dumpsys package me.weishu.kernelsu 2>/dev/null | sed -n "s/.*versionName=//p" | head -1);'
+        r' echo RESET=$(getprop sys.resettype 2>/dev/null);'
+        r' echo LASTB=$(getprop sys.boot.reason.last 2>/dev/null);');
     for (final l in r.out.split('\n')) {
       if (l.startsWith('KSUAPP=') || l.startsWith('KSUDIR=') || l.startsWith('SUWHICH=')) {
         _log('[status] ${l.trim()}');
@@ -908,6 +911,12 @@ class RootChain extends ChangeNotifier {
     suPath = RegExp(r'^SUWHICH=(\S+)', multiLine: true).firstMatch(r.out)?.group(1) ?? '';
     ksuAppVersion = _normVer(
         RegExp(r'^KSUV=(\S+)', multiLine: true).firstMatch(r.out)?.group(1) ?? '');
+    lastResetType =
+        RegExp(r'^RESET=(\S+)', multiLine: true).firstMatch(r.out)?.group(1) ?? '';
+    if (lastResetType.toLowerCase().contains('panic') ||
+        lastResetType.toLowerCase().contains('abnormal')) {
+      _log('[status] 上次重启类型=$lastResetType（kernel panic ⇒ 命中后落地失败，属已知代价）');
+    }
     final m = <String, String>{};
     for (final line in r.out.split('\n')) {
       final i = line.indexOf('=');
@@ -1194,6 +1203,7 @@ class RootChain extends ChangeNotifier {
       ksuAppText,
       hasSu ? 'su 可用${suPath.isEmpty ? "" : "（$suPath）"}' : 'su 不可用',
       '资产 $asset/4',
+      if (lastResetType.toLowerCase().contains('panic')) '上次=panic 重启',
     ].join(' · ');
   }
 
