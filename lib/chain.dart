@@ -1499,25 +1499,29 @@ class RootChain extends ChangeNotifier {
 
   /// 开打前的温度闸（读 thermal_zone0，单位 m℃）
   ///
-  /// 历史数据：>60°C 时 CPU 降到 1.3GHz，泄漏/命中都会掉；连带把竞态时序打乱，
-  /// 表现为"越跑越差 + 更容易 panic"。所以宁可等几十秒。
+  /// 阈值 = **40°C**（用户指定）。历史数据：>60°C 时 CPU 降到 1.3GHz，泄漏/命中都会掉；
+  /// 机身有余温时竞态时序也会漂移，表现为"越跑越差 + 更容易 panic"。宁可等一两分钟。
+  static const int _tempGateMc = 40000;   // 40.0°C
+  static const int _tempGateTries = 9;    // 最多等 9×10s = 90s，超时后照打（并记一条警告）
   Future<void> _cooldownGate() async {
-    for (var i = 0; i < 6; i++) {
+    for (var i = 0; i < _tempGateTries; i++) {
       final r = await ShizukuShell.run(
           'cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null');
       final t = int.tryParse(RegExp(r'\d+').firstMatch(r.out)?.group(0) ?? '') ?? 0;
       if (t <= 0) return;
       health['T'] = '$t';
       notifyListeners();
-      if (t < 58000) {
-        if (i > 0) _log('[temp] ${(t / 1000).toStringAsFixed(1)}°C 已回落，开打');
+      if (t <= _tempGateMc) {
+        if (i > 0) _log('[temp] ${(t / 1000).toStringAsFixed(1)}°C ≤40°C，开打');
         return;
       }
-      _log('[temp] 机身 ${(t / 1000).toStringAsFixed(1)}°C 偏热，等 10s 降频恢复（第 ${i + 1}/6 次）');
+      _log('[temp] 机身 ${(t / 1000).toStringAsFixed(1)}°C > 40°C，等 10s 降温'
+          '（第 ${i + 1}/$_tempGateTries 次）');
       // 顺手把屏幕开着、别让系统进 doze
       await ShizukuShell.run('input keyevent 224 2>/dev/null');
       await _sleep(10000);
     }
+    _log('[temp] ⚠ 等满 ${_tempGateTries * 10}s 仍 >40°C，仍要开打（命中率与稳定性都会变差）');
   }
 
   Future<bool> _ksuSuReady() async {
