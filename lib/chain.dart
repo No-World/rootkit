@@ -74,6 +74,8 @@ class RootChain extends ChangeNotifier {
   String suPath = '';                          // su 实际所在路径（空 = 都没有）
   String ksuAppVersion = '';                   // KernelSU 管理器版本（versionName）
   String devState = '';                        // 一句话设备现状（用于界面）
+  Timer? _healthTimer;                        // 5s 主动刷新状态区
+  bool _healthBusy = false;                   // 防重入
   String shizukuVia = '';
 
   // ---- 可选项（持久化在 App 私有 SharedPreferences）----
@@ -435,6 +437,13 @@ class RootChain extends ChangeNotifier {
     } catch (e) {
       _log('[diag-root:$tag] 采集失败：$e');
     }
+  }
+
+  @override
+  void dispose() {
+    stopHealthPolling();
+    _flushTimer?.cancel();
+    super.dispose();
   }
 
   void _advice() {
@@ -1133,20 +1142,48 @@ class RootChain extends ChangeNotifier {
         'echo "P=\$(grep -m1 posix_timers_cache /proc/slabinfo 2>/dev/null | awk \'{print \$2\"/\"\$3}\')";'
         'echo "C=\$(grep -m1 \"^cred_jar\" /proc/slabinfo 2>/dev/null | awk \'{print \$2\"/\"\$3}\')";'
         'echo "E=\$(getenforce 2>/dev/null)"');
+    var changed = false;
     for (final line in r.out.split('\n')) {
       final i = line.indexOf('=');
       if (i <= 0) continue;
       final k = line.substring(0, i).trim();
       final v = line.substring(i + 1).trim();
       if (k == 'T' || k == 'W' || k == 'M' || k == 'P' || k == 'C' || k == 'E') {
-        health[k] = v;
+        if (health[k] != v) {
+          health[k] = v;
+          changed = true;
+        }
       }
     }
     if (r.via.isNotEmpty && shizukuVia != r.via) {
       shizukuVia = r.via;
       _log('[env] Shizuku 接口: ${r.via == 'api' ? 'Shizuku.newProcess' : 'AIDL newProcess'}');
+      changed = true;
     }
-    notifyListeners();
+    // 每 5s 轮询时值通常不变，没必要刷新整屏
+    if (changed) notifyListeners();
+  }
+
+  /// 状态区（温度/唤醒/内存/slab/SELinux）**每 5 秒主动刷新**，不依赖是否在跑
+  ///
+  /// 之前只在 running 时的 20s 心跳里刷，所以空闲时温度一直是旧的。
+  void startHealthPolling() {
+    _healthTimer?.cancel();
+    _healthTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
+      if (!shizukuOk || _healthBusy) return;
+      _healthBusy = true;
+      try {
+        await refreshHealth();
+      } catch (_) {
+      } finally {
+        _healthBusy = false;
+      }
+    });
+  }
+
+  void stopHealthPolling() {
+    _healthTimer?.cancel();
+    _healthTimer = null;
   }
 
   Future<bool> _rebooted() async {

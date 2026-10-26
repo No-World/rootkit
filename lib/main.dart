@@ -65,6 +65,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     chain.loadOptions();
     _refreshShizuku();
     _startShizukuPoll();
+    chain.startHealthPolling();   // 状态区每 5s 主动刷新（不依赖是否在跑）
     _maybeShowDisclaimer();
   }
 
@@ -103,9 +104,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     if (state == AppLifecycleState.resumed) {
       _refreshShizuku();
       _startShizukuPoll();
+      chain.startHealthPolling();
+      chain.refreshHealth();
     } else if (state == AppLifecycleState.paused) {
       _shizukuPoll?.cancel();
       _shizukuPoll = null;
+      chain.stopHealthPolling();
     }
   }
 
@@ -153,6 +157,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   @override
   void dispose() {
     _shizukuPoll?.cancel();
+    chain.stopHealthPolling();
     WidgetsBinding.instance.removeObserver(this);
     chain.removeListener(_onChange);
     chain.dispose();
