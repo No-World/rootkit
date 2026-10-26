@@ -56,6 +56,13 @@ class RootChain extends ChangeNotifier {
   final List<String> suggestions = [];
 
   bool running = false;
+
+  /// 链路正在跑（任何后台轮询/检查都应据此让路）
+  ///
+  /// 规则：**一旦开始跑链，就不再在运行期间做任何额外探测/更新检查**
+  /// （detectStatus、refreshHealth、更新检查、日志外的网络请求全部让路）。
+  /// 原因见 CHANGELOG v1.0.17：3s/5s 的重型轮询会把 UAF 释放的页重新占用，直接推高 panic 率。
+  bool get busy => running;
   bool shizukuOk = false;
   bool success = false;        // su 验证通过（整链成功）
   bool softRebootTried = false;
@@ -666,13 +673,13 @@ class RootChain extends ChangeNotifier {
     _heartbeat = Timer.periodic(const Duration(seconds: 20), (_) async {
       if (!running) return;
       await ShizukuShell.run(_prepCmd());
-      await refreshHealth();
+      await refreshHealth(force: true);
     });
 
     try {
       bootId = await _bootId();
       await _snapshotOptions();   // 先记录原值，运行结束/成功后可原样恢复
-      await refreshHealth();
+      await refreshHealth(force: true);
       // 探测现状（决定哪些阶段可直接跳过）
       try {
         await detectStatus();
@@ -1145,8 +1152,9 @@ class RootChain extends ChangeNotifier {
   }
 
   /// 设备健康 / slab 检查（温度、唤醒、内存、posix_timers_cache、cred_jar、SELinux）
-  Future<void> refreshHealth() async {
-    if (running) return;   // 跑链期间一律不读（slabinfo/dumpsys 都会干扰竞态）
+  Future<void> refreshHealth({bool force = false}) async {
+    // 跑链期间一律不读（slabinfo/dumpsys 都会干扰竞态）；只有显式 force 的一次性调用例外
+    if (running && !force) return;
     final r = await ShizukuShell.run(
         'echo "T=\$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null)";'
         'echo "W=\$(dumpsys power 2>/dev/null | grep -m1 mWakefulness= | cut -d= -f2)";'

@@ -75,6 +75,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _shizukuPoll = Timer.periodic(const Duration(seconds: 3), (_) => _pollShizuku());
   }
 
+  /// 约定：任何"额外的后台工作"（状态探测、更新检查、网络请求）都必须先看 [chain.busy]
+  /// —— 跑链期间一律不做，避免干扰竞态窗口（见 CHANGELOG v1.0.17 的 panic 分析）。
   Future<void> _pollShizuku() async {
     if (!mounted || _pollBusy) return;
     _pollBusy = true;
