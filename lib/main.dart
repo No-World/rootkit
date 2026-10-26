@@ -422,7 +422,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final h = chain.health;
     final items = <String>[];
     final t = int.tryParse(h['T'] ?? '');
-    if (t != null) items.add('${(t / 1000).toStringAsFixed(1)}°C');
+    if (t != null && t > 0) {
+      // 分档与参考实现一致：≤40 最佳 / ≤55 可用 / >55 偏高
+      final tier = RootChain.tempTier(t);
+      final tag = tier == 0 ? '最佳' : (tier == 1 ? '可用' : '偏高');
+      items.add('${(t / 1000).toStringAsFixed(1)}°C $tag');
+    }
     if ((h['W'] ?? '').isNotEmpty) items.add(h['W']!);
     if ((h['M'] ?? '').isNotEmpty) items.add('内存 ${h['M']}MB');
     if ((h['P'] ?? '').isNotEmpty) items.add('posix ${h['P']}');

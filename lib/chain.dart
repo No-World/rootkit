@@ -1293,7 +1293,7 @@ class RootChain extends ChangeNotifier {
     // 跑链期间一律不读（slabinfo/dumpsys 都会干扰竞态）；只有显式 force 的一次性调用例外
     if (running && !force) return;
     final r = await ShizukuShell.run(
-        'echo "T=\$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null)";'
+        // 温度走直读（readTempMc），这里不再读
         'echo "W=\$(dumpsys power 2>/dev/null | grep -m1 mWakefulness= | cut -d= -f2)";'
         'echo "M=\$(free -m 2>/dev/null | awk \'/Mem:/{print \$3\"/\"\$2}\')";'
         'echo "P=\$(grep -m1 posix_timers_cache /proc/slabinfo 2>/dev/null | awk \'{print \$2\"/\"\$3}\')";'
@@ -1378,19 +1378,30 @@ class RootChain extends ChangeNotifier {
   /// 只有开打前的一次温度闸 + 20s 心跳的 prep，不做 detectStatus/slabinfo 这类重活）。
   void startHealthPolling() {
     _healthTimer?.cancel();
-    refreshStatus(); // 先立刻刷一次，别等第一个 5s
-    _healthTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
-      if (_healthBusy || running) return;
+    refreshStatus(); // 先立刻刷一次
+    var tick = 0;
+    // 频率照参考实现：**2 秒一拍**；温度直读文件（零开销），
+    // 每 5 拍（10 秒）才走一次 shell 读 slab/内存/唤醒/SELinux。
+    _healthTimer = Timer.periodic(const Duration(seconds: 2), (_) async {
+      if (running) return;               // 跑链期间完全暂停读取（参考实现也是"已暂停读取"）
+      tick++;
+      // 每拍：温度直读
+      final t = readTempMc();
+      if (t > 0 && health['T'] != '$t') {
+        health['T'] = '$t';
+        notifyListeners();
+      }
+      if (tick % 5 != 0) return;         // 10s 才做一次重活
+      if (_healthBusy) return;
       _healthBusy = true;
       try {
-        // 死锁修复：原来守卫是 if(!shizukuOk) return，而 shizukuOk 只在 refreshHealth 成功时置位
         if (!shizukuOk) {
           final ok = await ShizukuShell.checkPermission();
           if (!ok) return;
           shizukuOk = true;
-          _log('[health] Shizuku 已授权，开始每 5s 刷新状态');
+          _log('[health] Shizuku 已授权，开始每 2s 读温度 / 每 10s 读 slab');
         }
-        await refreshHealth();   // 只刷健康条（轻量），不跑 detectStatus
+        await refreshHealth();           // shell 部分（slab/内存/唤醒/SELinux/模块/su/资产）
       } catch (_) {
       } finally {
         _healthBusy = false;
@@ -1633,53 +1644,81 @@ class RootChain extends ChangeNotifier {
     return m?.group(1) ?? raw.trim();
   }
 
+  // ------------------------------------------------------------------ 温度直读
+  //
+  // `/sys/class/thermal/thermal_zone0/temp` 是 `-r--r--r--`（0444），**普通 App 直接读就行**，
+  // 不需要 shell/Shizuku。所以高频采样（2s）不会带来任何进程开销；
+  // 参考实现的监控线程也是 2 秒一采样，但它是每条命令都走 shell，我们这里省掉这一步。
+
+  static const String _tempPath = '/sys/class/thermal/thermal_zone0/temp';
+  static const String _tempTypePath = '/sys/class/thermal/thermal_zone0/type';
+
+  /// 读 CPU 温度（m℃）；失败/异常值返回 0
+  static int readTempMc() {
+    try {
+      final raw = File(_tempPath).readAsStringSync().trim();
+      final v = int.tryParse(raw) ?? 0;
+      // 范围校验：只认 10–120°C，其余当坏值（瞬时抖动/读文件撞上更新）
+      if (v <= 10000 || v >= 120000) return 0;
+      return v;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  static String readTempZoneName() {
+    try {
+      final t = File(_tempTypePath).readAsStringSync().trim();
+      return t.isEmpty ? 'zone0' : t;
+    } catch (_) {
+      return 'zone0';
+    }
+  }
+
   /// 开打前的温度闸（读 thermal_zone0，单位 m℃）
   ///
-  /// 两级（用户指定）：
-  /// · **>40°C 提醒**：照打，但日志/建议里提示偏高；
-  /// · **≥45°C 阻断**：先等降温（10s × 9 = 最多 90s），降下来再打。
-  /// 为什么管温度：>60°C 时 CPU 降到 1.3GHz，泄漏/命中都会掉；有余温时竞态时序也漂移，
-  /// 表现为"越跑越差 + 更容易 panic"。
-  static const int _tempWarnMc = 40000;    // 40.0°C 以上提醒
-  static const int _tempBlockMc = 45000;   // 45.0°C 及以上阻断
-  static const int _tempGateTries = 30;    // 最多等 30×10s = 5min（真机上从 68°C 降到 45°C 要几分钟）
+  /// 分级参考同类公开实现的温度方案（三档写死）：
+  ///   · **≤40°C = 最佳**      → 直接打
+  ///   · **40–55°C = 可用**    → 照打，日志提醒
+  ///   · **>55°C = 偏高**      → 先等降温（10s × 30 = 最多 5 分钟）
+  /// 另外两点也照抄：
+  ///   · 读数做取值范围校验（只接受 10000–120000，挡掉异常/瞬时的坏值）
+  ///   · **跑链期间不读**（同类实现的监控面板此时直接显示"已暂停读取"）
+  static const int _tempBestMc = 40000;    // ≤40 最佳
+  static const int _tempOkMc = 55000;      // ≤55 可用；>55 偏高
+  static const int _tempGateTries = 30;    // 最多等 30×10s = 5 分钟
+
+  /// 温度分档（UI 与日志共用）：0=最佳 1=可用 2=偏高
+  static int tempTier(int mC) => mC <= _tempBestMc ? 0 : (mC <= _tempOkMc ? 1 : 2);
 
   Future<void> _cooldownGate() async {
     for (var i = 0; i < _tempGateTries; i++) {
-      // 顺带把传感器名字读出来：不同机器 zone0 含义不同（本机是 cpullc-0-0，CPU LLC）
-      final r = await ShizukuShell.run(
-          'cat /sys/class/thermal/thermal_zone0/type 2>/dev/null; '
-          'cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null');
-      final lines = r.out.trim().split('\n').map((e) => e.trim()).toList();
-      final zoneName = lines.isNotEmpty && !RegExp(r'^\d+$').hasMatch(lines.first)
-          ? lines.first
-          : 'zone0';
-      final tempLine = lines.lastWhere((e) => RegExp(r'^\d+$').hasMatch(e), orElse: () => '');
-      final t = int.tryParse(tempLine) ?? 0;
-      if (t <= 0) return;
-      health['T'] = '$t';
+      final zoneName = readTempZoneName();
+      final raw = readTempMc();      // 直读文件，不 spawn shell
+      if (raw == 0) {
+        if (i == 0) _log('[temp] 读数异常 ⇒ 跳过温度闸');
+        return;
+      }
+      health['T'] = '$raw';
       notifyListeners();
-      final c = (t / 1000).toStringAsFixed(1);
-      if (t >= _tempBlockMc) {
-        _log('[temp] 机身 ${c}°C（$zoneName）≥45°C，阻断开打，等 10s 降温'
+      final c = (raw / 1000).toStringAsFixed(1);
+      if (tempTier(raw) == 2) {
+        _log('[temp] 机身 ${c}°C（$zoneName）偏高（>55°C），等 10s 降温'
             '（第 ${i + 1}/$_tempGateTries 次）');
         await ShizukuShell.run('input keyevent 224 2>/dev/null');
         await _sleep(10000);
         continue;
       }
-      if (t > _tempWarnMc) {
-        _log('[temp] ⚠ 机身 ${c}°C（$zoneName，>40°C 偏高但 <45°C 放行）：'
-            '命中率可能偏低，建议再晾一会儿');
+      if (tempTier(raw) == 1) {
+        _log('[temp] 机身 ${c}°C（$zoneName）可用（40–55°C），开打');
       } else if (i > 0) {
-        _log('[temp] ${c}°C（$zoneName）已降到 40°C 以下，开打');
+        _log('[temp] ${c}°C（$zoneName）最佳（≤40°C），开打');
       }
       return;
     }
-    // 等满 5 分钟还降不下来 ⇒ **直接放弃本轮**，而不是硬打。
-    // 实测：机身 68°C + load 19 时打，几乎必 panic（命中率也趋近 0），只会白烧一次重启。
-    _log('[temp] ✗ 等满 ${_tempGateTries * 10 ~/ 60} 分钟仍 ≥45°C，放弃本轮（机身过热时打必崩）');
-    lastError = '机身温度过高（≥45°C 持续 ${_tempGateTries * 10 ~/ 60} 分钟未降）：'
-        '先关屏静置 10–15 分钟降到 40°C 以下再跑；过热时命中率≈0 且极易 panic';
+    _log('[temp] ✗ 等满 ${_tempGateTries * 10 ~/ 60} 分钟仍 >55°C，放弃本轮（过热时打必崩）');
+    lastError = '机身温度过高（>55°C 持续 ${_tempGateTries * 10 ~/ 60} 分钟未降）：'
+        '先关屏静置 10–15 分钟再跑；过热时命中率≈0 且极易 panic';
     _stop = true;
   }
 
