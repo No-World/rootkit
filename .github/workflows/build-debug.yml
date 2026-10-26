@@ -25,6 +25,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
+      # 固定 debug 签名 key（仓库 Secret）。放在 job 级：step 级 env 在 if 里不生效。
+      DEBUG_KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
     steps:
       - uses: actions/checkout@v5
 
@@ -41,14 +43,22 @@ jobs:
 
       # 可选：固定 debug 签名 key。不提供时 runner 每次生成新 key ⇒ 不同次构建之间覆盖安装会签名冲突。
       # 注意：secrets 不能在 steps[*].if 里直接引用（会让整份 workflow 校验失败），要用 env 中转。
-      - name: Use stable debug keystore (optional)
-        env:
-          DEBUG_KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+      # 不固定 key 时，runner 每次生成新的 debug.keystore ⇒ 每次 CI 的测试包签名都不同，
+      # 手机上覆盖安装会 INSTALL_FAILED_UPDATE_INCOMPATIBLE。这里用 Secret 里的固定 key。
+      - name: Use stable debug keystore
         if: env.DEBUG_KEYSTORE_B64 != ''
         run: |
           mkdir -p ~/.android
           echo "$DEBUG_KEYSTORE_B64" | base64 -d > ~/.android/debug.keystore
-          ls -la ~/.android/debug.keystore
+          chmod 600 ~/.android/debug.keystore
+          keytool -list -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey \
+            | grep -iE "androiddebugkey|SHA" || true
+
+      - name: Warn if debug keystore is not pinned
+        if: env.DEBUG_KEYSTORE_B64 == ''
+        run: |
+          echo "::warning::未配置 DEBUG_KEYSTORE_B64 ⇒ 本次测试包用的是 runner 随机生成的 debug key，"
+          echo "::warning::下次构建的包无法覆盖安装（会报 INSTALL_FAILED_UPDATE_INCOMPATIBLE）。"
 
       - run: flutter pub get
 
@@ -88,6 +98,10 @@ jobs:
           VC=$(sed -n "s/^package: .* versionCode='\([^']*\)'.*/\1/p" /tmp/badging.txt | head -1)
           MD5=$(md5sum "out/${NAME}.apk" | cut -d' ' -f1)
           echo "${MD5}  ${NAME}.apk" > "out/${NAME}.apk.md5"
+          # 签名证书指纹：跨次构建应完全一致（debug key 固定后）
+          CERT=$("$BT/apksigner" verify --print-certs "out/${NAME}.apk" 2>/dev/null \
+                   | sed -n "s/^Signer #1 certificate SHA-256 digest: //p" | head -1)
+          echo "CERT=$CERT" >> "$GITHUB_ENV"
           SIZE=$(du -h "out/${NAME}.apk" | cut -f1)
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
           echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
@@ -102,6 +116,7 @@ jobs:
             echo "| 大小 | ${SIZE} |"
             echo "| 签名 | debug key（**不能**覆盖正式版，可与正式版共存） |"
             echo "| 构建 | release / AOT（与正式版同构，非 JIT debug 包） |"
+            echo "| 签名证书 SHA-256 | \`${CERT:-未知}\` |"
             echo "| md5 | \`${MD5}\` |"
             echo ""
             echo "下载：本页底部 **Artifacts → ${NAME}**（GitHub 强制打包成 zip，解压即为 apk）。"
