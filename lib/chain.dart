@@ -1292,6 +1292,9 @@ class RootChain extends ChangeNotifier {
   Future<void> refreshHealth({bool force = false}) async {
     // 跑链期间一律不读（slabinfo/dumpsys 都会干扰竞态）；只有显式 force 的一次性调用例外
     if (running && !force) return;
+    // 温度直读（一次性刷新时也要有值，不能等 2s 定时器）
+    final dip = readTempMc();
+    if (dip > 0) health['T'] = '$dip';
     final r = await ShizukuShell.run(
         // 温度走直读（readTempMc），这里不再读
         'echo "W=\$(dumpsys power 2>/dev/null | grep -m1 mWakefulness= | cut -d= -f2)";'
