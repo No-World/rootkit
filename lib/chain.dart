@@ -1529,7 +1529,7 @@ class RootChain extends ChangeNotifier {
   /// 表现为"越跑越差 + 更容易 panic"。
   static const int _tempWarnMc = 40000;    // 40.0°C 以上提醒
   static const int _tempBlockMc = 45000;   // 45.0°C 及以上阻断
-  static const int _tempGateTries = 9;     // 最多等 9×10s = 90s
+  static const int _tempGateTries = 30;    // 最多等 30×10s = 5min（真机上从 68°C 降到 45°C 要几分钟）
 
   Future<void> _cooldownGate() async {
     for (var i = 0; i < _tempGateTries; i++) {
@@ -1553,7 +1553,12 @@ class RootChain extends ChangeNotifier {
       }
       return;
     }
-    _log('[temp] ⚠ 等满 ${_tempGateTries * 10}s 仍 ≥45°C，仍要开打（命中率与稳定性都会明显变差）');
+    // 等满 5 分钟还降不下来 ⇒ **直接放弃本轮**，而不是硬打。
+    // 实测：机身 68°C + load 19 时打，几乎必 panic（命中率也趋近 0），只会白烧一次重启。
+    _log('[temp] ✗ 等满 ${_tempGateTries * 10 ~/ 60} 分钟仍 ≥45°C，放弃本轮（机身过热时打必崩）');
+    lastError = '机身温度过高（≥45°C 持续 ${_tempGateTries * 10 ~/ 60} 分钟未降）：'
+        '先关屏静置 10–15 分钟降到 40°C 以下再跑；过热时命中率≈0 且极易 panic';
+    _stop = true;
   }
 
   Future<bool> _ksuSuReady() async {
