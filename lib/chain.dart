@@ -234,13 +234,18 @@ class RootChain extends ChangeNotifier {
     final b = StringBuffer();
     // 注意：这里不再判断 optStayOn —— 只要快照里记过，就按原值恢复。
     // （原来写成 `if (optStayOn && ...)`，用户中途关掉开关后反而恢复不了）
+    // ★ 顺序很重要：先恢复 stay_on_while_plugged_in（开发者选项里的"保持唤醒"，
+    //   用户很难手动改回来），再恢复屏幕超时。
     final t = _orig['T'];
     final s0 = _orig['S'];
+    if (s0 != null && s0 != 'null') {
+      b.write('settings put global stay_on_while_plugged_in $s0; ');
+    }
     if (t != null && t != 'null') {
       b.write('settings put system screen_off_timeout $t; ');
     }
-    if (s0 != null && s0 != 'null') {
-      b.write('settings put global stay_on_while_plugged_in $s0; ');
+    if (s0 == null || s0 == 'null' || s0 == '0') {
+      b.write('svc power stayon false; ');
     }
     if (all || optWifiOff) {
       final a = _orig['A'];
@@ -871,6 +876,9 @@ class RootChain extends ChangeNotifier {
         phase = '已完成（含跳过）';
       }
       running = false;
+      // ★ 跑完就把选项改过的系统设置还原（v1.0.16 里 restoreOptions 从来没被调用过，
+      //   等于跑完一直留着 30 分钟超时 + 充电保持常亮）。stay_on 优先还原。
+      await restoreOptions();
       _lastEndAt = DateTime.now();
       _lastRunFailed = !success;
       _saveStats();
@@ -896,6 +904,8 @@ class RootChain extends ChangeNotifier {
     await ShizukuShell.run('pkill -f "[p]c_run"');
     await ShizukuShell.run('rm -f $workDir/probe.log');
     _log('[stop] 已清理 x645 / pc');
+    await restoreOptions();   // 手动停止也要把常亮/超时等还原
+    notifyListeners();
   }
 
   // ---------------------------------------------------------------- 各阶段

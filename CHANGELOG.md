@@ -18,6 +18,12 @@
 - **修「打开 App / 授权后不自动开始检测」**：5s 轮询的守卫是 `if (!shizukuOk) return`，
   而 `shizukuOk` 只在 `refreshHealth` 成功时才置位 ⇒ 死锁，永远不轮询。改成用
   `ShizukuShell.checkPermission()`（binder，不 spawn 进程）先翻状态；授权后立即刷一次。
+- **★★ 修「选项改过的系统设置从来不还原」**（最要命的一条，v1.0.15/1.0.16 就有）
+  `restoreOptions()` 写好了，但**从来没被调用过**（全文只有定义，没有调用点）⇒ 跑完之后
+  `screen_off_timeout` 一直停在 30 分钟、`stay_on_while_plugged_in`（开发者选项里的
+  「保持唤醒」）一直停在 7。WiFi/飞行还能手动关，这个开关藏在开发者选项里很难改回来。
+  现在三处都会还原：**跑完一轮**（无论成败）、**用户点停止**、以及**下次打开 App**
+  （读遗留快照）。且恢复顺序把 `stay_on` 放在最前面。
 - **★ 修「panic 之后系统设置回不去」**（用户实测：一次 panic 后屏幕超时一直是 30 分钟）
   根因：原设置快照只存在内存里（`_orig`），panic 重启后进程消失 ⇒ 再也没有机会还原。
   修法：快照**落盘**到 `/data/local/tmp/rk/opt_snapshot.txt`（`T/S/A/W/B` 五项 base64 写入），
