@@ -1,6 +1,21 @@
 # 变更记录
 
 ## v1.0.17 — 2026-10-26
+- **日志一键复制**：日志卡片头部新增「复制全部日志」，全屏/历史日志的复制按钮也统一走同一逻辑。
+  复制内容是**自带上下文**的一段文本，直接贴进 Issue 就能定位：
+  ```
+  === 越狱助手 v1.0.17 日志 ===
+  时间: 2026-10-26 14:03:21
+  设备: SELinux=Enforcing · KSU 未加载 · KSU 管理器 v3.3.1 · su 不可用 · 资产 0/4
+  失败阶段: ⑧ su 验证=su 不存在 | …
+  lastError: …
+  阶段: ①=ok ②=ok … ⑧=failed
+  --- 日志 137 行 ---
+  …
+  ```
+- **修 `vv3.3.1`**：Honor 的 `dumpsys package` 输出自带 `v` 前缀（`versionName=v3.3.1`），
+  拼成 `" v$ver"` 就成了 `vv3.3.1`，还会让「管理器版本 ≠ 模板版本」假报警。现在统一规范化。
+- 原设置快照的日志把 `null` 显示成 `(未记录)`（Shizuku 尚未授权时取不到值，属正常）。
 - **⑦ 之后自动补做 KernelSU 的「用户态安装」**（这是本次真正的功能修复）
   依据 KernelSU 源码，`su` 是**虚拟**的：`kernel/feature/sucompat.c` 把 `/system/bin/su`
   在 `faccessat/newfstatat/execve` 上劫持到 **`/data/adb/ksud`**，且只有 `is_ksud_exists()`

@@ -132,8 +132,9 @@ class RootChain extends ChangeNotifier {
       if ('TSAWB'.contains(k) && v.isNotEmpty && v != 'null') _orig[k] = v;
     }
     _optApplied = true;
-    _log('[env] 已记录原设置：屏幕超时=${_orig['T']} 常亮=${_orig['S']} '
-        '飞行=${_orig['A']} wifi=${_orig['W']} bt=${_orig['B']}');
+    String g(String k) => _orig[k] ?? '(未记录)';
+    _log('[env] 已记录原设置：屏幕超时=${g('T')} 常亮=${g('S')} '
+        '飞行=${g('A')} wifi=${g('W')} bt=${g('B')}');
   }
 
   /// 把选项改动过的系统设置恢复到运行前的状态
@@ -298,7 +299,7 @@ class RootChain extends ChangeNotifier {
             '0') !=
         '0';
     ksuAppVersion =
-        RegExp(r'^VER=(\S+)', multiLine: true).firstMatch(out)?.group(1) ?? '';
+        _normVer(RegExp(r'^VER=(\S+)', multiLine: true).firstMatch(out)?.group(1) ?? '');
     ksuDirReady = RegExp(r'^DIR=/', multiLine: true).hasMatch(out);
     suPath = RegExp(r'^SU=(\S+)', multiLine: true).firstMatch(out)?.group(1) ??
         RegExp(r'^SUM=(\S+)', multiLine: true).firstMatch(out)?.group(1) ??
@@ -307,7 +308,7 @@ class RootChain extends ChangeNotifier {
     final verTxt = ksuAppVersion.isEmpty ? '' : ' v$ksuAppVersion';
     _log('[pre] KernelSU 管理器：'
         '${ksuAppInstalled ? "已安装$verTxt（本模板对应 v$kKsuManagerVersion）" : "未安装（必需）"}');
-    _log('[pre] /data/adb/ksu：${ksuDirReady ? "已初始化" : "未初始化（正常，加载模块后打开一次 KernelSU 即可创建）"}');
+    _log('[pre] /data/adb/ksu：${ksuDirReady ? "已初始化" : "未初始化（正常：加载模块后本 App 会自己跑 libksud.so install 创建）"}');
     _log('[pre] su：${suPath.isEmpty ? "尚未提供（管理器初始化后才有）" : suPath}');
 
     if (!ksuAppInstalled) {
@@ -896,8 +897,8 @@ class RootChain extends ChangeNotifier {
             ?.group(1) ?? '0') != '0';
     ksuDirReady = RegExp(r'^KSUDIR=/', multiLine: true).hasMatch(r.out);
     suPath = RegExp(r'^SUWHICH=(\S+)', multiLine: true).firstMatch(r.out)?.group(1) ?? '';
-    ksuAppVersion =
-        RegExp(r'^KSUV=(\S+)', multiLine: true).firstMatch(r.out)?.group(1) ?? '';
+    ksuAppVersion = _normVer(
+        RegExp(r'^KSUV=(\S+)', multiLine: true).firstMatch(r.out)?.group(1) ?? '');
     final m = <String, String>{};
     for (final line in r.out.split('\n')) {
       final i = line.indexOf('=');
@@ -1366,6 +1367,15 @@ class RootChain extends ChangeNotifier {
   }
 
   /// su 现在能不能用（KernelSU 的 su 是"虚拟"的：文件不存在也能被内核劫持）
+  /// KernelSU 版本号规范化
+  ///
+  /// 坑：Honor 的 `dumpsys package` 输出 `versionName=v3.3.1`（自带 v 前缀），
+  /// 直接拼 " v$ver" 就成了 `vv3.3.1`，还会让版本比较假报警。
+  static String _normVer(String raw) {
+    final m = RegExp(r'[vV]?(\d+(?:\.\d+)+)').firstMatch(raw.trim());
+    return m?.group(1) ?? raw.trim();
+  }
+
   Future<bool> _ksuSuReady() async {
     final r = await ShizukuShell.run(
         'command -v su >/dev/null 2>&1 && echo Y || '

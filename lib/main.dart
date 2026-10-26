@@ -911,12 +911,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     IconButton(
                       tooltip: '复制',
                       icon: const Icon(Icons.copy_rounded, size: 19),
-                      onPressed: () {
-                        Clipboard.setData(ClipboardData(text: lines.join('\n')));
-                        ScaffoldMessenger.of(ctx).showSnackBar(
-                          const SnackBar(content: Text('已复制到剪贴板')),
-                        );
-                      },
+                      onPressed: () =>
+                          _copyLogs(lines, label: '历史日志', ctx: ctx),
                     ),
                     IconButton(
                       icon: const Icon(Icons.close_rounded, size: 21),
@@ -1030,12 +1026,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                   IconButton(
                     tooltip: '复制',
                     icon: const Icon(Icons.copy_rounded, size: 19),
-                    onPressed: () {
-                      Clipboard.setData(ClipboardData(text: chain.logs.join('\n')));
-                      ScaffoldMessenger.of(ctx).showSnackBar(
-                        const SnackBar(content: Text('已复制到剪贴板')),
-                      );
-                    },
+                    onPressed: () => _copyLogs(chain.logs, ctx: ctx),
                   ),
                   IconButton(
                     tooltip: '关闭',
@@ -1085,12 +1076,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     IconButton(
                       tooltip: '复制',
                       icon: const Icon(Icons.copy_rounded, size: 19),
-                      onPressed: () {
-                        Clipboard.setData(ClipboardData(text: chain.logs.join('\n')));
-                        ScaffoldMessenger.of(ctx).showSnackBar(
-                          const SnackBar(content: Text('已复制到剪贴板')),
-                        );
-                      },
+                      onPressed: () => _copyLogs(chain.logs, ctx: ctx),
                     ),
                     IconButton(
                       tooltip: '关闭',
@@ -1228,6 +1214,36 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
+  /// 一键复制：把「版本 + 设备现状 + 阶段结果 + 日志」一起复制
+  ///
+  /// 只复制日志时，别人拿到截图/文本不知道你跑的是哪个版本、卡在哪个阶段；
+  /// 这里把这三样拼在头部，配合 App 里的 [diag:*] 行，远程排障不用再问一轮。
+  Future<void> _copyLogs(List<String> lines,
+      {String label = '日志', BuildContext? ctx}) async {
+    final buf = StringBuffer()
+      ..writeln('=== 越狱助手 v$kAppVersion $label ===')
+      ..writeln('时间: ${DateTime.now().toString().substring(0, 19)}')
+      ..writeln('设备: ${chain.devState}');
+    final bad = chain.stages
+        .where((s) => s.status == StageStatus.failed)
+        .map((s) => '${s.title}=${s.detail}')
+        .join(' | ');
+    if (bad.isNotEmpty) buf.writeln('失败阶段: $bad');
+    if (chain.lastError != null && chain.lastError!.isNotEmpty) {
+      buf.writeln('lastError: ${chain.lastError}');
+    }
+    buf
+      ..writeln('阶段: ${chain.stages.map((s) => '${s.title}=${s.status.name}').join(' ')}')
+      ..writeln('--- 日志 ${lines.length} 行 ---')
+      ..writeln(lines.join('\n'));
+    await Clipboard.setData(ClipboardData(text: buf.toString()));
+    final c = ctx ?? context;
+    if (!c.mounted) return;
+    ScaffoldMessenger.of(c).showSnackBar(
+      SnackBar(content: Text('已复制 ${lines.length} 行（含版本与阶段摘要）')),
+    );
+  }
+
   Widget _logCard() {
     return Card(
       key: _logCardKey,
@@ -1242,6 +1258,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 const Text('日志',
                     style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
                 const Spacer(),
+                IconButton(
+                  tooltip: '复制全部日志',
+                  visualDensity: VisualDensity.compact,
+                  icon: const Icon(Icons.copy_all_rounded, size: 18),
+                  onPressed: () => _copyLogs(chain.logs),
+                ),
                 IconButton(
                   tooltip: '上次运行日志',
                   visualDensity: VisualDensity.compact,
