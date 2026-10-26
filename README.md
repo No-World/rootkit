@@ -259,6 +259,13 @@ python3 scripts/mk_symtab.py kallsyms_<ver>.txt assets/kallsyms_<ver>.bin.gz
 - 仓库：https://github.com/No-World/rootkit
 - 问题反馈：https://github.com/No-World/rootkit/issues
 
+## 贡献与分支规则
+
+`main` **只接受 PR 合并和发版**，不接受直接推送；新功能/修复一律开分支走 PR，
+CI `build-debug` 绿了才合并。发版 = 合并进 `main` → 打 tag → 发布 Release（CI 自动构建并挂 APK）。
+
+完整流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
 ## 技术资料
 
 | 文档 | 内容 |
