@@ -84,8 +84,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       if (ok && !_shizuku) {
         setState(() => _shizuku = true);
         _probeStatusOnce();
+        // 授权后立刻拉一次状态（温度/slab 等），不等用户的第一次点击
+        chain.refreshHealth();
       } else if (ok && _shizuku) {
-        _probeStatusOnce();
+        // ★ 跑链时绝不探测：detectStatus 会 spawn 一个 shell 跑 getenforce/pm/dumpsys，
+        //   每 3 秒来一次会把竞态窗口的时序彻底打乱（实测 panic 率上升），也抢 CPU。
+        if (!chain.running) _probeStatusOnce();
       } else if (!ok && _shizuku) {
         // 权限查询可能滞后：用一条真实命令复核，避免图标闪跳
         final r = await ShizukuShell.run('echo RK_OK');

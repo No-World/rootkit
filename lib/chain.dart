@@ -886,16 +886,20 @@ class RootChain extends ChangeNotifier {
     skipReason.clear();
     alreadyRooted = false;
     final r = await ShizukuShell.run(
+        'KSUV_CACHE="\${ksuAppVersion}"; export KSUV_CACHE; '
         r'echo ENF=$(getenforce 2>/dev/null);'
         r' echo KSU=$(grep -c "^kernelsu" /proc/modules 2>/dev/null || echo 0);'
         r' echo MODS=$(grep -cE "^(pwnm|pwn3|pwnf)" /proc/modules 2>/dev/null || echo 0);'
         r' echo ASSET=$(ls /data/local/tmp/rk/x645 /data/local/tmp/rk/pc /data/local/tmp/rk/ksupatch /data/local/tmp/rk/ml2 2>/dev/null | wc -l);'
         r' echo SUC=$(timeout 4 su -c id -u 2>/dev/null | tr -dc 0-9 | head -c 1);'
         r' echo UID=$(id -u);'
-        r' echo KSUAPP=$(pm list packages 2>/dev/null | grep -c me.weishu.kernelsu);'
+        // 轻量判断：pm path 比 "pm list packages | grep"（要枚举全部包）快一个量级
+        r' echo KSUAPP=$([ -n "$(pm path me.weishu.kernelsu 2>/dev/null)" ] && echo 1 || echo 0);'
         r' echo KSUDIR=$(ls -d /data/adb/ksu 2>/dev/null | head -1);'
         r' echo SUWHICH=$(command -v su 2>/dev/null || ls /data/adb/ksu/bin/su 2>/dev/null || echo);'
-        r' echo KSUV=$(dumpsys package me.weishu.kernelsu 2>/dev/null | sed -n "s/.*versionName=//p" | head -1);'
+        // dumpsys package 很重（binder + 枚举），只在还没拿到版本时查一次
+        r' echo KSUV=$([ -z "$KSUV_CACHE" ] && dumpsys package me.weishu.kernelsu 2>/dev/null'
+        r' | sed -n "s/.*versionName=//p" | head -1);'
         r' echo RESET=$(getprop sys.resettype 2>/dev/null);'
         r' echo LASTB=$(getprop sys.boot.reason.last 2>/dev/null);');
     for (final l in r.out.split('\n')) {
@@ -1068,6 +1072,8 @@ class RootChain extends ChangeNotifier {
           'P645_DRAIN_WAIT_MS=25000 P645_PIPE512=64 P645_SOCKS=64 P645_SOCK_MB=8 P645_UHID=0 '
           'P645_MODE=4 P645_ANON2_MB=1024 P645_PIPE_DRAIN=1 P645_PIPE_K=4 P645_SCAN_STOP=1 '
           'P645_THRESH=32 P645_RING_GO=0 P645_FORCE_LEFT=${calib.selinuxZeroTargetHex} P645_LOG=$logPath';
+      // 温度闸：>58°C 先降温再打（实测机身烫时命中率崩、panic 概率上升）
+      await _cooldownGate();
       _log('[permissive] run ${run + 1}: 开打（约 30–60s）');
       final r = await ShizukuShell.run(
         'cd $workDir && chmod 755 x645 && $env ./x645 2>&1; echo "RC=\$?"',
@@ -1140,6 +1146,7 @@ class RootChain extends ChangeNotifier {
 
   /// 设备健康 / slab 检查（温度、唤醒、内存、posix_timers_cache、cred_jar、SELinux）
   Future<void> refreshHealth() async {
+    if (running) return;   // 跑链期间一律不读（slabinfo/dumpsys 都会干扰竞态）
     final r = await ShizukuShell.run(
         'echo "T=\$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null)";'
         'echo "W=\$(dumpsys power 2>/dev/null | grep -m1 mWakefulness= | cut -d= -f2)";'
@@ -1214,9 +1221,18 @@ class RootChain extends ChangeNotifier {
     _healthTimer?.cancel();
     _healthTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
       // 跑链时不轮询：每 5s spawn 一个 shell 会干扰竞态窗口（命中率/panic 都受影响）
-      if (!shizukuOk || _healthBusy || running) return;
+      if (_healthBusy || running) return;
       _healthBusy = true;
       try {
+        // ★ 原来这里是 `if (!shizukuOk) return;` —— 死锁：shizukuOk 只在 refreshHealth 成功时置位，
+        //   而 refreshHealth 又被这个守卫拦住 ⇒ 打开 App 授权后永远不会开始轮询（用户实测的 bug）。
+        //   改成用 binder 查一次权限（很便宜，不 spawn 进程）。
+        if (!shizukuOk) {
+          final ok = await ShizukuShell.checkPermission();
+          if (!ok) return;
+          shizukuOk = true;
+          _log('[health] Shizuku 已授权，开始每 5s 刷新状态');
+        }
         await refreshHealth();
       } catch (_) {
       } finally {
@@ -1457,6 +1473,27 @@ class RootChain extends ChangeNotifier {
   static String _normVer(String raw) {
     final m = RegExp(r'[vV]?(\d+(?:\.\d+)+)').firstMatch(raw.trim());
     return m?.group(1) ?? raw.trim();
+  }
+
+  /// 开打前的温度闸（读 thermal_zone0，单位 m℃）
+  ///
+  /// 历史数据：>60°C 时 CPU 降到 1.3GHz，泄漏/命中都会掉；连带把竞态时序打乱，
+  /// 表现为"越跑越差 + 更容易 panic"。所以宁可等几十秒。
+  Future<void> _cooldownGate() async {
+    for (var i = 0; i < 6; i++) {
+      final r = await ShizukuShell.run(
+          'cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null');
+      final t = int.tryParse(RegExp(r'\d+').firstMatch(r.out)?.group(0) ?? '') ?? 0;
+      if (t <= 0) return;
+      if (t < 58000) {
+        if (i > 0) _log('[temp] ${(t / 1000).toStringAsFixed(1)}°C 已回落，开打');
+        return;
+      }
+      _log('[temp] 机身 ${(t / 1000).toStringAsFixed(1)}°C 偏热，等 10s 降频恢复（第 ${i + 1}/6 次）');
+      // 顺手把屏幕开着、别让系统进 doze
+      await ShizukuShell.run('input keyevent 224 2>/dev/null');
+      await _sleep(10000);
+    }
   }
 
   Future<bool> _ksuSuReady() async {

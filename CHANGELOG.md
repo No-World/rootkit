@@ -1,6 +1,24 @@
 # 变更记录
 
 ## v1.0.17 — 2026-10-26
+- **★ 修 panic 率过高（真凶：跑链期间还在每 3 秒做重活）**
+  实测统计（App 自己的 app.log，同一台机器同一天）：
+  · v1.0.16：8 次开打 → 7 次拿到判据（有泄漏/有 verdict），1 次中断
+  · v1.0.17 测试版：**7 次开打 → 7 次全部在开打后中断（panic）**
+  温度不是原因（用户是在降温后跑的，且 v1.0.16 反而是 panic 重启后直接跑）。
+  差异在 v1.0.17 新增的重活：
+  · `detectStatus` 被 `_pollShizuku` **每 3 秒**调一次，而它新增了 `pm list packages`
+    （枚举全部包）与 `dumpsys package me.weishu.kernelsu`（整包 dump，几百毫秒 + 大量分配）；
+  · `refreshHealth` 每 5 秒还会读 `/proc/slabinfo`（要拿 slab 锁）与 `dumpsys power`。
+  这些在竞态窗口里反复分配/持锁 ⇒ 被 UAF 释放的 `posix_timers_cache` 页更容易被重新占用、
+  写入垃圾 ⇒ 删除循环读到垃圾指针 ⇒ panic。
+  修法：**跑链期间彻底静默**（3s 探测、5s 健康轮询全部跳过；`refreshHealth` 里也加 `running` 早退），
+  并把 `detectStatus` 的 KSU 探测改轻量（`pm path` 代替 `pm list packages`；`dumpsys package`
+  只在还没拿到版本时查一次）。
+- **修「打开 App / 授权后不自动开始检测」**：5s 轮询的守卫是 `if (!shizukuOk) return`，
+  而 `shizukuOk` 只在 `refreshHealth` 成功时才置位 ⇒ 死锁，永远不轮询。改成用
+  `ShizukuShell.checkPermission()`（binder，不 spawn 进程）先翻状态；授权后立即刷一次。
+- **开打前加温度闸**：>58°C 先等（10s × 6），降温后再打。
 - **「现状」并进状态条，一行看完**：原来「现状：…」单独占一行、且只有打开 App 的快照；
   现在并进温度那条状态带（`温度 · 唤醒 · 内存 · posix · cred · SELinux · KSU/模块 ·
   管理器 · su ✓/✗ · 资产 n/4 · 上次 panic · 内核`），与温度同一个 5s 轮询，不再单独占行。
