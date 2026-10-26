@@ -2010,10 +2010,18 @@ class RootChain extends ChangeNotifier {
       return;
     }
     if (optStrictTemp) {
-      // 严格档等满也只是"没等到最佳状态"，照打但提醒（原来是直接放弃本轮）
       final raw2 = readTempMc();
-      _log('[temp] 等满 ${tries * 10 ~/ 60} 分钟仍在 ${(raw2 / 1000).toStringAsFixed(1)}°C：'
-          '照打，但 panic 概率会升高');
+      final c2 = (raw2 / 1000).toStringAsFixed(1);
+      // >55°C 等满还降不下来 = 散热条件根本不够（散热器撤掉/边充边打），照打基本必崩，
+      // 直接放弃本轮比打崩重启划算（重启代价 > 2 分钟，还要重装 APK）
+      if (raw2 > _tempOkMc) {
+        _log('[temp] ✗ 等满 ${tries * 10 ~/ 60} 分钟仍有 ${c2}°C（>55°C）⇒ 放弃本轮');
+        lastError = '机身 ${c2}°C 持续降不下来：先关屏静置 10–15 分钟，'
+            '或拔掉充电线/加散热再跑；这个温度打下去几乎必定 panic';
+        _stop = true;
+        return;
+      }
+      _log('[temp] 等满 ${tries * 10 ~/ 60} 分钟仍在 ${c2}°C：照打，但 panic 概率会升高');
       return;
     }
     _log('[temp] ✗ 等满 ${_tempGateTries * 10 ~/ 60} 分钟仍 >55°C，放弃本轮（过热时打必崩）');
