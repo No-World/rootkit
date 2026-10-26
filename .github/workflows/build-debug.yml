@@ -43,16 +43,20 @@ jobs:
 
       # 可选：固定 debug 签名 key。不提供时 runner 每次生成新 key ⇒ 不同次构建之间覆盖安装会签名冲突。
       # 注意：secrets 不能在 steps[*].if 里直接引用（会让整份 workflow 校验失败），要用 env 中转。
-      # 不固定 key 时，runner 每次生成新的 debug.keystore ⇒ 每次 CI 的测试包签名都不同，
-      # 手机上覆盖安装会 INSTALL_FAILED_UPDATE_INCOMPATIBLE。这里用 Secret 里的固定 key。
-      - name: Use stable debug keystore
+      # 固定测试包签名 key。
+      # 坑 1：不固定 ⇒ runner 每次生成新 key，覆盖安装报 INSTALL_FAILED_UPDATE_INCOMPATIBLE。
+      # 坑 2：把 key 写到 ~/.android/debug.keystore **没用** —— 实测 CI 上 AGP 仍用自己生成的那把
+      #       （APK 证书指纹 ≠ 放进去的 keystore），所以这里解到 workspace 并用 PR_TEST_KEYSTORE
+      #       传给 gradle（见 android/app/build.gradle 的 signingConfigs.prtest）。
+      - name: Decode test signing key
         if: env.DEBUG_KEYSTORE_B64 != ''
         run: |
-          mkdir -p ~/.android
-          echo "$DEBUG_KEYSTORE_B64" | base64 -d > ~/.android/debug.keystore
-          chmod 600 ~/.android/debug.keystore
-          keytool -list -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey \
-            | grep -iE "androiddebugkey|SHA" || true
+          mkdir -p "$GITHUB_WORKSPACE/ci"
+          echo "$DEBUG_KEYSTORE_B64" | base64 -d > "$GITHUB_WORKSPACE/ci/test.keystore"
+          chmod 600 "$GITHUB_WORKSPACE/ci/test.keystore"
+          keytool -list -keystore "$GITHUB_WORKSPACE/ci/test.keystore" -storepass android \
+            -alias androiddebugkey | grep -iE "androiddebugkey|SHA-256" || true
+          echo "PR_TEST_KEYSTORE=$GITHUB_WORKSPACE/ci/test.keystore" >> "$GITHUB_ENV"
 
       - name: Warn if debug keystore is not pinned
         if: env.DEBUG_KEYSTORE_B64 == ''

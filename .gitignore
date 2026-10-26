@@ -39,3 +39,4 @@ android/keystore/
 
 # 收款码（隐私）：仓库只保留中性占位图；真实图放 qr_*.real.png 由本地/CI 注入
 assets/qr_*.real.png
+/ci/

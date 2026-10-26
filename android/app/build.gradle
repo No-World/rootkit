@@ -52,6 +52,20 @@ android {
     }
 
     signingConfigs {
+        // PR/CI 测试包专用签名：keystore 由 CI 以**绝对路径**注入（PR_TEST_KEYSTORE）。
+        // 坑：把 key 放到 ~/.android/debug.keystore 不管用 —— 实测 CI 上 AGP 仍用自己生成的
+        // 那把 key（APK 证书指纹 ≠ 放进去的 keystore），所以这里显式指定路径。
+        if (System.getenv("PR_TEST_KEYSTORE")) {
+            prtest {
+                storeFile = file(System.getenv("PR_TEST_KEYSTORE"))
+                storePassword = System.getenv("PR_TEST_STORE_PASS") ?: "android"
+                keyAlias = System.getenv("PR_TEST_KEY_ALIAS") ?: "androiddebugkey"
+                keyPassword = System.getenv("PR_TEST_KEY_PASS") ?: "android"
+                enableV1Signing = true
+                enableV2Signing = true
+                enableV3Signing = true
+            }
+        }
         release {
             if (hasSigning) {
                 keyAlias = signKeyAlias
@@ -83,6 +97,10 @@ android {
             }
             // 有 key.properties 就用自建 release 签名，否则退回 debug（仅本地调试用）
             signingConfig = hasSigning ? signingConfigs.release : signingConfigs.debug
+            // CI 测试包：显式用注入的固定 key（优先级最高）
+            if (System.getenv("PR_TEST_KEYSTORE")) {
+                signingConfig = signingConfigs.prtest
+            }
             // 保留 Flutter 默认：不额外开启 R8（避免与 shrinkResources 冲突）
 
         }
