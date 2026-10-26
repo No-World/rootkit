@@ -1314,7 +1314,9 @@ class RootChain extends ChangeNotifier {
     final r = await ShizukuShell.run(
         // 温度走直读（readTempMc），这里不再读
         'echo "W=\$(dumpsys power 2>/dev/null | grep -m1 mWakefulness= | cut -d= -f2)";'
-        'echo "M=\$(free -m 2>/dev/null | awk \'/Mem:/{print \$3\"/\"\$2}\')";'
+        // 内存显示改成「可用/总」（原来 free 的 $3/$2 是已用/总，14858/15011 看着像要爆）
+        // 内存显示「可用/总」，按 GB 取整（原来是 free 的已用/总，看着像要爆）
+        'echo "M=\$(( \$(grep -m1 MemAvailable /proc/meminfo | tr -s " " | cut -d" " -f2) / 1048576 ))G/\$(( \$(grep -m1 MemTotal /proc/meminfo | tr -s " " | cut -d" " -f2) / 1048576 ))G";'
         'echo "P=\$(grep -m1 posix_timers_cache /proc/slabinfo 2>/dev/null | awk \'{print \$2\"/\"\$3}\')";'
         'echo "C=\$(grep -m1 \"^cred_jar\" /proc/slabinfo 2>/dev/null | awk \'{print \$2\"/\"\$3}\')";'
         'echo "E=\$(getenforce 2>/dev/null)"'
