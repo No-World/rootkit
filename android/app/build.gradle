@@ -74,6 +74,13 @@ android {
             debuggable true
         }
         release {
+            // PR / CI 测试包：复用 release 构建（AOT，体积≈正式版 19MB，debug 版 157MB ⇒ 3.7×）
+            // 但换包名 .debug + 版本后缀，且 CI 上没有 key.properties ⇒ 落到 debug 签名，可与正式版共存。
+            // 由 build-debug.yml 传 PR_TEST_BUILD=1 打开；本地正常打包不受影响。
+            if (System.getenv("PR_TEST_BUILD") == "1") {
+                applicationIdSuffix ".debug"
+                versionNameSuffix "-prtest"
+            }
             // 有 key.properties 就用自建 release 签名，否则退回 debug（仅本地调试用）
             signingConfig = hasSigning ? signingConfigs.release : signingConfigs.debug
             // 保留 Flutter 默认：不额外开启 R8（避免与 shrinkResources 冲突）

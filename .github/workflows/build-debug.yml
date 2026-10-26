@@ -1,22 +1,30 @@
 name: build-debug
-run-name: debug ${{ github.ref_name }}（仅编译校验，不签名不发布）
 
-# 编译校验版：PR / 任意分支（含 main）/ 手动触发
-# 产物包名 com.noworld.rootkit.debug（可与正式版共存），用 debug key 签名，不碰 release 签名 Secrets
-# 正式版构建只在打 tag 时由 build-release.yml 执行
+# 列表里一眼看出这是哪个 PR / 哪个分支（旧版直接显示 '2/merge'，看不出是什么）
+run-name: debug ${{ github.head_ref || github.ref_name }}
+
+# PR / main（合并结果）/ 手动。只在 PR 和 main 上跑：
+# 以前对 push 用了 branches: ['**']，导致「推分支」+「开/更新 PR」同一提交触发两份一样的构建。
 on:
   pull_request:
   push:
-    branches: [ '**' ]   # 只跟分支；tag 由 build-release.yml 负责，避免同一 tag 触发两份构建
+    branches: [ main ]
   workflow_dispatch:
 
+# PR 里回帖需要写权限；fork PR 上这步会被跳过（见 step 的 if）
+permissions:
+  contents: read
+
 concurrency:
-  group: build-debug-${{ github.ref }}
+  group: build-debug-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   debug:
+    name: debug
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v5
 
@@ -31,9 +39,8 @@ jobs:
           channel: stable
           cache: true
 
-      # debug 变体同样需要签名，AGP 默认用 ~/.android/debug.keystore（DN: CN=Android Debug）。
-      # 可选：固定 debug 签名 key —— 不提供时 runner 每次生成新 key ⇒ 覆盖安装会签名冲突。
-      # 注意：secrets 上下文不能在 steps[*].if 里用（会整份 workflow 校验失败），要用 env 中转。
+      # 可选：固定 debug 签名 key。不提供时 runner 每次生成新 key ⇒ 不同次构建之间覆盖安装会签名冲突。
+      # 注意：secrets 不能在 steps[*].if 里直接引用（会让整份 workflow 校验失败），要用 env 中转。
       - name: Use stable debug keystore (optional)
         env:
           DEBUG_KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
@@ -45,18 +52,74 @@ jobs:
 
       - run: flutter pub get
 
-      - name: Build debug APK (arm64)
-        run: flutter build apk --debug --target-platform android-arm64
-
-      - name: Show package info
+      # 测试包用 release 构建（AOT）而不是 debug：
+      #   实测体积 app-debug.apk 157MB（artifact 71MB） vs app-release.apk 19MB ⇒ 省 3.7 倍
+      # PR_TEST_BUILD=1 让 gradle 给 release 版本追加 applicationIdSuffix ".debug"；
+      # CI 上没有 key.properties ⇒ 签名落到 debug keystore，可与正式版共存。
+      - name: Build test APK (arm64)
+        env:
+          PR_TEST_BUILD: '1'
         run: |
-          APK=build/app/outputs/flutter-apk/app-debug.apk
-          ls -la "$APK"
-          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
-          $BT/aapt2 dump packagename "$APK" || true
+          # 版本号从 pubspec 取，避免 gradle 与 pubspec 不一致
+          ver=$(sed -n 's/^version: *\([0-9.]*\)+.*/\1/p' pubspec.yaml | head -1)
+          bn=$(sed -n 's/^version: *[0-9.]*+\([0-9]*\).*/\1/p' pubspec.yaml | head -1)
+          flutter build apk --release --target-platform android-arm64 \
+            --build-name "$ver" --build-number "$bn"
+
+      # 产物名带版本 + PR 号，手机上看得懂是哪个包
+      - name: Package artifact
+        id: pack
+        run: |
+          VER=$(sed -n 's/^version: *\([0-9.]*\)+.*/\1/p' pubspec.yaml | head -1)
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            SUF="pr${{ github.event.pull_request.number }}"
+          else
+            SUF="$(echo '${{ github.ref_name }}' | tr '/' '-')-$(echo '${{ github.sha }}' | cut -c1-7)"
+          fi
+          NAME="RootKit-v${VER}-${SUF}-test"
+          mkdir -p out
+          cp build/app/outputs/flutter-apk/app-release.apk "out/${NAME}.apk"
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          "$BT/aapt2" dump badging "out/${NAME}.apk" > /tmp/badging.txt
+          # 注意：不要用 sed "s/.*name='\([^']*\)'.*/\1/"，贪婪匹配会命中行尾的
+          # compileSdkVersionCodename='14' ⇒ 包名被解析成 "14"。用 dump packagename 最稳。
+          PKG=$("$BT/aapt2" dump packagename "out/${NAME}.apk" | tr -d '\r')
+          VN=$(sed -n "s/^package: .* versionName='\([^']*\)'.*/\1/p" /tmp/badging.txt | head -1)
+          VC=$(sed -n "s/^package: .* versionCode='\([^']*\)'.*/\1/p" /tmp/badging.txt | head -1)
+          MD5=$(md5sum "out/${NAME}.apk" | cut -d' ' -f1)
+          echo "${MD5}  ${NAME}.apk" > "out/${NAME}.apk.md5"
+          SIZE=$(du -h "out/${NAME}.apk" | cut -f1)
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
+          {
+            echo "### 测试包：${NAME}.apk"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 包名 | \`${PKG}\` |"
+            echo "| versionName | \`${VN}\` |"
+            echo "| versionCode | \`${VC}\` |"
+            echo "| 大小 | ${SIZE} |"
+            echo "| 签名 | debug key（**不能**覆盖正式版，可与正式版共存） |"
+            echo "| 构建 | release / AOT（与正式版同构，非 JIT debug 包） |"
+            echo "| md5 | \`${MD5}\` |"
+            echo ""
+            echo "下载：本页底部 **Artifacts → ${NAME}**（GitHub 强制打包成 zip，解压即为 apk）。"
+            echo ""
+            echo "安装："
+            echo '```'
+            echo "unzip ${NAME}.zip && adb install -r ${NAME}.apk"
+            echo '```'
+            echo ""
+            echo "注意：这个包是 \`${PKG}\`，**和正式版 \`com.noworld.rootkit\` 是两个 App**，桌面图标可能同名，别装错。"
+            echo ""
+            echo "Artifacts 直达：${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}#artifacts"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v7
         with:
-          name: RootKit-debug-apk
-          path: build/app/outputs/flutter-apk/app-debug.apk
+          name: ${{ steps.pack.outputs.name }}
+          path: out/*
           retention-days: 14
+          # 没匹配到文件时必须失败：默认只 warn，会静默产出"没有 Artifacts"的运行
+          if-no-files-found: error
