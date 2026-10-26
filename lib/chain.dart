@@ -195,7 +195,14 @@ class RootChain extends ChangeNotifier {
   String get _optSnapPath => '$workDir/opt_snapshot.txt';
 
   /// 上次运行没走到「恢复」就结束（panic / 被杀 / 用户强退）⇒ 开机后自动按记录还原
+  bool _leftoverChecked = false;
+  String _loggedDevState = '';
+  String _loggedResetType = '';
+  String _loggedSkip = '';
+
   Future<void> restoreLeftoverOptions() async {
+    if (_leftoverChecked) return;
+    _leftoverChecked = true;
     try {
       final r = await ShizukuShell.run('cat $_optSnapPath 2>/dev/null');
       final txt = r.out.trim();
@@ -361,13 +368,29 @@ class RootChain extends ChangeNotifier {
     }
   }
 
+  /// 去掉控制字符 / 私用区 / 代理区：底层的原生输出里混着二进制时，
+  /// Flutter 渲染不出来会变成一排 ▯（历史日志里出现过整屏方块）。
+  static String _san(String s) {
+    final sb = StringBuffer();
+    for (final r in s.runes) {
+      if (r == 0x0a) continue; // 行内不应有换行
+      if (r < 0x20 || r == 0x7f) continue;
+      if (r >= 0xD800 && r <= 0xDFFF) continue;
+      if (r >= 0xE000 && r <= 0xF8FF) continue;
+      if (r == 0xFFFD) continue;
+      sb.writeCharCode(r);
+    }
+    return sb.toString();
+  }
+
   void _log(String s) {
     if (s.isEmpty) return;
     final lines = s.split('\n');
     final buf = StringBuffer();
-    for (final l in lines) {
-      if (l.trim().isEmpty) continue;
-      final t = l.length > 400 ? '${l.substring(0, 400)}…' : l;
+    for (final raw in lines) {
+      final clean = _san(raw).trimRight();
+      if (clean.trim().isEmpty) continue;
+      final t = clean.length > 400 ? '${clean.substring(0, 400)}…' : clean;
       logs.add(t);
       buf.writeln(t);
     }
@@ -1102,11 +1125,6 @@ class RootChain extends ChangeNotifier {
         r' | sed -n "s/.*versionName=//p" | head -1);'
         r' echo RESET=$(getprop sys.resettype 2>/dev/null);'
         r' echo LASTB=$(getprop sys.boot.reason.last 2>/dev/null);');
-    for (final l in r.out.split('\n')) {
-      if (l.startsWith('KSUAPP=') || l.startsWith('KSUDIR=') || l.startsWith('SUWHICH=')) {
-        _log('[status] ${l.trim()}');
-      }
-    }
     // ↓ 供 preflight 与界面使用
     ksuAppInstalled = (RegExp(r'^KSUAPP=(\d+)', multiLine: true)
             .firstMatch(r.out)
@@ -1117,8 +1135,10 @@ class RootChain extends ChangeNotifier {
         RegExp(r'^KSUV=(\S+)', multiLine: true).firstMatch(r.out)?.group(1) ?? '');
     lastResetType =
         RegExp(r'^RESET=(\S+)', multiLine: true).firstMatch(r.out)?.group(1) ?? '';
-    if (lastResetType.toLowerCase().contains('panic') ||
-        lastResetType.toLowerCase().contains('abnormal')) {
+    if ((lastResetType.toLowerCase().contains('panic') ||
+            lastResetType.toLowerCase().contains('abnormal')) &&
+        lastResetType != _loggedResetType) {
+      _loggedResetType = lastResetType;
       _log('[status] 上次重启类型=$lastResetType（kernel panic ⇒ 命中后落地失败，属已知代价）');
     }
     final m = <String, String>{};
@@ -1141,8 +1161,11 @@ class RootChain extends ChangeNotifier {
       devState = '已越狱 · su 可用（${suPath.isEmpty ? "PATH" : suPath}）· '
           'KSU ${ksu > 0 ? "已加载" : "未加载"}';
       phase = '已越狱成功（无需操作）';
-      _log('[status] $devState');
-      _log('[status] 已越狱：全部阶段视为完成');
+      if (devState != _loggedDevState) {
+        _loggedDevState = devState;
+        _log('[status] $devState');
+        _log('[status] 已越狱：全部阶段视为完成');
+      }
       for (final id in StageId.values) {
         _stage(id, StageStatus.skipped, detail: '已越狱（su 可用）');
       }
@@ -1196,13 +1219,18 @@ class RootChain extends ChangeNotifier {
     health['A'] = '$asset';
     health['S'] = suc || suPath.isNotEmpty ? '1' : '0';
     devState = composeDevState();
-    _log('[status] $devState');
+    if (devState != _loggedDevState) {
+      _loggedDevState = devState;
+      _log('[status] $devState');
+    }
     if (ksuAppInstalled && ksuAppVersion.isNotEmpty && ksuAppVersion != kKsuManagerVersion) {
       _log('[status] ⚠ KernelSU 管理器 v$ksuAppVersion 与本模板内核（v$kKsuManagerVersion）不同；'
           '若 ⑦⑧ 异常，先换回 v$kKsuManagerVersion 再试');
     }
-    if (skipReason.isNotEmpty) {
-      _log('[status] 可跳过：${skipReason.keys.map((k) => k.name).join("、")}');
+    final skipLine = skipReason.keys.map((k) => k.name).join("、");
+    if (skipLine.isNotEmpty && skipLine != _loggedSkip) {
+      _loggedSkip = skipLine;
+      _log('[status] 可跳过：$skipLine');
     }
     notifyListeners();
   }
@@ -1761,19 +1789,20 @@ class RootChain extends ChangeNotifier {
     if (!optKillBg) return;
     final before = await ShizukuShell.run('ls /proc 2>/dev/null | grep -cE "^[0-9]"');
     final n0 = int.tryParse(before.out.trim()) ?? 0;
+    // 注意：**不能用 here-doc**。这条命令必须是一整行（Shizuku 通道按行执行），
+    // 而 `while read ... done <<EOF` 的正文必须从下一行开始 ⇒ 正文为空 ⇒ 循环一次都不跑，
+    // 真机上就表现成「只清第三方后台：0 个」。改成 for 遍历命令替换的结果。
     final r = await ShizukuShell.run(
         'TP=\$(pm list packages -3 2>/dev/null | cut -d: -f2)'
         '; K=""; N=0'
-        '; while read p; do'
+        '; for p in \$(ps -A -o args 2>/dev/null | sed "s/[: ].*//" | sort -u); do'
         ' case "\$p" in'
         ' com.noworld.rootkit*|moe.shizuku.privileged.api|me.weishu.kernelsu) continue;;'
         ' esac'
         ' printf "%s\\n" "\$TP" | grep -Fxq "\$p" || continue'
         ' am kill "\$p" >/dev/null 2>&1'
         ' K="\$K\$p,"; N=\$((N+1))'
-        ' done <<EOF2'
-        '\$(ps -A -o args 2>/dev/null | sed "s/[: ].*//" | sort -u)'
-        'EOF2'
+        ' done'
         '; echo KILLED=\$N; echo LIST=\$K');
     final out = r.out;
     final n = RegExp(r'KILLED=(\d+)').firstMatch(out)?.group(1) ?? '0';
@@ -1815,7 +1844,7 @@ class RootChain extends ChangeNotifier {
       final wake = m['W'] ?? '';
       _log('[envprobe:$tag] 唤醒=$wake 内存可用=${m['MA'] ?? '?'}KB '
           'Dirty=${m['DIRTY'] ?? '?'}KB swap=${m['SWF'] ?? '?'}KB '
-          '进程=${m['NPROC'] ?? '?'} 前三大户(rssK,名字)=${m['TOP'] ?? '?'}');
+          '进程=${m['NPROC'] ?? '?'} 内存前三(仅参考·不会被杀)=${m['TOP'] ?? '?'}');
       if (wake.isNotEmpty && wake != 'Awake') {
         _log('[envprobe:$tag] ⚠ 屏幕不在 Awake（$wake）⇒ 会先点屏唤醒；'
             '若仍 Dozing/Sleep，命中与落位都会显著变差');
