@@ -829,167 +829,183 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Future<void> _showOptions() async {
+    final maxH = MediaQuery.of(context).size.height * 0.72;
     await showDialog<void>(
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx2, setSt) => AlertDialog(
-          title: const Row(
+          // 关闭按钮放在标题右侧（原来在最底部，屏幕矮时够不到）
+          titlePadding: const EdgeInsets.fromLTRB(20, 12, 8, 0),
+          contentPadding: const EdgeInsets.fromLTRB(20, 4, 12, 8),
+          title: Row(
             children: [
-              Icon(Icons.tune_rounded, size: 20),
-              SizedBox(width: 8),
-              Text('选项', style: TextStyle(fontSize: 16)),
+              const Icon(Icons.tune_rounded, size: 20),
+              const SizedBox(width: 8),
+              const Text('选项', style: TextStyle(fontSize: 16)),
+              const Spacer(),
+              IconButton(
+                tooltip: '关闭',
+                visualDensity: VisualDensity.compact,
+                icon: const Icon(Icons.close_rounded, size: 20),
+                onPressed: () => Navigator.of(ctx).pop(),
+              ),
             ],
           ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              SwitchListTile(
-                dense: true,
-                contentPadding: EdgeInsets.zero,
-                value: chain.optTap,
-                title: const Text('每轮自动点屏', style: TextStyle(fontSize: 14)),
-                subtitle: const Text('防止息屏/doze 让命中率归零（建议开）',
-                    style: TextStyle(fontSize: 11)),
-                onChanged: (v) async {
-                  await chain.setOptions(tap: v);
-                  if (ctx2.mounted) setSt(() {});
-                },
-              ),
-              SwitchListTile(
-                dense: true,
-                contentPadding: EdgeInsets.zero,
-                value: chain.optStayOn,
-                title: const Text('保持屏幕常亮', style: TextStyle(fontSize: 14)),
-                subtitle: const Text('运行期间不让屏幕熄灭（建议开）',
-                    style: TextStyle(fontSize: 11)),
-                onChanged: (v) async {
-                  await chain.setOptions(stayOn: v);
-                  if (ctx2.mounted) setSt(() {});
-                },
-              ),
-              SwitchListTile(
-                dense: true,
-                contentPadding: EdgeInsets.zero,
-                value: chain.optKillBg,
-                title: const Text('开打前清理后台（默认关）', style: TextStyle(fontSize: 14)),
-                subtitle: const Text('每发之前只清理**第三方 App** 的后台进程'
-                    '（系统/供应商服务、Shizuku、KernelSU 一律不动）。'
-                    '后台多时会抢 pipe 页预算、干扰页回收，落位更容易失败（进而 panic）；'
-                    '被杀的后台重新打开即恢复，软重启可全部复原',
-                    style: TextStyle(fontSize: 11)),
-                onChanged: (v) async {
-                  await chain.setOptions(killBg: v);
-                  if (ctx2.mounted) setSt(() {});
-                },
-              ),
-              // 手动关常亮：开发者选项里自己开过「保持唤醒」时，一键把它关掉并恢复超时
-              Padding(
-                padding: const EdgeInsets.only(left: 2, bottom: 4),
-                child: Align(
-                  alignment: Alignment.centerLeft,
-                  child: TextButton.icon(
-                    style: TextButton.styleFrom(
-                        padding: const EdgeInsets.symmetric(horizontal: 4),
-                        minimumSize: const Size(0, 28),
-                        tapTargetSize: MaterialTapTargetSize.shrinkWrap),
-                    icon: const Icon(Icons.brightness_2_rounded, size: 15),
-                    label: const Text('现在关闭常亮（含开发者选项里的「保持唤醒」）',
-                        style: TextStyle(fontSize: 11.5)),
-                    onPressed: () async {
-                      await chain.disableStayOnNow();
-                      if (ctx2.mounted) {
-                        ScaffoldMessenger.of(ctx2).showSnackBar(const SnackBar(
-                            content: Text('已关闭常亮并恢复屏幕超时')));
-                      }
+          // 设置项可上下滑动：内容比屏幕高时不再被截断
+          content: ConstrainedBox(
+            constraints: BoxConstraints(maxHeight: maxH),
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SwitchListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    value: chain.optTap,
+                    title: const Text('每轮自动点屏', style: TextStyle(fontSize: 14)),
+                    subtitle: const Text('防止息屏/doze 让命中率归零（建议开）',
+                        style: TextStyle(fontSize: 11)),
+                    onChanged: (v) async {
+                      await chain.setOptions(tap: v);
+                      if (ctx2.mounted) setSt(() {});
                     },
                   ),
-                ),
+                  SwitchListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    value: chain.optStayOn,
+                    title: const Text('保持屏幕常亮', style: TextStyle(fontSize: 14)),
+                    subtitle: const Text('运行期间不让屏幕熄灭（建议开）',
+                        style: TextStyle(fontSize: 11)),
+                    onChanged: (v) async {
+                      await chain.setOptions(stayOn: v);
+                      if (ctx2.mounted) setSt(() {});
+                    },
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.only(left: 2, bottom: 4),
+                    child: Align(
+                      alignment: Alignment.centerLeft,
+                      child: TextButton.icon(
+                        style: TextButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(horizontal: 4),
+                            minimumSize: const Size(0, 28),
+                            tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+                        icon: const Icon(Icons.brightness_2_rounded, size: 15),
+                        label: const Text('现在关闭常亮（含开发者选项里的「保持唤醒」）',
+                            style: TextStyle(fontSize: 11.5)),
+                        onPressed: () async {
+                          await chain.disableStayOnNow();
+                          if (ctx2.mounted) {
+                            ScaffoldMessenger.of(ctx2).showSnackBar(const SnackBar(
+                                content: Text('已关闭常亮并恢复屏幕超时')));
+                          }
+                        },
+                      ),
+                    ),
+                  ),
+                  SwitchListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    value: chain.optWifiOff,
+                    title: const Text('运行前关闭 WiFi / 蓝牙（开飞行模式）',
+                        style: TextStyle(fontSize: 14)),
+                    subtitle: const Text('命中率更高（射频干扰更少）。代价：Shizuku 的无线调试会断开；'
+                        '重启后需要先重新打开 WiFi、在开发者选项里重新开启「无线调试」，'
+                        '才能再启动 Shizuku（或者用电脑 adb 启动，不需要 WiFi）',
+                        style: TextStyle(fontSize: 11)),
+                    onChanged: (v) async {
+                      await chain.setOptions(wifiOff: v);
+                      if (ctx2.mounted) setSt(() {});
+                    },
+                  ),
+                  SwitchListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    value: chain.optKillBg,
+                    title: const Text('开打前清理后台（默认关）',
+                        style: TextStyle(fontSize: 14)),
+                    subtitle: const Text('每发之前只清理第三方 App 的后台进程'
+                        '（系统/供应商服务、Shizuku、KernelSU 一律不动）。'
+                        '后台多时会抢 pipe 页预算、干扰页回收，落位更容易失败（进而 panic）；'
+                        '被杀的后台重新打开即恢复，软重启可全部复原',
+                        style: TextStyle(fontSize: 11)),
+                    onChanged: (v) async {
+                      await chain.setOptions(killBg: v);
+                      if (ctx2.mounted) setSt(() {});
+                    },
+                  ),
+                  SwitchListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    value: chain.optCleanup,
+                    title: const Text('成功后清理残留文件', style: TextStyle(fontSize: 14)),
+                    subtitle: const Text('停掉 5556 root shell、删除 /data/local/tmp/rk 里的原生件与临时文件'
+                        '（已加载的模块不受影响；下次运行会自动重新部署）',
+                        style: TextStyle(fontSize: 11)),
+                    onChanged: (v) async {
+                      await chain.setOptions(cleanup: v);
+                      if (ctx2.mounted) setSt(() {});
+                    },
+                  ),
+                  const Divider(height: 16),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: TextButton.icon(
+                      style: TextButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(horizontal: 4),
+                          minimumSize: const Size(0, 28),
+                          tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+                      icon: const Icon(Icons.restore_rounded, size: 15),
+                      label: const Text('立即恢复运行前的系统设置（超时/常亮/飞行/WiFi/蓝牙）',
+                          style: TextStyle(fontSize: 11.5)),
+                      onPressed: () async {
+                        await chain.restoreOptions();
+                        if (ctx2.mounted) {
+                          ScaffoldMessenger.of(ctx2).showSnackBar(const SnackBar(
+                              content: Text('已恢复运行前的系统设置')));
+                        }
+                      },
+                    ),
+                  ),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: TextButton.icon(
+                      style: TextButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(horizontal: 4),
+                          minimumSize: const Size(0, 30),
+                          tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+                      onPressed: () async {
+                        Navigator.of(ctx).pop();
+                        setState(() => chain.phase = '校准中');
+                        await chain.calib.detect(log: chain.addLogFromCalib);
+                        if (mounted) {
+                          setState(() => chain.phase = '空闲');
+                          _showCalibDialog();
+                        }
+                      },
+                      icon: const Icon(Icons.biotech_rounded, size: 16),
+                      label: const Text('重新校准（5 项自动探测）',
+                          style: TextStyle(fontSize: 11.5)),
+                    ),
+                  ),
+                  const Divider(height: 16),
+                  ListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    leading: const GithubMark(size: 20),
+                    title: const Text('GitHub 项目主页', style: TextStyle(fontSize: 14)),
+                    subtitle: const Text(kRepoUrl, style: TextStyle(fontSize: 11)),
+                    trailing: const Icon(Icons.open_in_new_rounded, size: 16),
+                    onTap: () {
+                      Navigator.of(ctx).pop();
+                      _openRepo();
+                    },
+                  ),
+                ],
               ),
-              SwitchListTile(
-                dense: true,
-                contentPadding: EdgeInsets.zero,
-                value: chain.optCleanup,
-                title: const Text('成功后清理残留文件', style: TextStyle(fontSize: 14)),
-                subtitle: const Text('停掉 5556 root shell、删除 /data/local/tmp/rk 里的原生件与临时文件'
-                    '（已加载的模块不受影响；下次运行会自动重新部署）',
-                    style: TextStyle(fontSize: 11)),
-                onChanged: (v) async {
-                  await chain.setOptions(cleanup: v);
-                  if (ctx2.mounted) setSt(() {});
-                },
-              ),
-              const Divider(height: 12),
-              Align(
-                alignment: Alignment.centerLeft,
-                child: TextButton.icon(
-                  style: TextButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(horizontal: 4),
-                      minimumSize: const Size(0, 28),
-                      tapTargetSize: MaterialTapTargetSize.shrinkWrap),
-                  icon: const Icon(Icons.restore_rounded, size: 15),
-                  label: const Text('立即恢复运行前的系统设置（超时/常亮/飞行/WiFi/蓝牙）',
-                      style: TextStyle(fontSize: 11.5)),
-                  onPressed: () async {
-                    await chain.restoreOptions();
-                    if (ctx2.mounted) {
-                      ScaffoldMessenger.of(ctx2).showSnackBar(const SnackBar(
-                          content: Text('已恢复运行前的系统设置')));
-                    }
-                  },
-                ),
-              ),
-              Align(
-                alignment: Alignment.centerLeft,
-                child: TextButton.icon(
-                  onPressed: () async {
-                    Navigator.of(ctx).pop();
-                    setState(() => chain.phase = '校准中');
-                    await chain.calib.detect(log: chain.addLogFromCalib);
-                    if (mounted) {
-                      setState(() => chain.phase = '空闲');
-                      _showCalibDialog();
-                    }
-                  },
-                  icon: const Icon(Icons.biotech_rounded, size: 18),
-                  label: const Text('重新校准（5 项自动探测）', style: TextStyle(fontSize: 13)),
-                ),
-              ),
-              SwitchListTile(
-                dense: true,
-                contentPadding: EdgeInsets.zero,
-                value: chain.optWifiOff,
-                title: const Text('运行前关闭 WiFi / 蓝牙（开飞行模式）',
-                    style: TextStyle(fontSize: 14)),
-                subtitle: const Text('命中率更高（射频干扰更少）。代价：Shizuku 的无线调试会断开；'
-                    '重启后需要先重新打开 WiFi、在开发者选项里重新开启「无线调试」，'
-                    '才能再启动 Shizuku（或者用电脑 adb 启动，不需要 WiFi）',
-                    style: TextStyle(fontSize: 11)),
-                onChanged: (v) async {
-                  await chain.setOptions(wifiOff: v);
-                  if (ctx2.mounted) setSt(() {});
-                },
-              ),
-              const Divider(height: 14),
-              ListTile(
-                dense: true,
-                contentPadding: EdgeInsets.zero,
-                leading: const GithubMark(size: 20),
-                title: const Text('GitHub 项目主页', style: TextStyle(fontSize: 14)),
-                subtitle: const Text(kRepoUrl, style: TextStyle(fontSize: 11)),
-                trailing: const Icon(Icons.open_in_new_rounded, size: 16),
-                onTap: () {
-                  Navigator.of(ctx).pop();
-                  _openRepo();
-                },
-              ),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(ctx).pop(),
-              child: const Text('关闭'),
             ),
-          ],
+          ),
         ),
       ),
     );
