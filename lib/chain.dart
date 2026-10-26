@@ -325,7 +325,8 @@ class RootChain extends ChangeNotifier {
           '若 ⑦⑧ 异常，先换回 v$kKsuManagerVersion');
     }
     if (!ksuDirReady) {
-      _log('[pre] 提示：加载完模块后若 su 仍不存在，打开 KernelSU 一次（顶部显示"未安装"时按提示装/修复）');
+      _log('[pre] 提示：su 是管理器在**检测到内核后**释放到 /data/adb/ksu/bin 的；'
+          '加载完模块本 App 会自动拉起一次 KernelSU（不需要点它的"安装"——那是解锁后改 boot.img 的流程）');
     }
   }
 
@@ -1364,6 +1365,50 @@ class RootChain extends ChangeNotifier {
     _advice();
   }
 
+  /// su 现在能不能用（KernelSU 的 su 是"虚拟"的：文件不存在也能被内核劫持）
+  Future<bool> _ksuSuReady() async {
+    final r = await ShizukuShell.run(
+        'command -v su >/dev/null 2>&1 && echo Y || '
+        '([ -x /data/adb/ksud ] && echo Y) || echo N');
+    return r.out.contains('Y');
+  }
+
+  /// 自己执行 KernelSU 的用户态安装（管理器"安装"按钮做的第二件事）
+  ///
+  /// 相当于：
+  ///   `<nativeLibDir>/libksud.so install --libadbroot <nativeLibDir>/libadbroot.so
+  ///                                    --data-path /data/user_de/0/me.weishu.kernelsu`
+  /// 效果：/data/adb/ksud 就位 + /data/adb/ksu/{bin,lib} 解包 + 软链；
+  /// 之后内核的 sucompat 才会把 `su` 劫持到 ksud（见 kernel/feature/sucompat.c）。
+  /// 全程只写 /data/adb，不需要解锁 BL、不碰 boot.img。
+  Future<bool> _ksuUserspaceInstall() async {
+    const pkg = 'me.weishu.kernelsu';
+    // 1) 找 nativeLibDir（libksud.so / libadbroot.so 在那里）
+    final r = await ShizukuShell.run(
+        'A=\$(pm path $pkg 2>/dev/null | head -1 | sed "s/^package://")'
+        '; B=\$(dirname "\$A")'
+        '; for d in "\$B"/lib/*; do [ -f "\$d/libksud.so" ] && echo LIB=\$d; done'
+        '; echo DEVDIR=/data/user_de/0/$pkg'
+        '; echo HAVEDEV=\$([ -d /data/user_de/0/$pkg ] && echo 1 || echo 0)');
+    final lib = RegExp(r'^LIB=(\S+)', multiLine: true).firstMatch(r.out)?.group(1) ?? '';
+    if (lib.isEmpty) {
+      _log('[ksu] 找不到 libksud.so（pm path 拿不到 nativeLibDir）：${r.out.trim()}');
+      return false;
+    }
+    _log('[ksu] 用户态安装：$lib/libksud.so install …（KernelSU 自己也是跑这一条）');
+    final cmd = '"$lib/libksud.so" install'
+        ' --libadbroot "$lib/libadbroot.so"'
+        ' --data-path /data/user_de/0/$pkg'
+        ' 2>&1; echo INSTALL_RC=\$?'
+        '; ls -l /data/adb/ksud /data/adb/ksu/bin/ksud 2>&1 | head -3'
+        '; echo SUCHK=\$(command -v su 2>/dev/null || echo none)';
+    final x = await ShizukuShell.run('echo ${_shq(cmd)} | nc 127.0.0.1 5556 2>&1');
+    _log('[ksu] 安装结果：${x.out.trim()}');
+    final ok = RegExp(r'INSTALL_RC=0').hasMatch(x.out) ||
+        RegExp(r'/data/adb/ksud').hasMatch(x.out);
+    return ok;
+  }
+
   /// ⑦ 的真实状态：**模块加载成功 ≠ KernelSU 可用**
   ///
   /// 三件事要分开看：
@@ -1391,11 +1436,47 @@ class RootChain extends ChangeNotifier {
   /// ⑦ 之后：KernelSU 模块已在 /proc/modules，但 **su 是由管理器（KSU App）释放到
   /// /data/adb/ksu/bin 的**，模块加载 ≠ su 可用。这里等最多 10s 并记录现场。
   Future<void> _afterKsuLoaded() async {
-    for (var i = 0; i < 5; i++) {
+    // 1) 先等几秒（有的是 insmod 后立刻可读）
+    for (var i = 0; i < 3; i++) {
       final r = await ShizukuShell.run(
           'ls /data/adb/ksu/bin/su /system/bin/su 2>/dev/null | head -1');
       if (r.out.trim().isNotEmpty) break;
       await _sleep(2000);
+    }
+    // 2) 还没有 su ⇒ 自己跑 KernelSU 的**用户态安装**（管理器里的"安装"做的就是这件事）
+    //
+    // 依据 KernelSU 源码：
+    //  · kernel/feature/sucompat.c:4  `#define SU_PATH "/system/bin/su"`，
+    //    在 faccessat/newfstatat/execve 上把 su 劫持成 **/data/adb/ksud**，
+    //    且只有 `is_ksud_exists()` 为真时才劫持 ⇒ 没有 /data/adb/ksud 时 `su` 就是 ENOENT。
+    //  · kernel/runtime/ksud.h:6 `KSUD_PATH "/data/adb/ksud"`。
+    //  · 管理器的 install()（ui/util/KsuCli.kt）只是执行
+    //    `<nativeLibDir>/libksud.so install --libadbroot <libadbroot.so> --data-path <deviceProtectedDataDir>`，
+    //    而 userspace/ksud/src/utils.rs::install() 就是把自己拷到 /data/adb/ksud + 解出 assets + 建软链。
+    //  ⇒ 我们已经有 root（⑥ 的自制模块），可以自己把这一步做掉，**不需要解锁 BL、不需要刷 boot.img**。
+    if (await _ksuSuReady() == false) {
+      await _ksuUserspaceInstall();
+    }
+    // 3) 还没有 su ⇒ 把 KernelSU 管理器**拉起来一次**
+    //    su/ksud 是管理器在"检测到内核"之后才释放到 /data/adb/ksu/bin 的，没人打开它就一直空着。
+    //    注意：这不是让它走"安装/修复"（那是解锁后改 boot.img 的注入流程，与本 LKM 路径无关）。
+    if (await _ksuSuReady() == false) {
+      final am = await ShizukuShell.run(
+          'am start -n me.weishu.kernelsu/.ui.MainActivity 2>&1 '
+          '|| monkey -p me.weishu.kernelsu -c android.intent.category.LAUNCHER 1 2>&1');
+      _log('[ksu] su 尚未出现，已尝试拉起 KernelSU 管理器：'
+          '${am.out.trim().split("\n").last}');
+      for (var i = 0; i < 4; i++) {
+        await _sleep(2000);
+        final r = await ShizukuShell.run(
+            'ls /data/adb/ksu/bin/su /system/bin/su 2>/dev/null | head -1');
+        if (r.out.trim().isNotEmpty) {
+          _log('[ksu] 管理器初始化完成，su 已就位：${r.out.trim()}');
+          break;
+        }
+      }
+      // 拉起后把界面收回去，别挡住用户
+      await ShizukuShell.run('am force-stop me.weishu.kernelsu 2>/dev/null');
     }
     final st = await _ksuState();
     final modOk = (int.tryParse(st['MODCNT'] ?? '0') ?? 0) > 0;
@@ -1517,9 +1598,10 @@ class RootChain extends ChangeNotifier {
 
     String why;
     if (ksuLoaded && !dirExists) {
-      why = 'KernelSU 模块已加载，但 /data/adb/ksu 不存在 ⇒ 管理器还没"安装/初始化"，'
-          'su 由管理器释放：打开 KernelSU App（顶部若显示"未安装"，按提示装/修复），'
-          '再回来重跑 ⑦⑧';
+      why = 'KernelSU 模块已加载，但 /data/adb/ksu 不存在 ⇒ 管理器还没初始化。'
+          'su/ksud 是管理器**检测到内核后**才释放到 /data/adb/ksu/bin 的：'
+          '手动打开一次 KernelSU（不是点它的"安装"，那是解锁后改 boot.img 的注入流程），'
+          '再回来重跑 ⑦⑧；若它打开后仍显示"未安装"，把本页日志发给作者（[diag-root] 里有内核镜像核对结果）';
     } else if (ksuLoaded && !appInstalled) {
       why = 'KernelSU 模块已加载，但没装 KernelSU 管理器 ⇒ 没有 su。装好管理器并打开一次，再重跑 ⑦⑧';
     } else if (ksuLoaded && !sysfs) {

@@ -1,6 +1,16 @@
 # 变更记录
 
 ## v1.0.17 — 2026-10-26
+- **⑦ 之后自动补做 KernelSU 的「用户态安装」**（这是本次真正的功能修复）
+  依据 KernelSU 源码，`su` 是**虚拟**的：`kernel/feature/sucompat.c` 把 `/system/bin/su`
+  在 `faccessat/newfstatat/execve` 上劫持到 **`/data/adb/ksud`**，且只有 `is_ksud_exists()`
+  为真才劫持 ⇒ 没有 `/data/adb/ksud` 时 `su` 就是 `ENOENT`（用户日志里那句
+  `su: inaccessible or not found`）。
+  而 `/data/adb/ksud` 是**管理器**跑 `libksud.so install --libadbroot … --data-path …` 生成的
+  （`userspace/ksud/src/utils.rs::install()`：把自己拷到 `/data/adb/ksud`、解 assets、建软链）。
+  本版在加载完模块后**自己跑这一条**（我们此时已有 root），
+  因此 **不需要点管理器的「安装」（那是解锁后改 boot.img 的注入流程）、也不需要解锁 BL**。
+  流程：等 su → 仍无则跑 ksud install → 仍无才拉起一次管理器 → 复查，每步都记日志。
 - **环境预检提前到 ② 一开始**（原来要跑到 ⑧ 才失败）：
   · **没装 KernelSU 管理器 ⇒ 直接拦下**并说明（`su` 由管理器释放，不装它整条链到 ⑧ 必没有 su，
     白跑 3–6 分钟）。要求 **KernelSU v3.3.1**（与本仓库 `ksu_template.ko` 同源），版本不同只警告。

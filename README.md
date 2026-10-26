@@ -65,8 +65,10 @@ KSU 加载成功后自动跳转 KernelSU。
   （与本仓库 `assets/ksu_template.ko.gz` 同源；版本不同时 App 只在日志里警告，但可能对不上协议）。
   **`su` 是这个管理器释放到 `/data/adb/ksu/bin` 的**，没装它 → 模块能加载、⑧ 一定没有 `su`。
   环境检查会先探测：没装就直接拦下并提示，不会白跑几分钟。
-  已实测同内核镜像的其它机型（荣耀 WIN RT2 / BRT-AN00）也能通过 ①–⑦；
-  若它的管理器顶部显示「未安装」，打开一次 KernelSU 让它初始化，然后回来重跑（①–⑥ 会跳过）。
+  **不需要点管理器里的「安装/修复」**——那是解锁后改 boot.img 的注入流程，与本路径无关：
+  App 在加载完模块后会自己执行 `libksud.so install`（KernelSU 源码里管理器"安装"按钮的第二步），
+  把 `/data/adb/ksud` 放好，`su` 才会被内核劫持出来（`kernel/feature/sucompat.c`）。
+  已实测同内核镜像的其它机型（荣耀 WIN RT2 / BRT-AN00）也能通过 ①–⑦。
 - 本 App 首次运行需在 Shizuku 弹窗里授权。
 
 > 说明：App 以 **shell（uid 2000）** 身份执行（Shizuku 通道），与 `adb shell` 等价；
