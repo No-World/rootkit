@@ -1636,23 +1636,32 @@ class RootChain extends ChangeNotifier {
 
   Future<void> _cooldownGate() async {
     for (var i = 0; i < _tempGateTries; i++) {
+      // 顺带把传感器名字读出来：不同机器 zone0 含义不同（本机是 cpullc-0-0，CPU LLC）
       final r = await ShizukuShell.run(
+          'cat /sys/class/thermal/thermal_zone0/type 2>/dev/null; '
           'cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null');
-      final t = int.tryParse(RegExp(r'\d+').firstMatch(r.out)?.group(0) ?? '') ?? 0;
+      final lines = r.out.trim().split('\n').map((e) => e.trim()).toList();
+      final zoneName = lines.isNotEmpty && !RegExp(r'^\d+$').hasMatch(lines.first)
+          ? lines.first
+          : 'zone0';
+      final tempLine = lines.lastWhere((e) => RegExp(r'^\d+$').hasMatch(e), orElse: () => '');
+      final t = int.tryParse(tempLine) ?? 0;
       if (t <= 0) return;
       health['T'] = '$t';
       notifyListeners();
       final c = (t / 1000).toStringAsFixed(1);
       if (t >= _tempBlockMc) {
-        _log('[temp] 机身 ${c}°C ≥45°C，阻断开打，等 10s 降温（第 ${i + 1}/$_tempGateTries 次）');
+        _log('[temp] 机身 ${c}°C（$zoneName）≥45°C，阻断开打，等 10s 降温'
+            '（第 ${i + 1}/$_tempGateTries 次）');
         await ShizukuShell.run('input keyevent 224 2>/dev/null');
         await _sleep(10000);
         continue;
       }
       if (t > _tempWarnMc) {
-        _log('[temp] ⚠ 机身 ${c}°C（>40°C 偏高，但 <45°C 放行）：命中率可能偏低，建议再晾一会儿');
+        _log('[temp] ⚠ 机身 ${c}°C（$zoneName，>40°C 偏高但 <45°C 放行）：'
+            '命中率可能偏低，建议再晾一会儿');
       } else if (i > 0) {
-        _log('[temp] ${c}°C 已降到 40°C 以下，开打');
+        _log('[temp] ${c}°C（$zoneName）已降到 40°C 以下，开打');
       }
       return;
     }
