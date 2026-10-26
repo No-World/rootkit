@@ -866,6 +866,20 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                   if (ctx2.mounted) setSt(() {});
                 },
               ),
+              SwitchListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                value: chain.optKillBg,
+                title: const Text('开打前清理后台（默认关）', style: TextStyle(fontSize: 14)),
+                subtitle: const Text('每发之前执行 am kill-all，回收可回收的后台进程。'
+                    '后台多时会抢 pipe 页预算/干扰页回收，落位更容易失败（进而 panic）；'
+                    '只影响后台，前台与常驻不受影响，软重启即可全部恢复',
+                    style: TextStyle(fontSize: 11)),
+                onChanged: (v) async {
+                  await chain.setOptions(killBg: v);
+                  if (ctx2.mounted) setSt(() {});
+                },
+              ),
               // 手动关常亮：开发者选项里自己开过「保持唤醒」时，一键把它关掉并恢复超时
               Padding(
                 padding: const EdgeInsets.only(left: 2, bottom: 4),

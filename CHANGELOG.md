@@ -32,6 +32,12 @@
   正常跑完仍走原来的 restore（同时删掉快照文件）。
   现场证据：设备上 `screen_off_timeout=1800000`、`stay_on_while_plugged_in=15`（15 是用户自己
   在开发者选项里开的），而快照文件不存在 —— 正是「panic 后内存快照丢失」的后果。
+- **新增「开打前清理后台」选项（默认关闭）**：每发之前执行 `am kill-all`，回收**可回收**的后台进程
+  （前台/常驻/白名单不动），并记录 `[killbg:*] 进程 N → M`。动机：后台 App 多时
+  ① 全局 pipe 页预算被占（日志里 `v8_pipe first F_SETPIPE_SZ=-1 errno=1`）、
+  ② 页回收竞争变强 ⇒ 落位失败 ⇒ panic。软重启即可全部恢复（进程本来会重建）。
+  同时新增 `[envprobe:*]`：每发前记录 唤醒态 / MemAvailable / Dirty / SwapFree / 进程数 /
+  前三大户，以及 `_ensureAwake()`（Dozing 时先点屏唤醒，唤不醒就放弃本轮）。
 - **选项里加两个手动按钮**：
   · 「现在关闭常亮（含开发者选项里的『保持唤醒』）」→ `svc power stayon false` +
     把 `screen_off_timeout` 恢复成运行前的值（没记录就 30s）。用户自己开过开发者选项的

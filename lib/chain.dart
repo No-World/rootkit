@@ -119,6 +119,9 @@ class RootChain extends ChangeNotifier {
   bool optTap = true;        // 每轮自动点屏（防止 doze 导致命中率归零）
   bool optStayOn = true;     // 保持屏幕常亮
   bool optCleanup = true;    // 成功后清理已落盘的原生件与临时文件
+  // 开打前清理后台（默认关闭）。动机：后台 App 多时 pipe 页预算被占（F_SETPIPE_SZ=EPERM）、
+  // 页回收竞争变强 ⇒ 落位失败 ⇒ panic。恢复：软重启/正常重启即可，进程本来就会重建。
+  bool optKillBg = false;
 
   Future<void> loadOptions() async {
     final a = await ShizukuShell.getPref('opt.wifiOff');
@@ -129,10 +132,12 @@ class RootChain extends ChangeNotifier {
     if (b != null) optTap = b == '1';
     if (c != null) optStayOn = c == '1';
     if (d != null) optCleanup = d == '1';
+    final e2 = await ShizukuShell.getPref('opt.killBg');
+    if (e2 != null) optKillBg = e2 == '1';
     notifyListeners();
   }
 
-  Future<void> setOptions({bool? wifiOff, bool? tap, bool? stayOn, bool? cleanup}) async {
+  Future<void> setOptions({bool? wifiOff, bool? tap, bool? stayOn, bool? cleanup, bool? killBg}) async {
     if (wifiOff != null) {
       optWifiOff = wifiOff;
       await ShizukuShell.setPref('opt.wifiOff', wifiOff ? '1' : '0');
@@ -144,6 +149,10 @@ class RootChain extends ChangeNotifier {
     if (stayOn != null) {
       optStayOn = stayOn;
       await ShizukuShell.setPref('opt.stayOn', stayOn ? '1' : '0');
+    }
+    if (killBg != null) {
+      optKillBg = killBg;
+      await ShizukuShell.setPref('opt.killBg', killBg ? '1' : '0');
     }
     if (cleanup != null) {
       optCleanup = cleanup;
@@ -1223,6 +1232,7 @@ class RootChain extends ChangeNotifier {
         _stop = true;
         return;
       }
+      await _killBackground('permissive');
       await _envProbe('permissive');
       _log('[permissive] run ${run + 1}: 开打（约 30–60s）');
       final r = await ShizukuShell.run(
@@ -1527,6 +1537,7 @@ class RootChain extends ChangeNotifier {
             .take(8)
             .map((c) => _hex(c + BigInt.from(calib.offCapBset)))
             .join(',');
+      await _killBackground('phase1');
       await _envProbe('phase1');
       final lg = await _runShot(
         stage: StageId.phase1,
@@ -1579,6 +1590,7 @@ class RootChain extends ChangeNotifier {
       final p = _hex(c + BigInt.from(calib.offCapPermitted));
       final ch = _hex(c + BigInt.from(calib.offCapEffective));
       final list = '3:$p:$ch,3:$p:$ch,3:$p:$ch';
+      await _killBackground('phase2');
       await _envProbe('phase2');
       final lg = await _runShot(
         stage: StageId.phase2,
@@ -1683,6 +1695,29 @@ class RootChain extends ChangeNotifier {
       return t.isEmpty ? 'zone0' : t;
     } catch (_) {
       return 'zone0';
+    }
+  }
+
+  /// 开打前清理后台（默认关闭；开关在「选项」里）
+  ///
+  /// - `am kill-all`：让系统回收**可回收**的后台进程（前台/常驻/白名单不动），最安全的一档
+  /// - 不做 `am force-stop` 逐个杀：会打断用户正在用的 App，风险与收益不成比例
+  /// - 副作用：Shizuku 自己也可能被回收 ⇒ 之后复核权限，掉线就提示重新授权
+  Future<void> _killBackground(String tag) async {
+    if (!optKillBg) return;
+    final b = await ShizukuShell.run('ls /proc 2>/dev/null | grep -cE "^[0-9]"');
+    final n0 = int.tryParse(b.out.trim()) ?? 0;
+    await ShizukuShell.run('am kill-all 2>/dev/null');
+    await _sleep(1200);
+    final a = await ShizukuShell.run('ls /proc 2>/dev/null | grep -cE "^[0-9]"');
+    final n1 = int.tryParse(a.out.trim()) ?? 0;
+    if (n0 > 0 && n1 > 0) {
+      _log('[killbg:$tag] am kill-all：进程 $n0 → $n1（回收 ${n0 - n1}）');
+    } else {
+      _log('[killbg:$tag] am kill-all 完成');
+    }
+    if (!await ShizukuShell.checkPermission()) {
+      _log('[killbg:$tag] ⚠ Shizuku 掉线（可能被一并回收）：请重新授权后再跑');
     }
   }
 
