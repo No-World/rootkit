@@ -175,15 +175,37 @@ class RootChain extends ChangeNotifier {
         '飞行=${g('A')} wifi=${g('W')} bt=${g('B')}');
   }
 
+  /// 立刻关掉"屏幕常亮"（手动按钮用）
+  ///
+  /// 场景：用户在开发者选项里自己开过「保持唤醒 / Stay awake」，
+  /// 或跑完链后想马上恢复正常休眠，不想等下一轮 restore。
+  /// 做两件事：`svc power stayon false` + 把屏幕超时恢复成运行前的值（没记录就 30s）。
+  Future<void> disableStayOnNow() async {
+    final t = _orig['T'];
+    final timeout = (t != null && t != 'null') ? t : '30000';
+    final r = await ShizukuShell.run(
+        'svc power stayon false; '
+        'settings put system screen_off_timeout $timeout; '
+        'echo STAY=\$(settings get global stay_on_while_plugged_in); '
+        'echo TO=\$(settings get system screen_off_timeout)');
+    _log('[opt] 已手动关闭常亮：$timeout ms'
+        '${r.out.trim().isEmpty ? "" : "（${r.out.trim().replaceAll("\n", " ")}）"}');
+    notifyListeners();
+  }
+
   /// 把选项改动过的系统设置恢复到运行前的状态
   Future<void> restoreOptions() async {
     if (!_optApplied) return;
     final b = StringBuffer();
+    // 注意：这里不再判断 optStayOn —— 只要快照里记过，就按原值恢复。
+    // （原来写成 `if (optStayOn && ...)`，用户中途关掉开关后反而恢复不了）
     final t = _orig['T'];
-    if (optStayOn && t != null && t != 'null') {
+    final s0 = _orig['S'];
+    if (t != null && t != 'null') {
       b.write('settings put system screen_off_timeout $t; ');
-      final s0 = _orig['S'];
-      if (s0 != null) b.write('settings put global stay_on_while_plugged_in $s0; ');
+    }
+    if (s0 != null && s0 != 'null') {
+      b.write('settings put global stay_on_while_plugged_in $s0; ');
     }
     if (optWifiOff) {
       final a = _orig['A'];

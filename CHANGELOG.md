@@ -18,6 +18,13 @@
 - **修「打开 App / 授权后不自动开始检测」**：5s 轮询的守卫是 `if (!shizukuOk) return`，
   而 `shizukuOk` 只在 `refreshHealth` 成功时才置位 ⇒ 死锁，永远不轮询。改成用
   `ShizukuShell.checkPermission()`（binder，不 spawn 进程）先翻状态；授权后立即刷一次。
+- **选项里加两个手动按钮**：
+  · 「现在关闭常亮（含开发者选项里的『保持唤醒』）」→ `svc power stayon false` +
+    把 `screen_off_timeout` 恢复成运行前的值（没记录就 30s）。用户自己开过开发者选项的
+    「保持唤醒」时，一键就能关掉，不用等下一轮 restore。
+  · 「立即恢复运行前的系统设置（超时/常亮/飞行/WiFi/蓝牙）」→ 直接调 `restoreOptions()`。
+  顺带修一个 bug：`restoreOptions()` 原来写成 `if (optStayOn && …)`，用户在跑链中途关掉开关后
+  反而恢复不了超时/常亮；现在只要快照里记过就恢复。
 - **防连点/连跑**：点一次「开始」后按钮立刻不可用；一轮结束进入冷却
   （成功 0s / 未成功 90s / **本轮检测到重启 180s**），按钮显示 `冷却中 123s` 倒计时，
   冷却期内 `start()` 也会直接拒绝。理由：每次 panic 重启都在重新加热机身，

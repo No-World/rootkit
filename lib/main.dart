@@ -861,6 +861,29 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                   if (ctx2.mounted) setSt(() {});
                 },
               ),
+              // 手动关常亮：开发者选项里自己开过「保持唤醒」时，一键把它关掉并恢复超时
+              Padding(
+                padding: const EdgeInsets.only(left: 2, bottom: 4),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: TextButton.icon(
+                    style: TextButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(horizontal: 4),
+                        minimumSize: const Size(0, 28),
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+                    icon: const Icon(Icons.brightness_2_rounded, size: 15),
+                    label: const Text('现在关闭常亮（含开发者选项里的「保持唤醒」）',
+                        style: TextStyle(fontSize: 11.5)),
+                    onPressed: () async {
+                      await chain.disableStayOnNow();
+                      if (ctx2.mounted) {
+                        ScaffoldMessenger.of(ctx2).showSnackBar(const SnackBar(
+                            content: Text('已关闭常亮并恢复屏幕超时')));
+                      }
+                    },
+                  ),
+                ),
+              ),
               SwitchListTile(
                 dense: true,
                 contentPadding: EdgeInsets.zero,
@@ -875,6 +898,25 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 },
               ),
               const Divider(height: 12),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton.icon(
+                  style: TextButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(horizontal: 4),
+                      minimumSize: const Size(0, 28),
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+                  icon: const Icon(Icons.restore_rounded, size: 15),
+                  label: const Text('立即恢复运行前的系统设置（超时/常亮/飞行/WiFi/蓝牙）',
+                      style: TextStyle(fontSize: 11.5)),
+                  onPressed: () async {
+                    await chain.restoreOptions();
+                    if (ctx2.mounted) {
+                      ScaffoldMessenger.of(ctx2).showSnackBar(const SnackBar(
+                          content: Text('已恢复运行前的系统设置')));
+                    }
+                  },
+                ),
+              ),
               Align(
                 alignment: Alignment.centerLeft,
                 child: TextButton.icon(
