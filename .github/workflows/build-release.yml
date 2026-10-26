@@ -24,6 +24,9 @@ concurrency:
 
 jobs:
   release:
+    # 只对正式 Release 构建。PR 测试包也会发「预发布」(pr-<号>)，
+    # 若不加这个门，每开一个 PR 都会触发一次签名构建并往预发布里塞签名包。
+    if: github.event_name == 'workflow_dispatch' || github.event.release.prerelease == false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

@@ -29,7 +29,40 @@ gh pr create --base main --fill           # 4. 开 PR（或网页开）
 gh pr merge --squash --delete-branch      # 5. 合并（squash，保持 main 单线可读）
 ```
 
-## 3. 模板（Issue / PR）
+## 3. PR 的测试包（怎么在自己手机上验）
+
+每个 PR 的 `debug` 检查会顺手构建一个**可直接装机的测试包**（两种拿法）：
+
+| 拿法 | 地址 | 是否 zip |
+|---|---|---|
+| 直链（推荐） | Releases 里的预发布 `pr-<号>`：`…/releases/download/pr-3/RootKit-v1.0.16-pr3-test.apk` | **不是**，点开就是 apk |
+| Actions Artifacts | PR → Checks → `debug` → 页面底部 | 是（GitHub 强制 zip） |
+
+| 项 | 值 |
+|---|---|
+| 包名 | `com.noworld.rootkit.debug` |
+| 构建 | **release / AOT**（与正式版同构），不是 JIT debug 包 |
+| 体积 | ≈19MB（debug 包要 157MB，artifact 71MB） |
+| 签名 | debug key ⇒ 可与正式版共存；**不能**覆盖正式版 |
+
+```bash
+adb install -r RootKit-v1.0.16-pr3-test.apk
+```
+
+**坑（都踩过）**：
+
+- **`actions/upload-artifact` 永远打包成 zip**，单文件也一样。要「点开就是 apk」只能挂 Release，
+  所以这里给每个 PR 建预发布 `pr-<号>`，PR 关闭时由 `pr-cleanup.yml` 自动删除。
+- **测试包不要用 `flutter build apk --debug`**：157MB，artifact 压完还有 71MB，
+  下载和装机都慢；改用 `PR_TEST_BUILD=1 flutter build apk --release`（gradle 会给 release
+  追加 `.debug` 包名与 `-prtest` 版本后缀），体积回到 ≈19MB 且行为与正式版一致。
+- **`upload-artifact` 找不到文件时默认只 warn**，会产出一个「没有任何 Artifacts」的绿色运行 ——
+  所以设了 `if-no-files-found: error`。看到「CI 没出包」先看是不是 0 job 的失败运行
+  （workflow 表达式写错时 GitHub 会造一个 0 job 的 failure run，页面上只有一句
+  `Invalid workflow file: …`）。
+- 包名带 `.debug` ⇒ 与正式版 `com.noworld.rootkit` 是两个 App，桌面图标同名，别点错。
+
+## 4. 模板（Issue / PR）
 
 开 Issue 时按类型选模板，**它们问的都是定位必需的信息**，不填没法查：
 
@@ -43,7 +76,7 @@ PR 模板可点选：`?template=bugfix.md` / `feature.md` / `adaptation.md` / `c
 （默认模板 `PULL_REQUEST_TEMPLATE.md` 就是这四个的索引）。
 适配类 PR 必须带**跑完整链后相机/电话/输入法正常**这一项 —— 这是「写坏内核状态」最容易漏测的地方。
 
-## 4. 发版流程（只有 `main` 才发）
+## 5. 发版流程（只有 `main` 才发）
 
 ```bash
 git checkout main && git pull
@@ -59,7 +92,7 @@ gh release create v1.0.17 --title "v1.0.17 —— ..." --notes-file notes.md
 - 所以：**先合并进 `main`，再在 `main` 的提交上打 tag**；tag 指向的提交里必须有当版 workflow，
   否则 CI 用的是旧 workflow。
 
-## 5. PR 检查清单
+## 6. PR 检查清单
 
 - [ ] `flutter analyze` 无新增 error（模板自带的 `test/widget_test.dart` 报错属已知，不影响）
 - [ ] CI `build-debug` 绿
@@ -67,7 +100,7 @@ gh release create v1.0.17 --title "v1.0.17 —— ..." --notes-file notes.md
 - [ ] 改了阶段逻辑时，CHANGELOG 写清「现象 → 根因 → 修法 → 验证判据」
 - [ ] **绝不提交**：签名私钥（`*.jks`）、`key.properties`、真实收款码、设备序列号/IP/口令
 
-## 6. 为什么这么定（踩过的坑）
+## 7. 为什么这么定（踩过的坑）
 
 - **直推 `main` 曾把带真实收款码的历史推上去**，事后只能重建历史 + 删 tag/Release。
   PR 至少留一次「合并前看得见」的机会。

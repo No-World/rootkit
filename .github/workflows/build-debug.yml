@@ -13,7 +13,7 @@ on:
 
 # PR 里回帖需要写权限；fork PR 上这步会被跳过（见 step 的 if）
 permissions:
-  contents: read
+  contents: write      # 给 PR 建「测试包预发布」需要（下载直链）；只写 tag/release，不碰代码
   pull-requests: write
 
 concurrency:
@@ -53,8 +53,19 @@ jobs:
 
       - run: flutter pub get
 
-      - name: Build debug APK (arm64)
-        run: flutter build apk --debug --target-platform android-arm64
+      # 测试包用 release 构建（AOT）而不是 debug：
+      #   实测体积 app-debug.apk 157MB（artifact 71MB） vs app-release.apk 19MB ⇒ 省 3.7 倍
+      # PR_TEST_BUILD=1 让 gradle 给 release 版本追加 applicationIdSuffix ".debug"；
+      # CI 上没有 key.properties ⇒ 签名落到 debug keystore，可与正式版共存。
+      - name: Build test APK (arm64)
+        env:
+          PR_TEST_BUILD: '1'
+        run: |
+          # 版本号从 pubspec 取，避免 gradle 与 pubspec 不一致
+          ver=$(sed -n 's/^version: *\([0-9.]*\)+.*/\1/p' pubspec.yaml | head -1)
+          bn=$(sed -n 's/^version: *[0-9.]*+\([0-9]*\).*/\1/p' pubspec.yaml | head -1)
+          flutter build apk --release --target-platform android-arm64 \
+            --build-name "$ver" --build-number "$bn"
 
       # 产物名带版本 + PR 号，手机上看得懂是哪个包
       - name: Package artifact
@@ -66,9 +77,9 @@ jobs:
           else
             SUF="$(echo '${{ github.ref_name }}' | tr '/' '-')-$(echo '${{ github.sha }}' | cut -c1-7)"
           fi
-          NAME="RootKit-v${VER}-${SUF}-debug"
+          NAME="RootKit-v${VER}-${SUF}-test"
           mkdir -p out
-          cp build/app/outputs/flutter-apk/app-debug.apk "out/${NAME}.apk"
+          cp build/app/outputs/flutter-apk/app-release.apk "out/${NAME}.apk"
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
           "$BT/aapt2" dump badging "out/${NAME}.apk" > /tmp/badging.txt
           # 注意：不要用 sed "s/.*name='\([^']*\)'.*/\1/"，贪婪匹配会命中行尾的
@@ -91,6 +102,7 @@ jobs:
             echo "| versionCode | \`${VC}\` |"
             echo "| 大小 | ${SIZE} |"
             echo "| 签名 | debug key（**不能**覆盖正式版，可与正式版共存） |"
+            echo "| 构建 | release / AOT（与正式版同构，非 JIT debug 包） |"
             echo "| md5 | \`${MD5}\` |"
             echo ""
             echo "下载：本页底部 **Artifacts → ${NAME}**（zip 里就是 apk）。"
@@ -113,6 +125,31 @@ jobs:
           # 没匹配到文件时必须失败：默认只 warn，会静默产出"没有 Artifacts"的运行
           if-no-files-found: error
 
+      # artifacts 下载永远是 zip（GitHub 强制的）。要「点一下就是 .apk」，
+      # 就给每个 PR 建一个预发布 tag `pr-<号>`，把 apk 直接挂上去：
+      #   https://github.com/<owner>/<repo>/releases/download/pr-3/RootKit-....apk
+      # 预发布不进 Releases 的 "Latest"；PR 关闭时由 pr-cleanup.yml 删除。
+      - name: Publish direct APK link (per-PR prerelease)
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        run: |
+          NAME='${{ steps.pack.outputs.name }}'
+          PKG='${{ steps.pack.outputs.pkg }}'
+          TAG="pr-${{ github.event.pull_request.number }}"
+          {
+            echo "PR：${{ github.event.pull_request.html_url }}"
+            echo ""
+            echo "分支 \`${{ github.event.pull_request.head.ref }}\` · 提交 \`${{ github.sha }}\`"
+            echo ""
+            echo "包名 \`${PKG}\`，release/AOT 构建 + debug 签名：**与正式版共存**，不能覆盖正式版。"
+            echo ""
+            echo "安装：\`adb install -r ${NAME}.apk\`，或手机直接点下面的 .apk"
+          } > /tmp/release-notes.md
+          gh release delete "$TAG" --repo '${{ github.repository }}' --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" "out/${NAME}.apk" "out/${NAME}.apk.md5" \
+            --repo '${{ github.repository }}' --prerelease \
+            --title "PR #${{ github.event.pull_request.number }} 测试包（自动构建）" \
+            --notes-file /tmp/release-notes.md
+
       # 同仓库 PR 才回帖（fork PR 的 token 只读，回帖会 403 把 job 弄红）
       - name: Comment artifact link on PR
         if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
@@ -124,7 +161,10 @@ jobs:
             echo ""
             echo "下载：本 PR 的 **Checks → debug → 页面底部 Artifacts** → \`${NAME}\`"
             echo ""
-            echo "直达：${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}#artifacts"
+            echo ""
+            echo "**直链（不用解压）**：${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/pr-${{ github.event.pull_request.number }}/${NAME}.apk"
+            echo ""
+            echo "Artifacts（zip）：${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}#artifacts"
             echo ""
             echo "md5：\`$(cat "out/${NAME}.apk.md5" | cut -d' ' -f1)\`"
             echo ""
