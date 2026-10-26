@@ -910,7 +910,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     value: chain.optWifiOff,
                     title: const Text('运行前关闭 WiFi / 蓝牙（开飞行模式）',
                         style: TextStyle(fontSize: 14)),
-                    subtitle: const Text('命中率更高（射频干扰更少）。代价：Shizuku 的无线调试会断开；'
+                    subtitle: const Text('只开飞行模式（WiFi/蓝牙由系统自行关闭，不单独去关）。'
+                        '命中率更高（射频干扰更少）。代价：Shizuku 的无线调试会断开；'
                         '重启后需要先重新打开 WiFi、在开发者选项里重新开启「无线调试」，'
                         '才能再启动 Shizuku（或者用电脑 adb 启动，不需要 WiFi）',
                         style: TextStyle(fontSize: 11)),

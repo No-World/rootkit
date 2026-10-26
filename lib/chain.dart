@@ -263,16 +263,14 @@ class RootChain extends ChangeNotifier {
         b.write('am broadcast -a android.intent.action.AIRPLANE_MODE --ez state '
             '${a == '1' ? 'true' : 'false'} >/dev/null 2>&1; ');
       }
-      final w = _orig['W'];
-      if (w != null) b.write('svc wifi ${w == '1' ? 'enable' : 'disable'}; ');
-      final bt = _orig['B'];
-      if (bt != null) b.write('svc bluetooth ${bt == '1' ? 'enable' : 'disable'}; ');
+      // WiFi/蓝牙不再单独恢复：关掉飞行模式后系统会按自身策略恢复射频，
+      // 强行 svc wifi/bluetooth 反而可能与飞行模式状态机冲突。
     }
     if (b.isEmpty) return;
     b.write('true');
     final r = await ShizukuShell.run(b.toString());
     await ShizukuShell.run('rm -f $_optSnapPath');
-    _log('[env] 已恢复原设置（屏幕超时/常亮/飞行/WiFi/蓝牙）rc=${r.code}');
+    _log('[env] 已恢复原设置（屏幕超时/常亮/飞行模式）rc=${r.code}');
     _optApplied = false;
   }
 
@@ -289,7 +287,9 @@ class RootChain extends ChangeNotifier {
       b.write('svc power stayon true; settings put system screen_off_timeout 1800000; ');
     }
     if (optWifiOff) {
-      b.write('svc wifi disable; svc bluetooth disable; settings put global airplane_mode_on 1; '
+      // 只开飞行模式：WiFi/蓝牙由系统在切换飞行模式时自行关闭，
+      // 不再单独 `svc wifi/bluetooth disable`（多此一举，且会和系统的飞行模式状态机打架）。
+      b.write('settings put global airplane_mode_on 1; '
           'am broadcast -a android.intent.action.AIRPLANE_MODE --ez state true >/dev/null 2>&1; ');
     }
     b.write('true');
@@ -512,7 +512,14 @@ class RootChain extends ChangeNotifier {
       // 我们自己的 root shell 是 ID=0，临时关掉再读，读完写回原值。
       // kptr_restrict==2 时内核的 kallsyms_show_value() 无条件返回 0
       // （uid=0/CAP_SYSLOG 也看不到），所以要在 root shell 里临时置 0、读完立刻写回。
-      final cmd = 'K=\$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null || echo 2)'
+      // 先把「原始值」持久化，之后每次核对前若发现它被留在 0（上一次没恢复），自动写回。
+      // 本机原始值是 2（user build 默认），若是 0 也照用户的 0 处理。
+      final cmd = 'F=/data/local/tmp/rk/kptr_orig.txt'
+          '; K=\$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null || echo 2)'
+          '; O=\$(cat \$F 2>/dev/null)'
+          '; [ -z "\$O" ] && { echo "\$K" > \$F; O=\$K; }'
+          '; if [ "\$K" != "\$O" ]; then echo "\$O" > /proc/sys/kernel/kptr_restrict 2>/dev/null;'
+          ' echo KPTR_FIXED=\$K-\>\$O; K=\$O; fi'
           '; echo ID=\$(id -u)'
           '; echo CTX=\$(id -Z 2>/dev/null)'
           '; echo KPTR_OLD=\$K'
@@ -520,7 +527,7 @@ class RootChain extends ChangeNotifier {
           '; echo KPTR_AFTER=\$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null)'
           '; grep -E " (_stext|selinux_state|init_task|commit_creds|prepare_kernel_cred|init_cred)\$"'
           ' /proc/kallsyms 2>/dev/null | head -8'
-          '; echo "\$K" > /proc/sys/kernel/kptr_restrict; echo RESTORE_RC=\$?'
+          '; echo "\$O" > /proc/sys/kernel/kptr_restrict; echo RESTORE_RC=\$?'
           '; echo KPTR_NOW=\$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null)'
           '; echo ---DMESG-KSU---'
           '; dmesg 2>/dev/null | grep -iE "ksu|kernelsu" | tail -6';
