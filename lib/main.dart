@@ -53,7 +53,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   final ScrollController _logScroll = ScrollController();
   bool _shizuku = false;
   bool _stagesExpanded = false; // 阶段列表默认折叠
-  Timer? _shizukuPoll;          // Shizuku 授权状态轮询
+  Timer? _shizukuPoll;   // Shizuku 授权状态轮询（3s，仅 binder 查询）
+  Timer? _coolTick;   // 冷却倒计时用（1s，纯 UI，不 spawn shell）
   bool _pollBusy = false;
   bool _statusProbed = false;
 
@@ -118,7 +119,26 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   bool _celebrated = false;
 
+  /// 冷却倒计时：只在「运行中或冷却中」时每秒刷一次 UI（纯 setState，不 spawn 任何进程）
+  void _ensureCoolTick() {
+    final need = chain.running || chain.startCooldownLeft > 0;
+    if (!need) {
+      _coolTick?.cancel();
+      _coolTick = null;
+      return;
+    }
+    _coolTick ??= Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      setState(() {});
+      if (!chain.running && chain.startCooldownLeft == 0) {
+        _coolTick?.cancel();
+        _coolTick = null;
+      }
+    });
+  }
+
   void _onChange() {
+    _ensureCoolTick();
     if (!mounted) return;
     setState(() {});
     if (chain.success && !_celebrated) {
@@ -160,6 +180,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   @override
   void dispose() {
     _shizukuPoll?.cancel();
+    _coolTick?.cancel();
     chain.stopHealthPolling();
     WidgetsBinding.instance.removeObserver(this);
     chain.removeListener(_onChange);
@@ -1326,14 +1347,23 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   Widget _buttons() {
     final busy = chain.running;
+    final cool = chain.startCooldownLeft;   // >0 = 冷却中，禁止再次点「开始」
     return Row(
       children: [
         Expanded(
           flex: 5,
           child: FilledButton.icon(
-            onPressed: busy ? null : () => chain.start(),
-            icon: const Icon(Icons.play_arrow_rounded, size: 18),
-            label: Text(busy ? '执行中…' : '开始越狱', style: const TextStyle(fontSize: 13)),
+            // 连点保护：运行中 或 冷却中 一律禁用（连点只会让设备反复重启升温）
+            onPressed: (busy || cool > 0 || !chain.canStart) ? null : () => chain.start(),
+            icon: Icon(busy
+                ? Icons.hourglass_top_rounded
+                : (cool > 0 ? Icons.thermostat_rounded : Icons.play_arrow_rounded),
+                size: 18),
+            label: Text(
+                busy
+                    ? '执行中…'
+                    : (cool > 0 ? '冷却中 ${cool}s' : '开始越狱'),
+                style: const TextStyle(fontSize: 13)),
             style: FilledButton.styleFrom(
               padding: const EdgeInsets.symmetric(vertical: 11),
             ),

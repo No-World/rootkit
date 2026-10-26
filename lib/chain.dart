@@ -84,6 +84,34 @@ class RootChain extends ChangeNotifier {
   String devState = '';                        // 一句话设备现状（用于界面）
   Timer? _healthTimer;                        // 5s 主动刷新状态区
   bool _healthBusy = false;                   // 防重入
+
+  // ---- 连点/连跑保护 ----
+  // 用户实测：连点"开始"会让设备连续重启，每次 panic 重启都在重新加热；
+  // 而且一轮跑完后立刻再点，命中率显著更差。所以：
+  //   · 运行中按钮禁用（原有）
+  //   · 一轮结束后进入冷却：成功 0s / 失败 90s / 疑似重启 180s
+  DateTime? _lastEndAt;
+  bool _lastRunFailed = false;
+  DateTime? _lastStartAt;
+  static const int _coolDownFailSec = 90;
+  static const int _coolDownPanicSec = 180;
+
+  /// 还要等多少秒才能再次点「开始」（0 = 可以点）
+  int get startCooldownLeft {
+    final end = _lastEndAt;
+    if (end == null) return 0;
+    final need = _lastRunFailed
+        ? (_rebootSeenInRun ? _coolDownPanicSec : _coolDownFailSec)
+        : 0;
+    if (need == 0) return 0;
+    final left = need - DateTime.now().difference(end).inSeconds;
+    return left > 0 ? left : 0;
+  }
+
+  bool get canStart => !running && startCooldownLeft == 0;
+
+  /// 本轮是否检测到过重启（panic）
+  bool _rebootSeenInRun = false;
   String shizukuVia = '';
 
   // ---- 可选项（持久化在 App 私有 SharedPreferences）----
@@ -677,6 +705,12 @@ class RootChain extends ChangeNotifier {
 
   Future<void> start() async {
     if (running) return;
+    if (startCooldownLeft > 0) {
+      _log('[start] 冷却中（还需 ${startCooldownLeft}s）：连点/连跑只会让设备反复重启升温');
+      return;
+    }
+    _lastStartAt = DateTime.now();
+    _rebootSeenInRun = false;
     running = true;
     _stop = false;
     lastError = null;
@@ -779,9 +813,15 @@ class RootChain extends ChangeNotifier {
         phase = '已完成（含跳过）';
       }
       running = false;
+      _lastEndAt = DateTime.now();
+      _lastRunFailed = !success;
       _saveStats();
       _advice();
       notifyListeners();
+      if (startCooldownLeft > 0) {
+        _log('[start] 本轮结束：${_lastRunFailed ? (_rebootSeenInRun ? "检测到重启" : "未成功") : "成功"}'
+            '，冷却 ${startCooldownLeft}s 后才能再次点「开始」（别连点：会让设备反复重启升温）');
+      }
       // 跑完一轮：刷新一次状态（事件驱动的最后一个时机）
       refreshStatus();
     }
@@ -1295,6 +1335,7 @@ class RootChain extends ChangeNotifier {
     final b = await _bootId();
     if (b.isNotEmpty && bootId.isNotEmpty && b != bootId) {
       bootId = b;
+      _rebootSeenInRun = true;   // 本轮遇到过重启 ⇒ 冷却时间加倍（180s）
       return true;
     }
     return false;

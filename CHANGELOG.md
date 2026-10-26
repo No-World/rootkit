@@ -18,6 +18,10 @@
 - **修「打开 App / 授权后不自动开始检测」**：5s 轮询的守卫是 `if (!shizukuOk) return`，
   而 `shizukuOk` 只在 `refreshHealth` 成功时才置位 ⇒ 死锁，永远不轮询。改成用
   `ShizukuShell.checkPermission()`（binder，不 spawn 进程）先翻状态；授权后立即刷一次。
+- **防连点/连跑**：点一次「开始」后按钮立刻不可用；一轮结束进入冷却
+  （成功 0s / 未成功 90s / **本轮检测到重启 180s**），按钮显示 `冷却中 123s` 倒计时，
+  冷却期内 `start()` 也会直接拒绝。理由：每次 panic 重启都在重新加热机身，
+  连点只会让设备在 68°C 上反复崩。
 - **双包共存提醒**：`.debug` 测试包与正式包同时装着时，两个 App 各自的 3s/5s 轮询会一起往
   竞态窗口里 spawn shell（实测显著提高 panic 率）。② 预检会检测「正式包在运行」并提示：
   `am force-stop com.noworld.rootkit` 或临时卸载它。
