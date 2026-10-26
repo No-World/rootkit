@@ -1,22 +1,28 @@
 name: build-debug
-run-name: debug ${{ github.ref_name }}（仅编译校验，不签名不发布）
 
-# 编译校验版：PR / 任意分支（含 main）/ 手动触发
-# 产物包名 com.noworld.rootkit.debug（可与正式版共存），用 debug key 签名，不碰 release 签名 Secrets
-# 正式版构建只在打 tag 时由 build-release.yml 执行
+# PR / main（合并结果）/ 手动。只在 PR 和 main 上跑：
+# 以前对 push 用了 branches: ['**']，导致「推分支」+「开/更新 PR」同一提交触发两份一样的构建。
 on:
   pull_request:
   push:
-    branches: [ '**' ]   # 只跟分支；tag 由 build-release.yml 负责，避免同一 tag 触发两份构建
+    branches: [ main ]
   workflow_dispatch:
 
+# PR 里回帖需要写权限；fork PR 上这步会被跳过（见 step 的 if）
+permissions:
+  contents: read
+  pull-requests: write
+
 concurrency:
-  group: build-debug-${{ github.ref }}
+  group: build-debug-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   debug:
+    name: debug
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v5
 
@@ -31,9 +37,8 @@ jobs:
           channel: stable
           cache: true
 
-      # debug 变体同样需要签名，AGP 默认用 ~/.android/debug.keystore（DN: CN=Android Debug）。
-      # 可选：固定 debug 签名 key —— 不提供时 runner 每次生成新 key ⇒ 覆盖安装会签名冲突。
-      # 注意：secrets 上下文不能在 steps[*].if 里用（会整份 workflow 校验失败），要用 env 中转。
+      # 可选：固定 debug 签名 key。不提供时 runner 每次生成新 key ⇒ 不同次构建之间覆盖安装会签名冲突。
+      # 注意：secrets 不能在 steps[*].if 里直接引用（会让整份 workflow 校验失败），要用 env 中转。
       - name: Use stable debug keystore (optional)
         env:
           DEBUG_KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
@@ -48,15 +53,67 @@ jobs:
       - name: Build debug APK (arm64)
         run: flutter build apk --debug --target-platform android-arm64
 
-      - name: Show package info
+      # 产物名带版本 + PR 号，手机上看得懂是哪个包
+      - name: Package artifact
+        id: pack
         run: |
-          APK=build/app/outputs/flutter-apk/app-debug.apk
-          ls -la "$APK"
-          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
-          $BT/aapt2 dump packagename "$APK" || true
+          VER=$(sed -n 's/^version: *\([0-9.]*\)+.*/\1/p' pubspec.yaml | head -1)
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            SUF="pr${{ github.event.pull_request.number }}"
+          else
+            SUF="$(echo '${{ github.ref_name }}' | tr '/' '-')-$(echo '${{ github.sha }}' | cut -c1-7)"
+          fi
+          NAME="RootKit-v${VER}-${SUF}-debug"
+          mkdir -p out
+          cp build/app/outputs/flutter-apk/app-debug.apk "out/${NAME}.apk"
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          "$BT/aapt2" dump badging "out/${NAME}.apk" > /tmp/badging.txt
+          PKG=$(grep -m1 '^package:' /tmp/badging.txt | sed "s/.*name='\([^']*\)'.*/\1/")
+          VN=$(grep -m1 '^package:' /tmp/badging.txt | sed "s/.*versionName='\([^']*\)'.*/\1/")
+          VC=$(grep -m1 '^package:' /tmp/badging.txt | sed "s/.*versionCode='\([^']*\)'.*/\1/")
+          SIZE=$(du -h "out/${NAME}.apk" | cut -f1)
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
+          {
+            echo "### 测试包：${NAME}.apk"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 包名 | \`${PKG}\` |"
+            echo "| versionName | \`${VN}\` |"
+            echo "| versionCode | \`${VC}\` |"
+            echo "| 大小 | ${SIZE} |"
+            echo "| 签名 | debug key（**不能**覆盖正式版，可与正式版共存） |"
+            echo ""
+            echo "下载：本页底部 **Artifacts → ${NAME}**（zip 里就是 apk）。"
+            echo ""
+            echo "安装："
+            echo '```'
+            echo "unzip ${NAME}.zip && adb install -r ${NAME}.apk"
+            echo '```'
+            echo ""
+            echo "注意：这个包是 \`${PKG}\`，**和正式版 \`com.noworld.rootkit\` 是两个 App**，桌面图标可能同名，别装错。"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v7
         with:
-          name: RootKit-debug-apk
-          path: build/app/outputs/flutter-apk/app-debug.apk
+          name: ${{ steps.pack.outputs.name }}
+          path: out/*.apk
           retention-days: 14
+
+      # 同仓库 PR 才回帖（fork PR 的 token 只读，回帖会 403 把 job 弄红）
+      - name: Comment artifact link on PR
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        run: |
+          NAME='${{ steps.pack.outputs.name }}'
+          PKG='${{ steps.pack.outputs.pkg }}'
+          {
+            echo "测试包已构建：\`${NAME}.apk\`（包名 \`${PKG}\`，debug 签名，可与正式版共存）"
+            echo ""
+            echo "下载：本 PR 的 **Checks → debug → 页面底部 Artifacts** → \`${NAME}\`"
+            echo ""
+            echo '```'
+            echo "unzip ${NAME}.zip && adb install -r ${NAME}.apk"
+            echo '```'
+          } > /tmp/pr-body.md
+          gh pr comment '${{ github.event.pull_request.number }}' --repo '${{ github.repository }}' --body-file /tmp/pr-body.md
