@@ -908,12 +908,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     dense: true,
                     contentPadding: EdgeInsets.zero,
                     value: chain.optWifiOff,
-                    title: const Text('运行前关闭 WiFi / 蓝牙（开飞行模式）',
+                    title: const Text('运行前打开飞行模式',
                         style: TextStyle(fontSize: 14)),
-                    subtitle: const Text('只切飞行模式，WiFi/蓝牙交给系统自己关。'
-                        '命中率更高（射频干扰更少）。代价：Shizuku 无线调试会断；'
-                        '重启后要先开 WiFi、在开发者选项里重开「无线调试」，'
-                        '才能再启动 Shizuku（用电脑 adb 启动则不需要 WiFi）',
+                    subtitle: const Text('射频干扰更少，命中率更高。'
+                        '代价：Shizuku 无线调试会断开，重启后要重新开「无线调试」'
+                        '（用电脑 adb 启动则不受影响）',
                         style: TextStyle(fontSize: 11)),
                     onChanged: (v) async {
                       await chain.setOptions(wifiOff: v);
