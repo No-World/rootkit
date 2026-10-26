@@ -863,7 +863,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     contentPadding: EdgeInsets.zero,
                     value: chain.optTap,
                     title: const Text('每轮自动点屏', style: TextStyle(fontSize: 14)),
-                    subtitle: const Text('防止息屏/doze 让命中率归零（建议开）',
+                    subtitle: const Text('息屏/doze 会让命中率归零',
                         style: TextStyle(fontSize: 11)),
                     onChanged: (v) async {
                       await chain.setOptions(tap: v);
@@ -875,7 +875,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     contentPadding: EdgeInsets.zero,
                     value: chain.optStayOn,
                     title: const Text('保持屏幕常亮', style: TextStyle(fontSize: 14)),
-                    subtitle: const Text('运行期间不让屏幕熄灭（建议开）',
+                    subtitle: const Text('运行期间不让屏幕熄灭',
                         style: TextStyle(fontSize: 11)),
                     onChanged: (v) async {
                       await chain.setOptions(stayOn: v);
@@ -923,12 +923,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     dense: true,
                     contentPadding: EdgeInsets.zero,
                     value: chain.optKillBg,
-                    title: const Text('开打前清理后台（默认关）',
+                    title: const Text('运行前清理第三方后台',
                         style: TextStyle(fontSize: 14)),
-                    subtitle: const Text('每发之前只清理第三方 App 的后台进程'
-                        '（系统/供应商服务、Shizuku、KernelSU 一律不动）。'
-                        '后台多时会抢 pipe 页预算、干扰页回收，落位更容易失败（进而 panic）；'
-                        '被杀的后台重新打开即恢复，软重启可全部复原',
+                    subtitle: const Text('系统服务、Shizuku、KernelSU 不动。'
+                        '后台少了更不容易失败（进而 panic）',
                         style: TextStyle(fontSize: 11)),
                     onChanged: (v) async {
                       await chain.setOptions(killBg: v);
@@ -940,8 +938,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     contentPadding: EdgeInsets.zero,
                     value: chain.optCleanup,
                     title: const Text('成功后清理残留文件', style: TextStyle(fontSize: 14)),
-                    subtitle: const Text('停掉 5556 root shell、删除 /data/local/tmp/rk 里的原生件与临时文件'
-                        '（已加载的模块不受影响；下次运行会自动重新部署）',
+                    subtitle: const Text('停掉 root shell、删掉 /data/local/tmp/rk 里的文件。'
+                        '已加载的模块不受影响，下次运行会自动重新部署',
                         style: TextStyle(fontSize: 11)),
                     onChanged: (v) async {
                       await chain.setOptions(cleanup: v);
