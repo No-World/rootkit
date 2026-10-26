@@ -1965,8 +1965,10 @@ class RootChain extends ChangeNotifier {
   /// 每多一个 pipe 就吃掉若干页，预算一满，后续 fcntl(F_SETPIPE_SZ, 512KB) 全部 EPERM。
   ///
   /// 真机 A/B（docs/2026-10-26_AB_管道预算与panic率.md，冷机 25–32°C）：
-  ///   PRE_PIPES=20000 → F_SETPIPE_SZ=-1(EPERM)  命中/落位 12/19 = 63%
-  ///   PRE_PIPES=512   → F_SETPIPE_SZ=524288     命中/落位 30/34 = 88%
+  ///   PRE_PIPES=20000 → F_SETPIPE_SZ=-1(EPERM)  16/26 = 62%（panic 12%）
+  ///   PRE_PIPES=512   → F_SETPIPE_SZ=524288     37/46 = 80%（panic 7%）
+  ///                     （两组独立复现：88% = 23/26、70% = 14/20）
+  ///   PRE_PIPES=0     → 也成功，但只有 13/20 = 65%（预建的那批 pipe 本身也在帮忙）
   ///   PRE_PIPES=2048  → 又变 -1（2048×8页 = 16384，正好撞上限）
   /// 所以只能取 ≤512。
   static const int kPrePipes = 512;

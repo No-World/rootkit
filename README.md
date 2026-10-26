@@ -136,9 +136,19 @@ cp android/key.properties.example android/key.properties    # 填自己的 keyst
   若你用的是旧版并已中招：**硬重启**恢复（软重启只重启 zygote，内核状态不变，无效）。
 
 
-- **单轮成功率 ≈65%**：唯一的统计性失败是"命中后 landing 失败 → 内核 panic 重启"（实测约 35%/轮）；
-  重启后需 `pm install -r` 重装（APK 常驻 `/data/local/tmp/rk_latest.apk`，约 30 秒），然后重跑。
-- 命中率受屏幕/温度/射频影响（App 每轮前会自动点屏 + 开飞行模式）；
+- **成功率与温度强相关**（冷机 25–32°C / 真机 120 发实测，详见 [`docs/04-benchmark.md`](docs/04-benchmark.md)）：
+
+  | 条件 | 落位成功 | 内核 panic |
+  |---|---|---|
+  | 冷机，`PRE_PIPES=512`（v1.0.17） | **80%** | 7% |
+  | 冷机，`PRE_PIPES=20000`（v1.0.16 及更早） | 62% | 12% |
+  | 热机 46–48°C，`PRE_PIPES=20000` | 50% | **37%** |
+
+  所以 v1.0.17 加了三个温度措施：**严格温度闸（>44°C 先等降温）**、
+  **运行时把屏幕压到最暗**（可关）、每发落 `meta.log`（温度/频率/充电）便于排障。
+  仍建议：机身明显烫手时先关屏静置 10–15 分钟再跑。
+- panic 重启后需 `pm install -r` 重装（APK 常驻 `/data/local/tmp/rk_latest.apk`，约 30 秒），然后重跑。
+- 命中率还受屏幕/射频影响（App 每轮前会自动点屏 + 开飞行模式）；
 - permissive 零写会清掉 `selinux_state.initialized`，本链用 pwn4 模块在拿到 root 后恢复；
 - KSU 用的是 6.12.76 官方 LKM + kallsyms ABS 静态绑定（本机 69 个符号未导出），
   模块与内核结构体若有差异可能崩，属已知风险。
@@ -281,3 +291,4 @@ CI `build-debug` 绿了才合并。发版 = 合并进 `main` → 打 tag → 发
 | [`docs/01-cve-2026-64560.md`](docs/01-cve-2026-64560.md) | 漏洞机制、两个写原语、cred 两阶段写、模块加载三门槛、KSU 三种符号绑定、实测量化 |
 | [`docs/02-architecture.md`](docs/02-architecture.md) | App 架构：Shizuku 双接口、阶段机、资产流水线、5 项自动校准、体积与失败面 |
 | [`docs/03-roadmap.md`](docs/03-roadmap.md) | 适配其他内核的步骤、rootless 路径、稳定性与风险表、明确不做/不可达的项 |
+| [`docs/04-benchmark.md`](docs/04-benchmark.md) | **实测基准**：120 发参数 A/B（管道页预算、喷页量、delete 线程、阈值）、温度与 panic 的关系、可复现命令与判定口径 |
