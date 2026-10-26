@@ -8,6 +8,8 @@ import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart' show rootBundle;
 
+import 'version.dart';
+
 import 'calib.dart';
 import 'shizuku.dart';
 
@@ -66,6 +68,11 @@ class RootChain extends ChangeNotifier {
   final Map<StageId, String> skipReason = {};  // 可跳过的阶段 → 原因
   bool alreadyRooted = false;                 // 探测到已越狱（su 可用）
   bool assetsReady = false;                   // 资产已在设备上（跳过重复写入）
+  // KernelSU 管理器的三项现场（环境预检就查，别等到 ⑧ 才发现没有 su）
+  bool ksuAppInstalled = false;                // APK 装了没（me.weishu.kernelsu）
+  bool ksuDirReady = false;                    // /data/adb/ksu 是否已初始化（模块加载后才可能出现）
+  String suPath = '';                          // su 实际所在路径（空 = 都没有）
+  String ksuAppVersion = '';                   // KernelSU 管理器版本（versionName）
   String devState = '';                        // 一句话设备现状（用于界面）
   String shizukuVia = '';
 
@@ -272,6 +279,162 @@ class RootChain extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// 环境预检（② 一开始就跑）
+  ///
+  /// 判据与后果：
+  /// - **没装 KernelSU 管理器** ⇒ 直接拦：`su` 由管理器释放到 `/data/adb/ksu/bin`，
+  ///   模块加载成功也不会有 su，跑到 ⑧ 必失败（浪费 3–6 分钟）。
+  /// - 管理器版本与模板不同 ⇒ 只警告（多数 3.3.x 兼容），但要在日志里看得见。
+  /// - `/data/adb/ksu` 不存在 ⇒ 只提示：它要等模块加载后、管理器被打开一次才会被创建。
+  Future<void> _preflight() async {
+    final r = await ShizukuShell.run(
+      'echo APP=\$(pm list packages 2>/dev/null | grep -c me.weishu.kernelsu)'
+      '; echo VER=\$(dumpsys package me.weishu.kernelsu 2>/dev/null | sed -n "s/.*versionName=//p" | head -1)'
+      '; echo DIR=\$(ls -d /data/adb/ksu 2>/dev/null | head -1)'
+      '; echo SU=\$(command -v su 2>/dev/null)'
+      '; echo SUM=\$(ls /data/adb/ksu/bin/su 2>/dev/null)');
+    final out = r.out;
+    ksuAppInstalled = (RegExp(r'^APP=(\d+)', multiLine: true).firstMatch(out)?.group(1) ??
+            '0') !=
+        '0';
+    ksuAppVersion =
+        RegExp(r'^VER=(\S+)', multiLine: true).firstMatch(out)?.group(1) ?? '';
+    ksuDirReady = RegExp(r'^DIR=/', multiLine: true).hasMatch(out);
+    suPath = RegExp(r'^SU=(\S+)', multiLine: true).firstMatch(out)?.group(1) ??
+        RegExp(r'^SUM=(\S+)', multiLine: true).firstMatch(out)?.group(1) ??
+        '';
+
+    final verTxt = ksuAppVersion.isEmpty ? '' : ' v$ksuAppVersion';
+    _log('[pre] KernelSU 管理器：'
+        '${ksuAppInstalled ? "已安装$verTxt（本模板对应 v$kKsuManagerVersion）" : "未安装（必需）"}');
+    _log('[pre] /data/adb/ksu：${ksuDirReady ? "已初始化" : "未初始化（正常，加载模块后打开一次 KernelSU 即可创建）"}');
+    _log('[pre] su：${suPath.isEmpty ? "尚未提供（管理器初始化后才有）" : suPath}');
+
+    if (!ksuAppInstalled) {
+      _stage(StageId.env, StageStatus.failed, detail: '未安装 KernelSU 管理器');
+      lastError = '未安装 KernelSU 管理器（me.weishu.kernelsu）v$kKsuManagerVersion。'
+          'su 由管理器释放，不装它整条链到 ⑧ 必失败：先装 KernelSU v$kKsuManagerVersion '
+          '并打开一次，再回到本页点开始。';
+      _log('[pre] ✗ 缺少 KernelSU 管理器 ⇒ 停止（否则 ⑧ 一定没有 su）');
+      _advice();
+      _stop = true;
+      return;
+    }
+    if (ksuAppVersion.isNotEmpty && ksuAppVersion != kKsuManagerVersion) {
+      _log('[pre] ⚠ 管理器 v$ksuAppVersion ≠ 模板 v$kKsuManagerVersion：'
+          '若 ⑦⑧ 异常，先换回 v$kKsuManagerVersion');
+    }
+    if (!ksuDirReady) {
+      _log('[pre] 提示：加载完模块后若 su 仍不存在，打开 KernelSU 一次（顶部显示"未安装"时按提示装/修复）');
+    }
+  }
+
+  // ---------------------------------------------------------------- 诊断（无法 adb 时靠它排障）
+  //
+  // 全部输出到 App 日志，用户截图就能定位问题。字段前缀统一 `[diag:<阶段>]` / `[diag-root:<阶段>]`。
+
+  /// shell 侧（uid 2000）能看到的现状：SELinux、机型、模块、KSU 管理器与 su 路径
+  Future<List<String>> _diag(String tag) async {
+    final out = <String>[];
+    try {
+      final r = await ShizukuShell.run(
+        'echo ENF=\$(getenforce 2>/dev/null)'
+        '; echo MODEL=\$(getprop ro.product.model)'
+        '; echo FP=\$(getprop ro.build.fingerprint)'
+        '; echo KREL=\$(uname -r)'
+        '; echo MODS=\$(grep -E "^(pwn|kernelsu)" /proc/modules 2>/dev/null | cut -d" " -f1 | tr "\\n" ",")'
+        '; echo KSUAPP=\$(pm list packages 2>/dev/null | grep -c me.weishu.kernelsu)'
+        '; echo KSUDIR=\$(ls -d /data/adb/ksu 2>/dev/null | head -1)'
+        '; echo KSUBIN=\$(ls /data/adb/ksu/bin 2>/dev/null | tr "\\n" ",")'
+        '; echo SU_WHICH=\$(command -v su 2>/dev/null)'
+        '; echo SU_SYS=\$(ls -l /system/bin/su 2>/dev/null | tr -s " " | cut -d" " -f1,9-)'
+        '; echo SU_KSU=\$(ls -l /data/adb/ksu/bin/su 2>/dev/null | tr -s " " | cut -d" " -f1,9-)'
+        '; echo SU_RAMDISK=\$(ls -l /debug_ramdisk/su 2>/dev/null | tr -s " " | cut -d" " -f1,9-)'
+        '; echo CTX=\$(id -Z 2>/dev/null)');
+      for (final line in r.out.split('\n')) {
+        final t = line.trim();
+        if (t.isNotEmpty) out.add(t);
+      }
+    } catch (_) {}
+    _log('[diag:$tag] ' + out.join(' | '));
+    return out;
+  }
+
+  /// root 侧（走 5556 自己的 root shell）才能看到的：内核符号、dmesg、KSU 目录权限
+  ///
+  /// 顺带核对「内核镜像是否与本机标定的一致」：用 5 个符号相对 _stext 的偏移和本机镜像比对。
+  /// 不符 ⇒ 这台机器的内核和已知镜像不同，后面的地址全都不可信（最该报给作者的信息）。
+  Future<void> _diagRoot(String tag) async {
+    const expect = <String, int>{
+      'selinux_state': 0x27D7A60,
+      'init_task': 0x254DAC0,
+      'commit_creds': 0x2DCB48,
+      'prepare_kernel_cred': 0x4798B4,
+      'init_cred': 0x2563880,
+    };
+    try {
+      final cmd = 'echo ID=\$(id -u)'
+          '; echo CTX=\$(id -Z 2>/dev/null)'
+          '; echo KPTR=\$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null)'
+          '; echo SU=\$(command -v su 2>/dev/null)'
+          '; echo KSUBIN=\$(ls /data/adb/ksu/bin 2>/dev/null | tr "\\n" ",")'
+          '; echo DMESG_TAIL=\$(dmesg 2>&1 | tail -1 | cut -c1-80)'
+          '; grep -E " (_stext|selinux_state|init_task|commit_creds|prepare_kernel_cred|init_cred)\$"'
+          ' /proc/kallsyms 2>/dev/null | head -8'
+          '; echo ---DMESG-KSU---'
+          '; dmesg 2>/dev/null | grep -iE "ksu|kernelsu" | tail -10';
+      final r = await ShizukuShell.run('echo ${_shq(cmd)} | nc 127.0.0.1 5556 2>&1');
+      final txt = r.out.trim();
+      if (txt.isNotEmpty) {
+        _log('[diag-root:$tag]');
+        for (final l in txt.split('\n')) {
+          if (l.trim().isNotEmpty) _log('  $l');
+        }
+      }
+      // 解析符号表，算相对 _stext 的偏移
+      BigInt? stext;
+      final got = <String, BigInt>{};
+      for (final l in txt.split('\n')) {
+        final m = RegExp(r'^([0-9a-f]{8,16})\s+\S\s+(\w+)').firstMatch(l.trim());
+        if (m == null) continue;
+        final addr = BigInt.tryParse(m.group(1)!, radix: 16);
+        if (addr == null) continue;
+        final name = m.group(2)!;
+        if (name == '_stext') {
+          stext = addr;
+        } else if (expect.containsKey(name)) {
+          got[name] = addr;
+        }
+      }
+      if (stext == null || got.isEmpty) {
+        _log('[diag-root:$tag] 内核符号不可读（kptr_restrict 或 SELinux 拦截）⇒ 无法核对镜像');
+        return;
+      }
+      final bad = <String>[];
+      for (final e in expect.entries) {
+        final a = got[e.key];
+        if (a == null) {
+          bad.add('${e.key}=缺失');
+          continue;
+        }
+        final off = a - stext;
+        final ok = off == BigInt.from(e.value);
+        if (!ok) {
+          bad.add('${e.key}=0x${off.toUnsigned(64).toRadixString(16)}'
+              '(期望0x${e.value.toRadixString(16)})');
+        }
+      }
+      if (bad.isEmpty) {
+        _log('[diag-root:$tag] 内核镜像核对：5/5 符号偏移一致 ⇒ 与内置标定同一镜像');
+      } else {
+        _log('[diag-root:$tag] 内核镜像核对：不一致 ⇐ ${bad.join(', ')}'
+            '（这台机器的内核与本机标定不同，需重新标定）');
+      }
+    } catch (e) {
+      _log('[diag-root:$tag] 采集失败：$e');
+    }
+  }
+
   void _advice() {
     suggestions.clear();
     final env = _byId[StageId.env]!;
@@ -297,6 +460,10 @@ class RootChain extends ChangeNotifier {
     }
     if (ksu.status == StageStatus.failed) {
       suggestions.add('KSU 加载失败：看日志里 ksupatch / ml2 的报错；模板与内核版本必须匹配。');
+    } else if (ksu.status == StageStatus.ok && _byId[StageId.verify]!.status == StageStatus.failed) {
+      suggestions.add('KernelSU 模块已在跑，但 su 不存在 —— su 由 KernelSU 管理器（App）释放到 '
+          '/data/adb/ksu/bin：打开 KernelSU，顶部若显示"未安装/点击安装"就按提示装一次，'
+          '再回到本页点开始（①–⑥ 会跳过）；日志里 [diag:ksu] / [diag-root:ksu] 有完整现场。');
     }
     if (env.status == StageStatus.failed) {
       suggestions.add('资产部署失败：确认 Shizuku 在线、/data/local/tmp 可写。');
@@ -606,6 +773,14 @@ class RootChain extends ChangeNotifier {
       return;
     }
     _log('[env] Shizuku OK, boot_id=$bootId');
+
+    // ---------------- 环境预检：KernelSU 管理器 / su / 目录 ----------------
+    // 为什么放最前面：⑦ 加载模块只要 10s，但 ⑧ 的 su 是**管理器**释放的。
+    // 管理器没装时整条链跑到 ⑧ 才失败（3–6 分钟白跑），所以这里先拦。
+    _stage(StageId.env, StageStatus.running, detail: '预检 KernelSU 管理器…');
+    await _preflight();
+    if (_stop) return;
+
     _stage(StageId.env, StageStatus.running, detail: '部署资产…');
 
     // 755：属主是 shell（可写），其他 App 不可替换（否则任何 App 都能替换 ksupatch/ksu_template 实现提权）
@@ -687,6 +862,10 @@ class RootChain extends ChangeNotifier {
     }
     _stage(StageId.env, StageStatus.ok,
         detail: '资产已部署 · 内核 ${calib.kernelVersion}（${_kernelSourceText()}）');
+    // 排障基线：版本 / 零写落点 / 设备指纹 / KSU 管理器与 su 现状
+    _log('[diag:env] ver=$kAppVersion zero=${calib.selinuxZeroTargetHex} '
+        'alias=${calib.selinuxAliasHex} phys=0x${calib.physBase.toRadixString(16)}');
+    await _diag('env');
     _advice();
   }
 
@@ -700,7 +879,24 @@ class RootChain extends ChangeNotifier {
         r' echo MODS=$(grep -cE "^(pwnm|pwn3|pwnf)" /proc/modules 2>/dev/null || echo 0);'
         r' echo ASSET=$(ls /data/local/tmp/rk/x645 /data/local/tmp/rk/pc /data/local/tmp/rk/ksupatch /data/local/tmp/rk/ml2 2>/dev/null | wc -l);'
         r' echo SUC=$(timeout 4 su -c id -u 2>/dev/null | tr -dc 0-9 | head -c 1);'
-        r' echo UID=$(id -u)');
+        r' echo UID=$(id -u);'
+        r' echo KSUAPP=$(pm list packages 2>/dev/null | grep -c me.weishu.kernelsu);'
+        r' echo KSUDIR=$(ls -d /data/adb/ksu 2>/dev/null | head -1);'
+        r' echo SUWHICH=$(command -v su 2>/dev/null || ls /data/adb/ksu/bin/su 2>/dev/null || echo);'
+        r' echo KSUV=$(dumpsys package me.weishu.kernelsu 2>/dev/null | sed -n "s/.*versionName=//p" | head -1);');
+    for (final l in r.out.split('\n')) {
+      if (l.startsWith('KSUAPP=') || l.startsWith('KSUDIR=') || l.startsWith('SUWHICH=')) {
+        _log('[status] ${l.trim()}');
+      }
+    }
+    // ↓ 供 preflight 与界面使用
+    ksuAppInstalled = (RegExp(r'^KSUAPP=(\d+)', multiLine: true)
+            .firstMatch(r.out)
+            ?.group(1) ?? '0') != '0';
+    ksuDirReady = RegExp(r'^KSUDIR=/', multiLine: true).hasMatch(r.out);
+    suPath = RegExp(r'^SUWHICH=(\S+)', multiLine: true).firstMatch(r.out)?.group(1) ?? '';
+    ksuAppVersion =
+        RegExp(r'^KSUV=(\S+)', multiLine: true).firstMatch(r.out)?.group(1) ?? '';
     final m = <String, String>{};
     for (final line in r.out.split('\n')) {
       final i = line.indexOf('=');
@@ -718,7 +914,8 @@ class RootChain extends ChangeNotifier {
       for (final id in StageId.values) {
         skipReason[id] = '已越狱（su 可用），无需操作';
       }
-      devState = '已越狱 · su 可用 · KSU ${ksu > 0 ? "已加载" : "未加载"}';
+      devState = '已越狱 · su 可用（${suPath.isEmpty ? "PATH" : suPath}）· '
+          'KSU ${ksu > 0 ? "已加载" : "未加载"}';
       phase = '已越狱成功（无需操作）';
       _log('[status] $devState');
       _log('[status] 已越狱：全部阶段视为完成');
@@ -769,13 +966,21 @@ class RootChain extends ChangeNotifier {
       }
     }
 
+    final ksuAppText = ksuAppInstalled
+        ? 'KSU 管理器 ${ksuAppVersion.isEmpty ? "已装" : "v$ksuAppVersion"}'
+        : 'KSU 管理器 未装';
     devState = [
       'SELinux=$enf',
       if (ksu > 0) 'KSU 已加载' else if (mods > 0) 'root 模块已加载 · KSU 未加载' else 'KSU 未加载',
-      'su 不可用',
+      ksuAppText,
+      suPath.isEmpty ? 'su 不可用' : 'su=$suPath',
       '资产 $asset/4',
     ].join(' · ');
     _log('[status] $devState');
+    if (ksuAppInstalled && ksuAppVersion.isNotEmpty && ksuAppVersion != kKsuManagerVersion) {
+      _log('[status] ⚠ KernelSU 管理器 v$ksuAppVersion 与本模板内核（v$kKsuManagerVersion）不同；'
+          '若 ⑦⑧ 异常，先换回 v$kKsuManagerVersion 再试');
+    }
     if (skipReason.isNotEmpty) {
       _log('[status] 可跳过：${skipReason.keys.map((k) => k.name).join("、")}');
     }
@@ -1145,6 +1350,8 @@ class RootChain extends ChangeNotifier {
     final v = await _pollVerdict('ROOT_OK', 90);
     if (v != null) {
       _stage(StageId.root, StageStatus.ok, detail: v.split('\n').last);
+      // 有 root 了：核对内核镜像 + 看 dmesg 里 KSU/模块的落地情况
+      await _diagRoot('root');
       _advice();
       return;
     }
@@ -1155,6 +1362,53 @@ class RootChain extends ChangeNotifier {
     _stage(StageId.root, StageStatus.failed, detail: '模块未加载');
     lastError = '模块未加载（看日志 FINIT errno）';
     _advice();
+  }
+
+  /// ⑦ 的真实状态：**模块加载成功 ≠ KernelSU 可用**
+  ///
+  /// 三件事要分开看：
+  /// 1. `/proc/modules` 里有 `kernelsu`（insmod/finit 成功）
+  /// 2. `/sys/module/kernelsu` 存在（模块真的注册进 sysfs，能区分"载入即返回"的假成功）
+  /// 3. `su` 存在（**由管理器释放**，与 1/2 无关）
+  Future<Map<String, String>> _ksuState() async {
+    final m = <String, String>{};
+    try {
+      final r = await ShizukuShell.run(
+        'echo MODCNT=\$(grep -c "^kernelsu" /proc/modules 2>/dev/null || echo 0)'
+        '; echo SYSFS=\$([ -d /sys/module/kernelsu ] && echo 1 || echo 0)'
+        '; echo MODLINE=\$(grep "^kernelsu" /proc/modules 2>/dev/null | head -1 | cut -c1-90)'
+        '; echo SU=\$(command -v su 2>/dev/null || ls /data/adb/ksu/bin/su 2>/dev/null || echo)'
+        '; echo KSUDIR=\$([ -d /data/adb/ksu ] && echo 1 || echo 0)'
+        '; echo APP=\$(pm list packages 2>/dev/null | grep -c me.weishu.kernelsu)');
+      for (final line in r.out.split('\n')) {
+        final i = line.indexOf('=');
+        if (i > 0) m[line.substring(0, i).trim()] = line.substring(i + 1).trim();
+      }
+    } catch (_) {}
+    return m;
+  }
+
+  /// ⑦ 之后：KernelSU 模块已在 /proc/modules，但 **su 是由管理器（KSU App）释放到
+  /// /data/adb/ksu/bin 的**，模块加载 ≠ su 可用。这里等最多 10s 并记录现场。
+  Future<void> _afterKsuLoaded() async {
+    for (var i = 0; i < 5; i++) {
+      final r = await ShizukuShell.run(
+          'ls /data/adb/ksu/bin/su /system/bin/su 2>/dev/null | head -1');
+      if (r.out.trim().isNotEmpty) break;
+      await _sleep(2000);
+    }
+    final st = await _ksuState();
+    final modOk = (int.tryParse(st['MODCNT'] ?? '0') ?? 0) > 0;
+    final sysfs = (st['SYSFS'] ?? '0') == '1';
+    _log('[ksu] 模块状态：/proc/modules=${modOk ? "有 kernelsu" : "无"}'
+        ' · /sys/module/kernelsu=${sysfs ? "存在" : "缺失"}'
+        ' · su=${(st['SU'] ?? '').isEmpty ? "缺失" : st['SU']}'
+        ' · /data/adb/ksu=${(st['KSUDIR'] ?? '0') == '1' ? "已初始化" : "未初始化"}');
+    if (modOk && !sysfs) {
+      _log('[ksu] ⚠ 模块在 /proc/modules 里但 /sys/module 没有它 ⇒ 可能是"载入即退出"或加载不完整');
+    }
+    await _diag('ksu');
+    await _diagRoot('ksu');
   }
 
   Future<void> _runKsu() async {
@@ -1170,6 +1424,7 @@ class RootChain extends ChangeNotifier {
         _log('[ksu] 候选进程已自行加载 kernelsu（无需 root shell）');
         final sc = await ShizukuShell.run('cat $workDir/ksu_self.log 2>/dev/null | tail -6');
         if (sc.out.trim().isNotEmpty) _log(sc.all);
+        await _afterKsuLoaded();
         _stage(StageId.ksu, StageStatus.ok, detail: 'kernelsu 已加载（自加载路径）');
         _advice();
         return;
@@ -1199,6 +1454,7 @@ class RootChain extends ChangeNotifier {
     final chk = await ShizukuShell.run('grep -c kernelsu /proc/modules');
     final n = int.tryParse(chk.out.trim()) ?? 0;
     if (n > 0) {
+      await _afterKsuLoaded();
       _stage(StageId.ksu, StageStatus.ok, detail: 'kernelsu 已加载');
       _advice();
       return;
@@ -1214,21 +1470,68 @@ class RootChain extends ChangeNotifier {
   Future<void> _runVerify() async {
     _stage(StageId.verify, StageStatus.running, detail: 'su 验证…');
     phase = '验证 su';
-    final r = await ShizukuShell.run('su -c id 2>&1');
-    _log('[verify] ${r.all}');
-    final okRoot = RegExp(r'uid=0\(root\)').hasMatch(r.out) ||
-        r.out.contains('u:r:ksu:s0');
-    if (okRoot) {
-      _stage(StageId.verify, StageStatus.ok, detail: 'su 可用 · ' + r.all.split('\n').first);
+    // su 不一定在 PATH：KernelSU 的 su 由管理器放到 /data/adb/ksu/bin，
+    // 也有机型是 /system/xbin/su 或 /debug_ramdisk/su。逐个试，全部记录（排障用）。
+    const cands = <String>[
+      'su',
+      '/system/bin/su',
+      '/system/xbin/su',
+      '/data/adb/ksu/bin/su',
+      '/debug_ramdisk/su',
+    ];
+    String? hitPath;
+    String? hitLine;
+    for (final p in cands) {
+      final r = await ShizukuShell.run('$p -c id 2>&1');
+      final out = r.out.trim();
+      final first = out.isEmpty ? '(空)' : out.split('\n').first;
+      _log('[verify] $p → $first');
+      if (RegExp(r'uid=0\(root\)').hasMatch(out) || out.contains('u:r:ksu:s0')) {
+        hitPath = p;
+        hitLine = first;
+        break;
+      }
+    }
+    if (hitLine != null) {
+      _stage(StageId.verify, StageStatus.ok, detail: 'su 可用（$hitPath）· $hitLine');
       success = true;
       phase = '越狱成功';
-      _log('[verify] 成功：${r.all.split('\n').first}');
+      _log('[verify] 成功：$hitLine');
       await cleanupAfterSuccess();
       _log('[verify] 若 KernelSU 面板仍显示"未安装/未工作"，先对 KernelSU 清后台或用软重启，再打开它');
-    } else {
-      _stage(StageId.verify, StageStatus.failed, detail: 'su 不可用');
-      lastError = 'su 不可用';
+      _advice();
+      return;
     }
+
+    // 失败：把「模块是否在、管理器是否装、su 在哪、dmesg 说啥」一次性打进日志
+    await _diag('verify-fail');
+    await _diagRoot('verify-fail');
+    final st = await _ksuState();
+    final ksuLoaded = (int.tryParse(st['MODCNT'] ?? '0') ?? 0) > 0;
+    final sysfs = (st['SYSFS'] ?? '0') == '1';
+    final appInstalled = (int.tryParse(st['APP'] ?? '0') ?? 0) > 0;
+    final dirExists = (st['KSUDIR'] ?? '0') == '1';
+    _log('[verify] 现场：kernelsu 模块=${ksuLoaded ? "有" : "无"} · sysfs=${sysfs ? "有" : "无"}'
+        ' · 管理器=${appInstalled ? "已装${ksuAppVersion.isEmpty ? "" : " v$ksuAppVersion"}" : "未装"}'
+        ' · /data/adb/ksu=${dirExists ? "已初始化" : "未初始化"}');
+
+    String why;
+    if (ksuLoaded && !dirExists) {
+      why = 'KernelSU 模块已加载，但 /data/adb/ksu 不存在 ⇒ 管理器还没"安装/初始化"，'
+          'su 由管理器释放：打开 KernelSU App（顶部若显示"未安装"，按提示装/修复），'
+          '再回来重跑 ⑦⑧';
+    } else if (ksuLoaded && !appInstalled) {
+      why = 'KernelSU 模块已加载，但没装 KernelSU 管理器 ⇒ 没有 su。装好管理器并打开一次，再重跑 ⑦⑧';
+    } else if (ksuLoaded && !sysfs) {
+      why = 'kernelsu 在 /proc/modules 但 /sys/module 没有它 ⇒ 加载不完整（看 dmesg 的 ksu 行）';
+    } else if (!ksuLoaded) {
+      why = 'su 不存在且 kernelsu 模块不在 /proc/modules ⇒ ⑦ 其实没成功，重跑 ⑦';
+    } else {
+      why = 'su 不存在（模块在、管理器在）：看日志 [diag-root:verify-fail] 的 dmesg KSU 行';
+    }
+    _log('[verify] 失败原因判定：$why');
+    _stage(StageId.verify, StageStatus.failed, detail: 'su 不存在');
+    lastError = why;
     _advice();
   }
 

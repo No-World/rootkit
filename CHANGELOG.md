@@ -1,5 +1,34 @@
 # 变更记录
 
+## v1.0.17 — 2026-10-26
+- **环境预检提前到 ② 一开始**（原来要跑到 ⑧ 才失败）：
+  · **没装 KernelSU 管理器 ⇒ 直接拦下**并说明（`su` 由管理器释放，不装它整条链到 ⑧ 必没有 su，
+    白跑 3–6 分钟）。要求 **KernelSU v3.3.1**（与本仓库 `ksu_template.ko` 同源），版本不同只警告。
+  · 打印 `/data/adb/ksu` 是否已初始化、`su` 当前路径。
+  · 启动探测（打开 App 即跑）的现状行也带上 `KSU 管理器 vX` / `su=路径`。
+- **⑦ 的"模块是否真的加载成功"改成三元判定**（用户反馈：模块在 /proc/modules 里但 KSU 不可用）：
+  · `/proc/modules` 有 `kernelsu`
+  · `/sys/module/kernelsu` 存在（区分"载入即退出"的假成功）
+  · `su` 是否存在（由管理器释放，与上两条无关）
+  三者分别打日志，⑧ 失败时按三元组合给出不同结论。
+- **新增分阶段自检日志（远程排障用）**：`[diag:env] / [diag:ksu] / [diag:verify-fail]`
+  与 `[diag-root:*]`（走自己的 root shell），一次截图就能定位：
+  · `ver= / zero= / alias= / phys=`：版本与零写落点（区分新旧版的关键）
+  · 机型指纹、`uname -r`、`getenforce`、`id -Z`
+  · 模块现状（`pwn*` / `kernelsu`）、KernelSU 管理器是否安装、`/data/adb/ksu` 是否存在
+  · `su` 在 4 条候选路径上的 `ls -l` 结果
+  · **内核镜像核对**：取 `_stext` 与 `selinux_state / init_task / commit_creds /
+    prepare_kernel_cred / init_cred`，算相对偏移与内置标定比对，打印 `5/5 一致` 或逐个不一致项
+    ⇒ 其它机型是否真的同一镜像，不用猜
+- **⑧ 修复：su 不再只在 PATH 里找**。KernelSU 的 su 由管理器释放到 `/data/adb/ksu/bin/su`，
+  有的机型在 `/system/xbin/su` 或 `/debug_ramdisk/su`；现在逐个试并记录每一条结果。
+- **⑧ 失败原因直接写清楚**（不再只报「su 不可用」）：
+  · 模块在、`/data/adb/ksu` 不存在 ⇒ 管理器没初始化（打开 KernelSU 按提示装一次）
+  · 模块在、管理器没装 ⇒ 装管理器
+  · 模块不在 ⇒ ⑦ 其实没成功
+- **⑦ 之后等 su 最多 10s**（管理器释放 su 有延迟），并把 `[diag:ksu]` 落进日志。
+- 版本号收口到 `lib/version.dart`（`chain.dart` 的日志也要用，避免循环 import）。
+
 ## v1.0.16 — 2026-10-25
 - **修复：跑完链后相机崩溃 / 系统服务连环崩（本次核心）**
   根因：零写原语是 8 字节 store，之前直接写 `selinux_state` 基址，会连带清零 +1 的 `initialized`

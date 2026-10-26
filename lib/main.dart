@@ -4,11 +4,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'chain.dart';
+import 'version.dart';
 import 'shizuku.dart';
 import 'github_icon.dart';
 
 /// 版本号（与 pubspec 的 version 保持一致）
-const String kAppVersion = '1.0.16';
+// 版本号在 lib/version.dart（chain.dart 也要用，避免循环 import）
 
 /// 项目主页（AppBar 与选项里都可一键跳转）
 const String kRepoUrl = 'https://github.com/No-World/rootkit';
