@@ -977,16 +977,12 @@ class RootChain extends ChangeNotifier {
       }
     }
 
-    final ksuAppText = ksuAppInstalled
-        ? 'KSU 管理器 ${ksuAppVersion.isEmpty ? "已装" : "v$ksuAppVersion"}'
-        : 'KSU 管理器 未装';
-    devState = [
-      'SELinux=$enf',
-      if (ksu > 0) 'KSU 已加载' else if (mods > 0) 'root 模块已加载 · KSU 未加载' else 'KSU 未加载',
-      ksuAppText,
-      suPath.isEmpty ? 'su 不可用' : 'su=$suPath',
-      '资产 $asset/4',
-    ].join(' · ');
+    health['E'] = enf;
+    health['G'] = '$mods';
+    health['K'] = '$ksu';
+    health['A'] = '$asset';
+    health['S'] = suc || suPath.isNotEmpty ? '1' : '0';
+    devState = composeDevState();
     _log('[status] $devState');
     if (ksuAppInstalled && ksuAppVersion.isNotEmpty && ksuAppVersion != kKsuManagerVersion) {
       _log('[status] ⚠ KernelSU 管理器 v$ksuAppVersion 与本模板内核（v$kKsuManagerVersion）不同；'
@@ -1141,14 +1137,19 @@ class RootChain extends ChangeNotifier {
         'echo "M=\$(free -m 2>/dev/null | awk \'/Mem:/{print \$3\"/\"\$2}\')";'
         'echo "P=\$(grep -m1 posix_timers_cache /proc/slabinfo 2>/dev/null | awk \'{print \$2\"/\"\$3}\')";'
         'echo "C=\$(grep -m1 \"^cred_jar\" /proc/slabinfo 2>/dev/null | awk \'{print \$2\"/\"\$3}\')";'
-        'echo "E=\$(getenforce 2>/dev/null)"');
+        'echo "E=\$(getenforce 2>/dev/null)"'
+        '; echo "G=\$(grep -cE \"^pwn\" /proc/modules 2>/dev/null || echo 0)"'
+        '; echo "K=\$(grep -c \"^kernelsu\" /proc/modules 2>/dev/null || echo 0)"'
+        '; echo "A=\$(ls /data/local/tmp/rk/x645 /data/local/tmp/rk/pc /data/local/tmp/rk/ksupatch /data/local/tmp/rk/ml2 2>/dev/null | wc -l)"'
+        '; echo "S=\$(command -v su >/dev/null 2>&1 && echo 1 || ([ -x /data/adb/ksud ] && echo 1) || echo 0)"');
     var changed = false;
     for (final line in r.out.split('\n')) {
       final i = line.indexOf('=');
       if (i <= 0) continue;
       final k = line.substring(0, i).trim();
       final v = line.substring(i + 1).trim();
-      if (k == 'T' || k == 'W' || k == 'M' || k == 'P' || k == 'C' || k == 'E') {
+      if (k == 'T' || k == 'W' || k == 'M' || k == 'P' || k == 'C' || k == 'E' ||
+          k == 'G' || k == 'K' || k == 'A' || k == 'S') {
         if (health[k] != v) {
           health[k] = v;
           changed = true;
@@ -1160,8 +1161,40 @@ class RootChain extends ChangeNotifier {
       _log('[env] Shizuku 接口: ${r.via == 'api' ? 'Shizuku.newProcess' : 'AIDL newProcess'}');
       changed = true;
     }
+    // 拿到数据说明 Shizuku 通了 ⇒ 打开 App 后就能开始轮询（之前只有 start() 里才置位）
+    if (r.via.isNotEmpty && !shizukuOk) shizukuOk = true;
+    // 「现状」那行也跟着 5s 刷新（和温度同一节奏）
+    if (health['E'] != null) {
+      final ds = composeDevState();
+      if (ds != devState) {
+        devState = ds;
+        changed = true;
+      }
+    }
     // 每 5s 轮询时值通常不变，没必要刷新整屏
     if (changed) notifyListeners();
+  }
+
+  /// 「现状」那一行的文字（detectStatus 与 5s 轮询共用）
+  ///
+  /// 只依赖 health 里的轻量字段（E/G/K/A/S）与探测到的管理器信息，
+  /// 所以可以每 5 秒算一次，不会像 pm list packages 那样重。
+  String composeDevState() {
+    final enf = (health['E'] ?? '').trim();
+    final pwn = int.tryParse((health['G'] ?? '0').trim()) ?? 0;
+    final ksu = int.tryParse((health['K'] ?? '0').trim()) ?? 0;
+    final asset = int.tryParse((health['A'] ?? '0').trim()) ?? 0;
+    final hasSu = (health['S'] ?? '0').trim() == '1';
+    final ksuAppText = ksuAppInstalled
+        ? 'KSU 管理器 ${ksuAppVersion.isEmpty ? "已装" : "v$ksuAppVersion"}'
+        : 'KSU 管理器 未装';
+    return [
+      if (enf.isEmpty) 'SELinux=?' else 'SELinux=$enf',
+      if (ksu > 0) 'KSU 已加载' else if (pwn > 0) 'root 模块已加载 · KSU 未加载' else 'KSU 未加载',
+      ksuAppText,
+      hasSu ? 'su 可用${suPath.isEmpty ? "" : "（$suPath）"}' : 'su 不可用',
+      '资产 $asset/4',
+    ].join(' · ');
   }
 
   /// 状态区（温度/唤醒/内存/slab/SELinux）**每 5 秒主动刷新**，不依赖是否在跑
@@ -1170,7 +1203,8 @@ class RootChain extends ChangeNotifier {
   void startHealthPolling() {
     _healthTimer?.cancel();
     _healthTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
-      if (!shizukuOk || _healthBusy) return;
+      // 跑链时不轮询：每 5s spawn 一个 shell 会干扰竞态窗口（命中率/panic 都受影响）
+      if (!shizukuOk || _healthBusy || running) return;
       _healthBusy = true;
       try {
         await refreshHealth();
@@ -1391,6 +1425,8 @@ class RootChain extends ChangeNotifier {
       _stage(StageId.root, StageStatus.ok, detail: v.split('\n').last);
       // 有 root 了：核对内核镜像 + 看 dmesg 里 KSU/模块的落地情况
       await _diagRoot('root');
+      // 顺手把「上次为什么重启」也抓下来（pstore/ramoops 只有 root 能读）
+      await collectLastCrash();
       _advice();
       return;
     }
@@ -1454,6 +1490,32 @@ class RootChain extends ChangeNotifier {
     final ok = RegExp(r'INSTALL_RC=0').hasMatch(x.out) ||
         RegExp(r'/data/adb/ksud').hasMatch(x.out);
     return ok;
+  }
+
+  /// 上次重启的原因（panic 现场）
+  ///
+  /// 只有拿到 root 才读得到：`/sys/fs/pstore/*` 是 ramoops（上一次崩溃的内核日志），
+  /// `/proc/last_kmsg` 是更老的接口。App 每次拿到 root 就顺手抓一次，
+  /// 下次再遇到"莫名重启"时，日志里直接有 panic 的那几行。
+  Future<void> collectLastCrash() async {
+    try {
+      final cmd = 'echo PSTORE=\$(ls /sys/fs/pstore 2>/dev/null | tr "\\n" ",")'
+          '; echo RESET=\$(getprop sys.resettype 2>/dev/null)'
+          '; echo LAST=\$(getprop sys.boot.reason.last 2>/dev/null)'
+          '; echo ---RAMOOPS-TAIL---'
+          '; for f in /sys/fs/pstore/console-ramoops* /sys/fs/pstore/dmesg-ramoops*; do'
+          ' [ -f "\$f" ] && { echo "## \$f"; grep -aE "Kernel panic|Unable to handle|Internal error|BUG:|Oops|pc :|lr :|Call trace" "\$f" | tail -12; }; done'
+          '; echo ---LASTKMSG---'
+          '; [ -f /proc/last_kmsg ] && grep -aE "Kernel panic|Unable to handle|Internal error|BUG:|Oops" /proc/last_kmsg | tail -8'
+          '; echo ---END---';
+      final r = await ShizukuShell.run('echo ${_shq(cmd)} | nc 127.0.0.1 5556 2>&1');
+      final t = r.out.trim();
+      if (t.isEmpty) return;
+      _log('[crash] 上次重启现场：');
+      for (final l in t.split('\n')) {
+        if (l.trim().isNotEmpty) _log('  $l');
+      }
+    } catch (_) {}
   }
 
   /// ⑦ 的真实状态：**模块加载成功 ≠ KernelSU 可用**

@@ -1,6 +1,15 @@
 # 变更记录
 
 ## v1.0.17 — 2026-10-26
+- **「现状」那行也每 5 秒刷新**：原来只有温度等在刷，`SELinux/模块/管理器/su/资产` 那行还是打开
+  App 时的快照。现在两行共用一个 5s 轮询（`composeDevState()`），字段取 `E/G/K/A/S` 五项轻量值，
+  不额外 spawn shell。
+- **打开 App 就开始检测**：`shizukuOk` 之前只在「开始」时置位，导致 5s 轮询的守卫永远拦着；
+  现在 `refreshHealth` 一旦拿到数据就置位，授权后立即开跑（不需要先点开始）。
+- **跑链时暂停轮询**：5s 一次的 shell spawn 会干扰竞态窗口（影响命中率/panic），运行期间自动停。
+- **新增「上次重启现场」采集**（`[crash]`）：拿到 root 后读 `/sys/fs/pstore/console-ramoops*`、
+  `/proc/last_kmsg`、`sys.resettype`，把 `Kernel panic / Unable to handle / BUG: / Call trace`
+  的尾部十几行写进日志 —— 再遇到莫名重启，日志里直接有 panic 现场。
 - **CI 构建告警清理**：`compileOptions` 保持 Java 8，用 `-Xlint:-options` 关掉
   `source value 8 is obsolete / target value 8 is obsolete` 这一类警告。
   **不能**直接把它提到 17：AGP 8.1.0 + JDK 21 下 target 17 会触发 `JdkImageTransform` → `jlink`，
