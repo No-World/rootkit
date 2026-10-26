@@ -516,10 +516,11 @@ class RootChain extends ChangeNotifier {
           '; echo ID=\$(id -u)'
           '; echo CTX=\$(id -Z 2>/dev/null)'
           '; echo KPTR_OLD=\$K'
-          '; echo 0 > /proc/sys/kernel/kptr_restrict 2>/dev/null'
+          '; echo 0 > /proc/sys/kernel/kptr_restrict; echo SET0_RC=\$?'
+          '; echo KPTR_AFTER=\$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null)'
           '; grep -E " (_stext|selinux_state|init_task|commit_creds|prepare_kernel_cred|init_cred)\$"'
           ' /proc/kallsyms 2>/dev/null | head -8'
-          '; echo "\$K" > /proc/sys/kernel/kptr_restrict 2>/dev/null'
+          '; echo "\$K" > /proc/sys/kernel/kptr_restrict; echo RESTORE_RC=\$?'
           '; echo KPTR_NOW=\$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null)'
           '; echo ---DMESG-KSU---'
           '; dmesg 2>/dev/null | grep -iE "ksu|kernelsu" | tail -6';
@@ -541,6 +542,25 @@ class RootChain extends ChangeNotifier {
         for (final l in lines) {
           _log('  $l');
         }
+      }
+      final txt = lines.join('\n');
+      String kv(String k) =>
+          RegExp('^$k=(.*)\$', multiLine: true).firstMatch(txt)?.group(1)?.trim() ?? '';
+      final set0rc = kv('SET0_RC');
+      final kptrAfter = kv('KPTR_AFTER');
+      final kptrOld = kv('KPTR_OLD');
+      final restoreRc = kv('RESTORE_RC');
+      // ★ 置 0 失败就该立刻报错：这说明我们改不动 kptr_restrict（SELinux/只读/权限不足），
+      //   后面的'读不到'只是它的后果，不该笼统报成'核对无效'。
+      if (set0rc != '0' || (kptrAfter.isNotEmpty && kptrAfter != '0')) {
+        _log('[diag-root:$tag] ✗ 临时置 kptr_restrict=0 失败'
+            '（原值=${kptrOld.isEmpty ? '?' : kptrOld}, 写入 rc=${set0rc.isEmpty ? '?' : set0rc}, '
+            '写后=${kptrAfter.isEmpty ? '?' : kptrAfter}）⇒ 无法读取内核符号，本次核对无效');
+        return;
+      }
+      if (restoreRc.isNotEmpty && restoreRc != '0') {
+        _log('[diag-root:$tag] ⚠ kptr_restrict 恢复失败（rc=$restoreRc），当前值可能仍为 0，'
+            '重启可复位');
       }
       BigInt? stext;
       final got = <String, BigInt>{};
