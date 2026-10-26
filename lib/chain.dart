@@ -442,7 +442,18 @@ class RootChain extends ChangeNotifier {
     _log('[pre] KernelSU 管理器：'
         '${ksuAppInstalled ? "已安装$verTxt（本模板对应 v$kKsuManagerVersion）" : "未安装（必需）"}');
     _log('[pre] /data/adb/ksu：${ksuDirReady ? "已初始化" : "未初始化（正常：加载模块后本 App 会自己跑 libksud.so install 创建）"}');
-    _log('[pre] su：${suPath.isEmpty ? "尚未提供（管理器初始化后才有）" : suPath}');
+    if (suPath.isEmpty) {
+      // 有些实现里 su 已在 PATH 上（/system/bin/su 由 sucompat 提供），但 /data/adb/ksu/bin 没有
+      final t = await ShizukuShell.run('command -v su 2>/dev/null || echo -n');
+      final w = t.out.trim();
+      if (w.isNotEmpty) {
+        _log('[pre] su：$w（可用；/data/adb/ksu 未初始化不影响）');
+      } else {
+        _log('[pre] su：尚未提供（管理器初始化后才有）');
+      }
+    } else {
+      _log('[pre] su：$suPath');
+    }
 
     // 双包共存检测：.debug 测试包和正式包会装在同一台机器上，各自都有 3s/5s 轮询。
     // 两个 App 同时往竞态窗口里 spawn shell，会明显推高 panic 率（真机踩过）。
@@ -522,7 +533,7 @@ class RootChain extends ChangeNotifier {
   ///
   /// 顺带核对「内核镜像是否与本机标定的一致」：用 5 个符号相对 _stext 的偏移和本机镜像比对。
   /// 不符 ⇒ 这台机器的内核和已知镜像不同，后面的地址全都不可信（最该报给作者的信息）。
-  Future<void> _diagRoot(String tag) async {
+  Future<void> _diagRoot(String tag, {bool viaSu = false}) async {
     const expect = <String, int>{
       'selinux_state': 0x27D7A60,
       'init_task': 0x254DAC0,
@@ -554,7 +565,13 @@ class RootChain extends ChangeNotifier {
           '; echo KPTR_NOW=\$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null)'
           '; echo ---DMESG-KSU---'
           '; dmesg 2>/dev/null | grep -iE "ksu|kernelsu" | tail -6';
-      final r = await ShizukuShell.run('echo ${_shq(cmd)} | nc 127.0.0.1 5556 2>&1');
+      // 通道选择：
+      // - 默认走 5556 的"root shell"（自己用 exploit 提权出来的那个，早期阶段只有它）
+      // - viaSu 时走 KernelSU 的 su -c（⑦ 之后 su 已可用；实测加载 KSU 后
+      //   5556 那个 shell 已经写不动 /proc/sys/kernel/kptr_restrict，会 Permission denied）
+      final r = await ShizukuShell.run(viaSu
+          ? 'su -c ${_shq(cmd)} 2>&1'
+          : 'echo ${_shq(cmd)} | nc 127.0.0.1 5556 2>&1');
       // 清洗 nc 回显的 shell 提示与续行标记
       final lines = <String>[];
       for (final raw in r.out.split('\n')) {
@@ -582,10 +599,16 @@ class RootChain extends ChangeNotifier {
       final restoreRc = kv('RESTORE_RC');
       // ★ 置 0 失败就该立刻报错：这说明我们改不动 kptr_restrict（SELinux/只读/权限不足），
       //   后面的'读不到'只是它的后果，不该笼统报成'核对无效'。
+      if ((set0rc != '0' || (kptrAfter.isNotEmpty && kptrAfter != '0')) && !viaSu) {
+        _log('[diag-root:$tag] root shell 写不动 kptr_restrict（rc=${set0rc.isEmpty ? "?" : set0rc}）'
+            '⇒ 改用 su 重试');
+        return _diagRoot(tag, viaSu: true);
+      }
       if (set0rc != '0' || (kptrAfter.isNotEmpty && kptrAfter != '0')) {
         _log('[diag-root:$tag] ✗ 临时置 kptr_restrict=0 失败'
-            '（原值=${kptrOld.isEmpty ? '?' : kptrOld}, 写入 rc=${set0rc.isEmpty ? '?' : set0rc}, '
-            '写后=${kptrAfter.isEmpty ? '?' : kptrAfter}）⇒ 无法读取内核符号，本次核对无效');
+            '（通道=${viaSu ? "su -c" : "root shell"}, 原值=${kptrOld.isEmpty ? '?' : kptrOld}, '
+            '写入 rc=${set0rc.isEmpty ? '?' : set0rc}, 写后=${kptrAfter.isEmpty ? '?' : kptrAfter}）'
+            '⇒ 无法读取内核符号，本次核对无效');
         return;
       }
       if (restoreRc.isNotEmpty && restoreRc != '0') {
@@ -1787,31 +1810,51 @@ class RootChain extends ChangeNotifier {
   /// - 显式跳过：本 App 自己、Shizuku、KernelSU 管理器（杀了会断掉自己的通道）。
   Future<void> _killBackground(String tag) async {
     if (!optKillBg) return;
+    // 三件事分开做，全部在 Dart 侧求交集：
+    // ① 取第三方包清单；② 取当前在跑的进程名（ps -A -o args，完整 cmdline）；
+    // ③ 只对交集里的包下发 am kill。
+    // 不在 shell 里写 while/for + here-doc：Shizuku 通道一次只跑一条命令，
+    // here-doc 正文必须另起一行 ⇒ 之前真机上恒定输出「0 个」。
     final before = await ShizukuShell.run('ls /proc 2>/dev/null | grep -cE "^[0-9]"');
     final n0 = int.tryParse(before.out.trim()) ?? 0;
-    // 注意：**不能用 here-doc**。这条命令必须是一整行（Shizuku 通道按行执行），
-    // 而 `while read ... done <<EOF` 的正文必须从下一行开始 ⇒ 正文为空 ⇒ 循环一次都不跑，
-    // 真机上就表现成「只清第三方后台：0 个」。改成 for 遍历命令替换的结果。
-    final r = await ShizukuShell.run(
-        'TP=\$(pm list packages -3 2>/dev/null | cut -d: -f2)'
-        '; K=""; N=0'
-        '; for p in \$(ps -A -o args 2>/dev/null | sed "s/[: ].*//" | sort -u); do'
-        ' case "\$p" in'
-        ' com.noworld.rootkit*|moe.shizuku.privileged.api|me.weishu.kernelsu) continue;;'
-        ' esac'
-        ' printf "%s\\n" "\$TP" | grep -Fxq "\$p" || continue'
-        ' am kill "\$p" >/dev/null 2>&1'
-        ' K="\$K\$p,"; N=\$((N+1))'
-        ' done'
-        '; echo KILLED=\$N; echo LIST=\$K');
-    final out = r.out;
-    final n = RegExp(r'KILLED=(\d+)').firstMatch(out)?.group(1) ?? '0';
-    final list = RegExp(r'LIST=(.*)').firstMatch(out)?.group(1)?.trim() ?? '';
+    final tpR = await ShizukuShell.run('pm list packages -3 2>/dev/null');
+    final third = <String>{};
+    for (final l in tpR.out.split('\n')) {
+      final t = l.trim();
+      if (t.startsWith('package:')) third.add(t.substring(8));
+    }
+    final psR = await ShizukuShell.run('ps -A -o args 2>/dev/null');
+    final running = <String>{};
+    for (final l in psR.out.split('\n')) {
+      final t = l.trim();
+      if (t.isEmpty) continue;
+      var name = t;
+      final sp = name.indexOf(RegExp(r'[ :]'));
+      if (sp > 0) name = name.substring(0, sp);
+      running.add(name);
+    }
+    const skip = <String>{
+      'moe.shizuku.privileged.api',
+      'me.weishu.kernelsu',
+    };
+    final targets = running
+        .where((p) => third.contains(p))
+        .where((p) => !p.startsWith('com.noworld.rootkit'))
+        .where((p) => !skip.contains(p))
+        .toList()
+      ..sort();
+    if (targets.isEmpty) {
+      _log('[killbg:$tag] 没有需要清理的第三方后台'
+          '（第三方包=${third.length} 进程=${running.length} rc=${tpR.code}/${psR.code}）');
+      return;
+    }
+    final cmd = targets.map((p) => 'am kill ${_shq(p)} >/dev/null 2>&1').join('; ');
+    await ShizukuShell.run(cmd);
     await _sleep(1200);
     final after = await ShizukuShell.run('ls /proc 2>/dev/null | grep -cE "^[0-9]"');
     final n1 = int.tryParse(after.out.trim()) ?? 0;
-    _log('[killbg:$tag] 只清第三方后台：$n 个${list.isEmpty ? "" : "（$list）"}'
-        '${(n0 > 0 && n1 > 0) ? " · 进程 $n0 → $n1" : ""}');
+    _log('[killbg:$tag] 已清理第三方后台 ${targets.length} 个'
+        '（${targets.join(",")}）${(n0 > 0 && n1 > 0) ? " · 进程 $n0 → $n1" : ""}');
     if (!await ShizukuShell.checkPermission()) {
       _log('[killbg:$tag] ⚠ Shizuku 掉线：请重新授权后再跑');
     }
