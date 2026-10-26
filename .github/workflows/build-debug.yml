@@ -71,9 +71,13 @@ jobs:
           cp build/app/outputs/flutter-apk/app-debug.apk "out/${NAME}.apk"
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
           "$BT/aapt2" dump badging "out/${NAME}.apk" > /tmp/badging.txt
-          PKG=$(grep -m1 '^package:' /tmp/badging.txt | sed "s/.*name='\([^']*\)'.*/\1/")
-          VN=$(grep -m1 '^package:' /tmp/badging.txt | sed "s/.*versionName='\([^']*\)'.*/\1/")
-          VC=$(grep -m1 '^package:' /tmp/badging.txt | sed "s/.*versionCode='\([^']*\)'.*/\1/")
+          # 注意：不要用 sed "s/.*name='\([^']*\)'.*/\1/"，贪婪匹配会命中行尾的
+          # compileSdkVersionCodename='14' ⇒ 包名被解析成 "14"。用 dump packagename 最稳。
+          PKG=$("$BT/aapt2" dump packagename "out/${NAME}.apk" | tr -d '\r')
+          VN=$(sed -n "s/^package: .* versionName='\([^']*\)'.*/\1/p" /tmp/badging.txt | head -1)
+          VC=$(sed -n "s/^package: .* versionCode='\([^']*\)'.*/\1/p" /tmp/badging.txt | head -1)
+          MD5=$(md5sum "out/${NAME}.apk" | cut -d' ' -f1)
+          echo "${MD5}  ${NAME}.apk" > "out/${NAME}.apk.md5"
           SIZE=$(du -h "out/${NAME}.apk" | cut -f1)
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
           echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
@@ -87,6 +91,7 @@ jobs:
             echo "| versionCode | \`${VC}\` |"
             echo "| 大小 | ${SIZE} |"
             echo "| 签名 | debug key（**不能**覆盖正式版，可与正式版共存） |"
+            echo "| md5 | \`${MD5}\` |"
             echo ""
             echo "下载：本页底部 **Artifacts → ${NAME}**（zip 里就是 apk）。"
             echo ""
@@ -96,13 +101,17 @@ jobs:
             echo '```'
             echo ""
             echo "注意：这个包是 \`${PKG}\`，**和正式版 \`com.noworld.rootkit\` 是两个 App**，桌面图标可能同名，别装错。"
+            echo ""
+            echo "Artifacts 直达：${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}#artifacts"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.pack.outputs.name }}
-          path: out/*.apk
+          path: out/*
           retention-days: 14
+          # 没匹配到文件时必须失败：默认只 warn，会静默产出"没有 Artifacts"的运行
+          if-no-files-found: error
 
       # 同仓库 PR 才回帖（fork PR 的 token 只读，回帖会 403 把 job 弄红）
       - name: Comment artifact link on PR
@@ -114,6 +123,10 @@ jobs:
             echo "测试包已构建：\`${NAME}.apk\`（包名 \`${PKG}\`，debug 签名，可与正式版共存）"
             echo ""
             echo "下载：本 PR 的 **Checks → debug → 页面底部 Artifacts** → \`${NAME}\`"
+            echo ""
+            echo "直达：${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}#artifacts"
+            echo ""
+            echo "md5：\`$(cat "out/${NAME}.apk.md5" | cut -d' ' -f1)\`"
             echo ""
             echo '```'
             echo "unzip ${NAME}.zip && adb install -r ${NAME}.apk"
