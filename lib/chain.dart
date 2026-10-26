@@ -1522,10 +1522,15 @@ class RootChain extends ChangeNotifier {
 
   /// 开打前的温度闸（读 thermal_zone0，单位 m℃）
   ///
-  /// 阈值 = **40°C**（用户指定）。历史数据：>60°C 时 CPU 降到 1.3GHz，泄漏/命中都会掉；
-  /// 机身有余温时竞态时序也会漂移，表现为"越跑越差 + 更容易 panic"。宁可等一两分钟。
-  static const int _tempGateMc = 40000;   // 40.0°C
-  static const int _tempGateTries = 9;    // 最多等 9×10s = 90s，超时后照打（并记一条警告）
+  /// 两级（用户指定）：
+  /// · **>40°C 提醒**：照打，但日志/建议里提示偏高；
+  /// · **≥45°C 阻断**：先等降温（10s × 9 = 最多 90s），降下来再打。
+  /// 为什么管温度：>60°C 时 CPU 降到 1.3GHz，泄漏/命中都会掉；有余温时竞态时序也漂移，
+  /// 表现为"越跑越差 + 更容易 panic"。
+  static const int _tempWarnMc = 40000;    // 40.0°C 以上提醒
+  static const int _tempBlockMc = 45000;   // 45.0°C 及以上阻断
+  static const int _tempGateTries = 9;     // 最多等 9×10s = 90s
+
   Future<void> _cooldownGate() async {
     for (var i = 0; i < _tempGateTries; i++) {
       final r = await ShizukuShell.run(
@@ -1534,17 +1539,21 @@ class RootChain extends ChangeNotifier {
       if (t <= 0) return;
       health['T'] = '$t';
       notifyListeners();
-      if (t <= _tempGateMc) {
-        if (i > 0) _log('[temp] ${(t / 1000).toStringAsFixed(1)}°C ≤40°C，开打');
-        return;
+      final c = (t / 1000).toStringAsFixed(1);
+      if (t >= _tempBlockMc) {
+        _log('[temp] 机身 ${c}°C ≥45°C，阻断开打，等 10s 降温（第 ${i + 1}/$_tempGateTries 次）');
+        await ShizukuShell.run('input keyevent 224 2>/dev/null');
+        await _sleep(10000);
+        continue;
       }
-      _log('[temp] 机身 ${(t / 1000).toStringAsFixed(1)}°C > 40°C，等 10s 降温'
-          '（第 ${i + 1}/$_tempGateTries 次）');
-      // 顺手把屏幕开着、别让系统进 doze
-      await ShizukuShell.run('input keyevent 224 2>/dev/null');
-      await _sleep(10000);
+      if (t > _tempWarnMc) {
+        _log('[temp] ⚠ 机身 ${c}°C（>40°C 偏高，但 <45°C 放行）：命中率可能偏低，建议再晾一会儿');
+      } else if (i > 0) {
+        _log('[temp] ${c}°C 已降到 40°C 以下，开打');
+      }
+      return;
     }
-    _log('[temp] ⚠ 等满 ${_tempGateTries * 10}s 仍 >40°C，仍要开打（命中率与稳定性都会变差）');
+    _log('[temp] ⚠ 等满 ${_tempGateTries * 10}s 仍 ≥45°C，仍要开打（命中率与稳定性都会明显变差）');
   }
 
   Future<bool> _ksuSuReady() async {
