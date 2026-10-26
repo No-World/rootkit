@@ -1,5 +1,8 @@
 name: build-debug
 
+# 列表里一眼看出这是哪个 PR / 哪个分支（旧版直接显示 '2/merge'，看不出是什么）
+run-name: debug ${{ github.event_name == 'pull_request' && format('PR #{0}', github.event.pull_request.number) || github.ref_name }}
+
 # PR / main（合并结果）/ 手动。只在 PR 和 main 上跑：
 # 以前对 push 用了 branches: ['**']，导致「推分支」+「开/更新 PR」同一提交触发两份一样的构建。
 on:
