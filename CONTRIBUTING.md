@@ -42,7 +42,7 @@ gh pr merge --squash --delete-branch      # 5. 合并（squash，保持 main 单
 |---|---|
 | 包名 | `com.noworld.rootkit.debug` |
 | 构建 | **release / AOT**（与正式版同构），不是 JIT debug 包 |
-| 体积 | ≈19MB（debug 包要 157MB，artifact 71MB） |
+| 体积 | **19.0MB**（APK）/ 10.2MB（artifact zip）；debug 包是 157MB / 71MB ⇒ 换 release/AOT 省 7 倍 |
 | 签名 | debug key ⇒ 可与正式版共存；**不能**覆盖正式版 |
 
 ```bash
