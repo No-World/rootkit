@@ -18,6 +18,9 @@
 - **修「打开 App / 授权后不自动开始检测」**：5s 轮询的守卫是 `if (!shizukuOk) return`，
   而 `shizukuOk` 只在 `refreshHealth` 成功时才置位 ⇒ 死锁，永远不轮询。改成用
   `ShizukuShell.checkPermission()`（binder，不 spawn 进程）先翻状态；授权后立即刷一次。
+- **双包共存提醒**：`.debug` 测试包与正式包同时装着时，两个 App 各自的 3s/5s 轮询会一起往
+  竞态窗口里 spawn shell（实测显著提高 panic 率）。② 预检会检测「正式包在运行」并提示：
+  `am force-stop com.noworld.rootkit` 或临时卸载它。
 - **开打前加温度闸**：**>40°C 就先等**（10s × 9，最多 90s），降到 40.0°C 及以下再开打；超时仍未降温会打一条 ⚠ 日志后照打。阈值按用户指定设为 40°C。
 - **「现状」并进状态条，一行看完**：原来「现状：…」单独占一行、且只有打开 App 的快照；
   现在并进温度那条状态带（`温度 · 唤醒 · 内存 · posix · cred · SELinux · KSU/模块 ·

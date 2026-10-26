@@ -321,6 +321,29 @@ class RootChain extends ChangeNotifier {
     _log('[pre] /data/adb/ksu：${ksuDirReady ? "已初始化" : "未初始化（正常：加载模块后本 App 会自己跑 libksud.so install 创建）"}');
     _log('[pre] su：${suPath.isEmpty ? "尚未提供（管理器初始化后才有）" : suPath}');
 
+    // 双包共存检测：.debug 测试包和正式包会装在同一台机器上，各自都有 3s/5s 轮询。
+    // 两个 App 同时往竞态窗口里 spawn shell，会明显推高 panic 率（真机踩过）。
+    final dual = await ShizukuShell.run(
+        'echo D=\$(pm path com.noworld.rootkit 2>/dev/null | head -1 | wc -l)'
+        '; echo R=\$(ps -A -o NAME 2>/dev/null | grep -cx "com.noworld.rootkit")'
+        '; echo B=\$(ps -A -o NAME 2>/dev/null | grep -cx "com.noworld.rootkit.debug")');
+    final dInstalled = (RegExp(r'^D=(\d+)', multiLine: true).firstMatch(dual.out)?.group(1) ??
+            '0') !=
+        '0';
+    final rAlive = int.tryParse(
+            RegExp(r'^R=(\d+)', multiLine: true).firstMatch(dual.out)?.group(1) ?? '0') ??
+        0;
+    final bAlive = int.tryParse(
+            RegExp(r'^B=(\d+)', multiLine: true).firstMatch(dual.out)?.group(1) ?? '0') ??
+        0;
+    if (dInstalled && rAlive > 0 && bAlive > 0) {
+      _log('[pre] ⚠ 检测到正式包 com.noworld.rootkit 也在运行（两个 App 都在轮询）'
+          '⇒ 会挤占竞态窗口、显著提高 panic 率。建议先执行：'
+          'am force-stop com.noworld.rootkit（或临时卸载正式包），再跑本页');
+      suggestions.add('正式包还在后台跑：先 `am force-stop com.noworld.rootkit` 或临时卸载它，'
+          '否则两个 App 的定时轮询会互相干扰（panic 率明显上升）。');
+    }
+
     if (!ksuAppInstalled) {
       _stage(StageId.env, StageStatus.failed, detail: '未安装 KernelSU 管理器');
       lastError = '未安装 KernelSU 管理器（me.weishu.kernelsu）v$kKsuManagerVersion。'
