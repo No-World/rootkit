@@ -510,16 +510,19 @@ class RootChain extends ChangeNotifier {
     try {
       // kptr_restrict=2 时 /proc/kallsyms 对所有非特权域返回全 0。
       // 我们自己的 root shell 是 ID=0，临时关掉再读，读完写回原值。
-      final cmd = 'K=\$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null)'
+      // kptr_restrict==2 时内核的 kallsyms_show_value() 无条件返回 0
+      // （uid=0/CAP_SYSLOG 也看不到），所以要在 root shell 里临时置 0、读完立刻写回。
+      final cmd = 'K=\$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null || echo 2)'
           '; echo ID=\$(id -u)'
           '; echo CTX=\$(id -Z 2>/dev/null)'
           '; echo KPTR_OLD=\$K'
           '; echo 0 > /proc/sys/kernel/kptr_restrict 2>/dev/null'
           '; grep -E " (_stext|selinux_state|init_task|commit_creds|prepare_kernel_cred|init_cred)\$"'
           ' /proc/kallsyms 2>/dev/null | head -8'
+          '; echo "\$K" > /proc/sys/kernel/kptr_restrict 2>/dev/null'
+          '; echo KPTR_NOW=\$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null)'
           '; echo ---DMESG-KSU---'
-          '; dmesg 2>/dev/null | grep -iE "ksu|kernelsu" | tail -6'
-          '; echo "\$K" > /proc/sys/kernel/kptr_restrict 2>/dev/null';
+          '; dmesg 2>/dev/null | grep -iE "ksu|kernelsu" | tail -6';
       final r = await ShizukuShell.run('echo ${_shq(cmd)} | nc 127.0.0.1 5556 2>&1');
       // 清洗 nc 回显的 shell 提示与续行标记
       final lines = <String>[];
