@@ -45,8 +45,11 @@ jobs:
       # 注意：secrets 不能在 steps[*].if 里直接引用（会让整份 workflow 校验失败），要用 env 中转。
       # 缓存 1：Gradle 依赖 + 构建缓存（Flutter 的 Android 构建里最耗时的一段）
       # 命中时 android 侧几乎不用重新下载 AGP/Kotlin/依赖；改代码只重编增量部分。
+      # version 必须 ≥ v5：v4 的 action.yml 是 `runs.using: node20`，GitHub 已废弃 Node 20
+      # （会在每次运行顶部刷 "Node.js 20 is deprecated … forced to run on Node.js 24"）。
+      # v5 是 node24 且输入/输出与 v4 完全一致（纯升级 runtime）；v6 只是迁到 ESM，不必跟。
       - name: Cache Gradle
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.gradle/caches
@@ -57,7 +60,7 @@ jobs:
 
       # 缓存 2：pub 包（flutter_svg / shizuku 等）
       - name: Cache pub
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.pub-cache

@@ -64,47 +64,55 @@ class RootChain extends ChangeNotifier {
   /// 原因见 CHANGELOG v1.0.17：3s/5s 的重型轮询会把 UAF 释放的页重新占用，直接推高 panic 率。
   bool get busy => running;
   bool shizukuOk = false;
-  bool success = false;        // su 验证通过（整链成功）
+  bool success = false; // su 验证通过（整链成功）
   bool softRebootTried = false;
-  final Map<String, String> _orig = {};  // 选项改动前的系统原值快照
+  final Map<String, String> _orig = {}; // 选项改动前的系统原值快照
   bool _optApplied = false;
   String bootId = '';
   String phase = '空闲';
   String? lastError;
   final Map<String, String> health = {}; // temp/wake/mem/posix/cred/enforce
-  final Map<StageId, String> skipReason = {};  // 可跳过的阶段 → 原因
-  bool alreadyRooted = false;                 // 探测到已越狱（su 可用）
-  bool assetsReady = false;                   // 资产已在设备上（跳过重复写入）
+  final Map<StageId, String> skipReason = {}; // 可跳过的阶段 → 原因
+  bool alreadyRooted = false; // 探测到已越狱（su 可用）
+  bool assetsReady = false; // 资产已在设备上（跳过重复写入）
   // KernelSU 管理器的三项现场（环境预检就查，别等到 ⑧ 才发现没有 su）
-  bool ksuAppInstalled = false;                // APK 装了没（me.weishu.kernelsu）
-  bool ksuDirReady = false;                    // /data/adb/ksu 是否已初始化（模块加载后才可能出现）
-  String suPath = '';                          // su 实际所在路径（空 = 都没有）
-  String ksuAppVersion = '';                   // KernelSU 管理器版本（versionName）
-  String lastResetType = '';                   // sys.resettype：上次关机/重启类型（abnormal:AP_S_PANIC 等）
-  String devState = '';                        // 一句话设备现状（用于界面）
-  Timer? _healthTimer;                        // 5s 主动刷新状态区
-  bool _healthBusy = false;                   // 防重入
+  bool ksuAppInstalled = false; // APK 装了没（me.weishu.kernelsu）
+  bool ksuDirReady = false; // /data/adb/ksu 是否已初始化（模块加载后才可能出现）
+  String suPath = ''; // su 实际所在路径（空 = 都没有）
+  String ksuAppVersion = ''; // KernelSU 管理器版本（versionName）
+  String lastResetType = ''; // sys.resettype：上次关机/重启类型（abnormal:AP_S_PANIC 等）
+  String devState = ''; // 一句话设备现状（用于界面）
+  Timer? _healthTimer; // 5s 主动刷新状态区
+  bool _healthBusy = false; // 防重入
   String shizukuVia = '';
 
   // ---- 可选项（持久化在 App 私有 SharedPreferences）----
-  bool optWifiOff = false;   // 关 WiFi / 蓝牙 / 飞行模式（提高命中率，但会让 Shizuku 无线调试失效）
-  bool optTap = true;        // 每轮自动点屏（防止 doze 导致命中率归零）
-  bool optStayOn = true;     // 保持屏幕常亮
-  bool optCleanup = true;    // 成功后清理已落盘的原生件与临时文件
+  bool optWifiOff = false; // 关 WiFi / 蓝牙 / 飞行模式（提高命中率，但会让 Shizuku 无线调试失效）
+  bool optTap = true; // 每轮自动点屏（防止 doze 导致命中率归零）
+  bool optStayOn = true; // 保持屏幕常亮
+  bool optCleanup = true; // 成功后清理已落盘的原生件与临时文件
+  bool optUpdateCheck = true; // 启动时检查 GitHub Release 是否有新版（默认开；关掉只影响自动检查）
 
   Future<void> loadOptions() async {
     final a = await ShizukuShell.getPref('opt.wifiOff');
     final b = await ShizukuShell.getPref('opt.tap');
     final c = await ShizukuShell.getPref('opt.stayOn');
     final d = await ShizukuShell.getPref('opt.cleanup');
+    final e = await ShizukuShell.getPref('opt.updateCheck');
     if (a != null) optWifiOff = a == '1';
     if (b != null) optTap = b == '1';
     if (c != null) optStayOn = c == '1';
     if (d != null) optCleanup = d == '1';
+    if (e != null) optUpdateCheck = e == '1';
     notifyListeners();
   }
 
-  Future<void> setOptions({bool? wifiOff, bool? tap, bool? stayOn, bool? cleanup}) async {
+  Future<void> setOptions(
+      {bool? wifiOff,
+      bool? tap,
+      bool? stayOn,
+      bool? cleanup,
+      bool? updateCheck}) async {
     if (wifiOff != null) {
       optWifiOff = wifiOff;
       await ShizukuShell.setPref('opt.wifiOff', wifiOff ? '1' : '0');
@@ -120,6 +128,10 @@ class RootChain extends ChangeNotifier {
     if (cleanup != null) {
       optCleanup = cleanup;
       await ShizukuShell.setPref('opt.cleanup', cleanup ? '1' : '0');
+    }
+    if (updateCheck != null) {
+      optUpdateCheck = updateCheck;
+      await ShizukuShell.setPref('opt.updateCheck', updateCheck ? '1' : '0');
     }
     _advice();
     notifyListeners();
@@ -155,19 +167,22 @@ class RootChain extends ChangeNotifier {
     if (optStayOn && t != null && t != 'null') {
       b.write('settings put system screen_off_timeout $t; ');
       final s0 = _orig['S'];
-      if (s0 != null) b.write('settings put global stay_on_while_plugged_in $s0; ');
+      if (s0 != null)
+        b.write('settings put global stay_on_while_plugged_in $s0; ');
     }
     if (optWifiOff) {
       final a = _orig['A'];
       if (a != null) {
         b.write('settings put global airplane_mode_on $a; ');
-        b.write('am broadcast -a android.intent.action.AIRPLANE_MODE --ez state '
+        b.write(
+            'am broadcast -a android.intent.action.AIRPLANE_MODE --ez state '
             '${a == '1' ? 'true' : 'false'} >/dev/null 2>&1; ');
       }
       final w = _orig['W'];
       if (w != null) b.write('svc wifi ${w == '1' ? 'enable' : 'disable'}; ');
       final bt = _orig['B'];
-      if (bt != null) b.write('svc bluetooth ${bt == '1' ? 'enable' : 'disable'}; ');
+      if (bt != null)
+        b.write('svc bluetooth ${bt == '1' ? 'enable' : 'disable'}; ');
     }
     if (b.isEmpty) return;
     b.write('true');
@@ -186,10 +201,12 @@ class RootChain extends ChangeNotifier {
     final b = StringBuffer();
     if (optTap) b.write('input keyevent 224; input tap 540 1200; ');
     if (optStayOn) {
-      b.write('svc power stayon true; settings put system screen_off_timeout 1800000; ');
+      b.write(
+          'svc power stayon true; settings put system screen_off_timeout 1800000; ');
     }
     if (optWifiOff) {
-      b.write('svc wifi disable; svc bluetooth disable; settings put global airplane_mode_on 1; '
+      b.write(
+          'svc wifi disable; svc bluetooth disable; settings put global airplane_mode_on 1; '
           'am broadcast -a android.intent.action.AIRPLANE_MODE --ez state true >/dev/null 2>&1; ');
     }
     b.write('true');
@@ -227,6 +244,9 @@ class RootChain extends ChangeNotifier {
 
   /// 校准弹窗用：走统一日志管道（批量化落盘 + 800 行裁剪）
   void addLogFromCalib(String l) => _log('[calib] $l');
+
+  /// 其它界面（更新检查等）写日志：同样走统一管道（批量化落盘 + 800 行裁剪）
+  void addLog(String l) => _log(l);
 
   void _flushLog() {
     final f = _logFile;
@@ -299,17 +319,18 @@ class RootChain extends ChangeNotifier {
   /// - `/data/adb/ksu` 不存在 ⇒ 只提示：它要等模块加载后、管理器被打开一次才会被创建。
   Future<void> _preflight() async {
     final r = await ShizukuShell.run(
-      'echo APP=\$(pm list packages 2>/dev/null | grep -c me.weishu.kernelsu)'
-      '; echo VER=\$(dumpsys package me.weishu.kernelsu 2>/dev/null | sed -n "s/.*versionName=//p" | head -1)'
-      '; echo DIR=\$(ls -d /data/adb/ksu 2>/dev/null | head -1)'
-      '; echo SU=\$(command -v su 2>/dev/null)'
-      '; echo SUM=\$(ls /data/adb/ksu/bin/su 2>/dev/null)');
+        'echo APP=\$(pm list packages 2>/dev/null | grep -c me.weishu.kernelsu)'
+        '; echo VER=\$(dumpsys package me.weishu.kernelsu 2>/dev/null | sed -n "s/.*versionName=//p" | head -1)'
+        '; echo DIR=\$(ls -d /data/adb/ksu 2>/dev/null | head -1)'
+        '; echo SU=\$(command -v su 2>/dev/null)'
+        '; echo SUM=\$(ls /data/adb/ksu/bin/su 2>/dev/null)');
     final out = r.out;
-    ksuAppInstalled = (RegExp(r'^APP=(\d+)', multiLine: true).firstMatch(out)?.group(1) ??
-            '0') !=
-        '0';
-    ksuAppVersion =
-        _normVer(RegExp(r'^VER=(\S+)', multiLine: true).firstMatch(out)?.group(1) ?? '');
+    ksuAppInstalled =
+        (RegExp(r'^APP=(\d+)', multiLine: true).firstMatch(out)?.group(1) ??
+                '0') !=
+            '0';
+    ksuAppVersion = _normVer(
+        RegExp(r'^VER=(\S+)', multiLine: true).firstMatch(out)?.group(1) ?? '');
     ksuDirReady = RegExp(r'^DIR=/', multiLine: true).hasMatch(out);
     suPath = RegExp(r'^SU=(\S+)', multiLine: true).firstMatch(out)?.group(1) ??
         RegExp(r'^SUM=(\S+)', multiLine: true).firstMatch(out)?.group(1) ??
@@ -318,7 +339,8 @@ class RootChain extends ChangeNotifier {
     final verTxt = ksuAppVersion.isEmpty ? '' : ' v$ksuAppVersion';
     _log('[pre] KernelSU 管理器：'
         '${ksuAppInstalled ? "已安装$verTxt（本模板对应 v$kKsuManagerVersion）" : "未安装（必需）"}');
-    _log('[pre] /data/adb/ksu：${ksuDirReady ? "已初始化" : "未初始化（正常：加载模块后本 App 会自己跑 libksud.so install 创建）"}');
+    _log(
+        '[pre] /data/adb/ksu：${ksuDirReady ? "已初始化" : "未初始化（正常：加载模块后本 App 会自己跑 libksud.so install 创建）"}');
     _log('[pre] su：${suPath.isEmpty ? "尚未提供（管理器初始化后才有）" : suPath}');
 
     if (!ksuAppInstalled) {
@@ -349,20 +371,19 @@ class RootChain extends ChangeNotifier {
   Future<List<String>> _diag(String tag) async {
     final out = <String>[];
     try {
-      final r = await ShizukuShell.run(
-        'echo ENF=\$(getenforce 2>/dev/null)'
-        '; echo MODEL=\$(getprop ro.product.model)'
-        '; echo FP=\$(getprop ro.build.fingerprint)'
-        '; echo KREL=\$(uname -r)'
-        '; echo MODS=\$(grep -E "^(pwn|kernelsu)" /proc/modules 2>/dev/null | cut -d" " -f1 | tr "\\n" ",")'
-        '; echo KSUAPP=\$(pm list packages 2>/dev/null | grep -c me.weishu.kernelsu)'
-        '; echo KSUDIR=\$(ls -d /data/adb/ksu 2>/dev/null | head -1)'
-        '; echo KSUBIN=\$(ls /data/adb/ksu/bin 2>/dev/null | tr "\\n" ",")'
-        '; echo SU_WHICH=\$(command -v su 2>/dev/null)'
-        '; echo SU_SYS=\$(ls -l /system/bin/su 2>/dev/null | tr -s " " | cut -d" " -f1,9-)'
-        '; echo SU_KSU=\$(ls -l /data/adb/ksu/bin/su 2>/dev/null | tr -s " " | cut -d" " -f1,9-)'
-        '; echo SU_RAMDISK=\$(ls -l /debug_ramdisk/su 2>/dev/null | tr -s " " | cut -d" " -f1,9-)'
-        '; echo CTX=\$(id -Z 2>/dev/null)');
+      final r = await ShizukuShell.run('echo ENF=\$(getenforce 2>/dev/null)'
+          '; echo MODEL=\$(getprop ro.product.model)'
+          '; echo FP=\$(getprop ro.build.fingerprint)'
+          '; echo KREL=\$(uname -r)'
+          '; echo MODS=\$(grep -E "^(pwn|kernelsu)" /proc/modules 2>/dev/null | cut -d" " -f1 | tr "\\n" ",")'
+          '; echo KSUAPP=\$(pm list packages 2>/dev/null | grep -c me.weishu.kernelsu)'
+          '; echo KSUDIR=\$(ls -d /data/adb/ksu 2>/dev/null | head -1)'
+          '; echo KSUBIN=\$(ls /data/adb/ksu/bin 2>/dev/null | tr "\\n" ",")'
+          '; echo SU_WHICH=\$(command -v su 2>/dev/null)'
+          '; echo SU_SYS=\$(ls -l /system/bin/su 2>/dev/null | tr -s " " | cut -d" " -f1,9-)'
+          '; echo SU_KSU=\$(ls -l /data/adb/ksu/bin/su 2>/dev/null | tr -s " " | cut -d" " -f1,9-)'
+          '; echo SU_RAMDISK=\$(ls -l /debug_ramdisk/su 2>/dev/null | tr -s " " | cut -d" " -f1,9-)'
+          '; echo CTX=\$(id -Z 2>/dev/null)');
       for (final line in r.out.split('\n')) {
         final t = line.trim();
         if (t.isNotEmpty) out.add(t);
@@ -395,7 +416,8 @@ class RootChain extends ChangeNotifier {
           ' /proc/kallsyms 2>/dev/null | head -8'
           '; echo ---DMESG-KSU---'
           '; dmesg 2>/dev/null | grep -iE "ksu|kernelsu" | tail -10';
-      final r = await ShizukuShell.run('echo ${_shq(cmd)} | nc 127.0.0.1 5556 2>&1');
+      final r =
+          await ShizukuShell.run('echo ${_shq(cmd)} | nc 127.0.0.1 5556 2>&1');
       final txt = r.out.trim();
       if (txt.isNotEmpty) {
         _log('[diag-root:$tag]');
@@ -407,7 +429,8 @@ class RootChain extends ChangeNotifier {
       BigInt? stext;
       final got = <String, BigInt>{};
       for (final l in txt.split('\n')) {
-        final m = RegExp(r'^([0-9a-f]{8,16})\s+\S\s+(\w+)').firstMatch(l.trim());
+        final m =
+            RegExp(r'^([0-9a-f]{8,16})\s+\S\s+(\w+)').firstMatch(l.trim());
         if (m == null) continue;
         final addr = BigInt.tryParse(m.group(1)!, radix: 16);
         if (addr == null) continue;
@@ -470,16 +493,19 @@ class RootChain extends ChangeNotifier {
       suggestions.add('先授权 Shizuku（打开 Shizuku → 无线调试启动 → 回到本页点「授权」）。');
     }
     if (perm.status == StageStatus.failed) {
-      suggestions.add('permissive 连续未命中：确认屏幕常亮、关 WiFi / 开飞行模式、机身不烫（>60°C 会降频）。');
+      suggestions
+          .add('permissive 连续未命中：确认屏幕常亮、关 WiFi / 开飞行模式、机身不烫（>60°C 会降频）。');
     } else if (perm.hasRate && perm.rate < 0.4) {
-      suggestions.add('permissive 命中率 ${(perm.rate * 100).toStringAsFixed(0)}% 偏低：每轮前会点屏，建议重启设备后再跑。');
+      suggestions.add(
+          'permissive 命中率 ${(perm.rate * 100).toStringAsFixed(0)}% 偏低：每轮前会点屏，建议重启设备后再跑。');
     }
     if (p1.status == StageStatus.failed || p2.status == StageStatus.failed) {
       suggestions.add('cred 写未落地：命中率会随尝试次数下降，重启设备后重跑通常更稳（本页可继续点开始）。');
     }
     if (ksu.status == StageStatus.failed) {
       suggestions.add('KSU 加载失败：看日志里 ksupatch / ml2 的报错；模板与内核版本必须匹配。');
-    } else if (ksu.status == StageStatus.ok && _byId[StageId.verify]!.status == StageStatus.failed) {
+    } else if (ksu.status == StageStatus.ok &&
+        _byId[StageId.verify]!.status == StageStatus.failed) {
       suggestions.add('KernelSU 模块已在跑，但 su 不存在 —— su 由 KernelSU 管理器（App）释放到 '
           '/data/adb/ksu/bin：打开 KernelSU，顶部若显示"未安装/点击安装"就按提示装一次，'
           '再回到本页点开始（①–⑥ 会跳过）；日志里 [diag:ksu] / [diag-root:ksu] 有完整现场。');
@@ -489,7 +515,8 @@ class RootChain extends ChangeNotifier {
     }
     final t = int.tryParse(health['T'] ?? '');
     if (t != null && t > 45000) {
-      suggestions.add('机身偏热（${(t / 1000).toStringAsFixed(1)}°C）：CPU 会降频、命中率明显下降，建议停一会儿降温。');
+      suggestions.add(
+          '机身偏热（${(t / 1000).toStringAsFixed(1)}°C）：CPU 会降频、命中率明显下降，建议停一会儿降温。');
     }
     if ((health['W'] ?? '').isNotEmpty && health['W'] != 'Awake') {
       suggestions.add('屏幕不在唤醒状态（${health['W']}）：命中和 rnd 会掉，App 每轮会自动点屏。');
@@ -503,7 +530,9 @@ class RootChain extends ChangeNotifier {
           '重新开启开发者选项里的「无线调试」才能启动 Shizuku（或用电脑 adb 启动）。');
     }
     if (suggestions.isEmpty) {
-      suggestions.add(running ? '正在执行，保持屏幕常亮；单轮约 3–5 分钟。' : '点「开始越狱」：先拿 root，再自动装 KernelSU。');
+      suggestions.add(running
+          ? '正在执行，保持屏幕常亮；单轮约 3–5 分钟。'
+          : '点「开始越狱」：先拿 root，再自动装 KernelSU。');
     }
     notifyListeners();
   }
@@ -522,8 +551,7 @@ class RootChain extends ChangeNotifier {
   static final BigInt _u64 = BigInt.one << 64;
 
   /// 内核地址一律用 BigInt：0xffff... 超过 int64 上限，用 int 会 FormatException
-  String _hex(BigInt v) =>
-      '0x${(v & (_u64 - BigInt.one)).toRadixString(16)}';
+  String _hex(BigInt v) => '0x${(v & (_u64 - BigInt.one)).toRadixString(16)}';
 
   BigInt _fromHex(String s) {
     final t = s.startsWith('0x') || s.startsWith('0X') ? s.substring(2) : s;
@@ -553,6 +581,7 @@ class RootChain extends ChangeNotifier {
       void put(int w) {
         b.add([w & 0xff, (w >> 8) & 0xff, (w >> 16) & 0xff, (w >> 24) & 0xff]);
       }
+
       put(movz(part(v, 0), 3));
       put(movk(part(v, 16), 1, 3));
       put(movk(part(v, 32), 2, 3));
@@ -608,7 +637,8 @@ class RootChain extends ChangeNotifier {
   }
 
   Future<String> _bootId() async {
-    final r = await ShizukuShell.run('cat /proc/sys/kernel/random/boot_id 2>&1');
+    final r =
+        await ShizukuShell.run('cat /proc/sys/kernel/random/boot_id 2>&1');
     if (r.out.trim().isEmpty) _log('[env] boot_id 读取异常: rc=${r.code} ${r.all}');
     return r.out.trim();
   }
@@ -678,7 +708,7 @@ class RootChain extends ChangeNotifier {
 
     try {
       bootId = await _bootId();
-      await _snapshotOptions();   // 先记录原值，运行结束/成功后可原样恢复
+      await _snapshotOptions(); // 先记录原值，运行结束/成功后可原样恢复
       await refreshHealth(force: true);
       // 探测现状（决定哪些阶段可直接跳过）
       try {
@@ -694,7 +724,7 @@ class RootChain extends ChangeNotifier {
         phase = '已越狱成功（无需操作）';
         _log('[verify] su 已可用：设备已越狱，本次不执行任何步骤');
         notifyListeners();
-        return;   // finally 仍会收尾
+        return; // finally 仍会收尾
       }
 
       Future<void> guarded(StageId id, Future<void> Function() fn,
@@ -720,8 +750,7 @@ class RootChain extends ChangeNotifier {
 
       await guarded(StageId.env, _runEnv, next: StageId.permissive);
       if (!_stop && statusOkOrSkipped(StageId.env)) {
-        await guarded(StageId.permissive, _runPermissive,
-            next: StageId.probe);
+        await guarded(StageId.permissive, _runPermissive, next: StageId.probe);
       }
       if (!_stop && (statusOkOrSkipped(StageId.permissive))) {
         await guarded(StageId.probe, _runProbe, next: StageId.phase1);
@@ -805,7 +834,8 @@ class RootChain extends ChangeNotifier {
     _stage(StageId.env, StageStatus.running, detail: '部署资产…');
 
     // 755：属主是 shell（可写），其他 App 不可替换（否则任何 App 都能替换 ksupatch/ksu_template 实现提权）
-    final r = await ShizukuShell.run('mkdir -p $workDir && chmod 755 $workDir && echo MKDIR_OK');
+    final r = await ShizukuShell.run(
+        'mkdir -p $workDir && chmod 755 $workDir && echo MKDIR_OK');
     _log('[env] mkdir rc=${r.code} ${r.all}');
     if (r.code != 0 || !r.out.contains('MKDIR_OK')) {
       _stage(StageId.env, StageStatus.failed, detail: '目录不可写');
@@ -843,9 +873,12 @@ class RootChain extends ChangeNotifier {
         if (assetsReady) {
           final st = await ShizukuShell.run(
               'wc -c < $workDir/${e.value} 2>/dev/null || echo 0');
-          final have = int.tryParse(RegExp(r'\d+').firstMatch(st.out)?.group(0) ?? '') ?? 0;
+          final have =
+              int.tryParse(RegExp(r'\d+').firstMatch(st.out)?.group(0) ?? '') ??
+                  0;
           if (have == bytes.length) {
-            _log('[env] ${e.value} 已存在（${(bytes.length / 1024).toStringAsFixed(0)}KB）跳过写入');
+            _log(
+                '[env] ${e.value} 已存在（${(bytes.length / 1024).toStringAsFixed(0)}KB）跳过写入');
             continue;
           }
         }
@@ -856,13 +889,16 @@ class RootChain extends ChangeNotifier {
           timeoutMs: 180000,
         );
         final szm = RegExp(r'(\d+)\s*SIZE_END').firstMatch(w.out);
-        final wroteOk = szm != null && int.tryParse(szm.group(1)!) == bytes.length;
+        final wroteOk =
+            szm != null && int.tryParse(szm.group(1)!) == bytes.length;
         if (w.code != 0 || !wroteOk) {
           _stage(StageId.env, StageStatus.failed, detail: '写入 ${e.value} 失败');
-          _log('[env] ${e.value}: rc=${w.code} 期望 ${bytes.length}B 实际 ${szm?.group(1) ?? "?"}B ${w.all}');
+          _log(
+              '[env] ${e.value}: rc=${w.code} 期望 ${bytes.length}B 实际 ${szm?.group(1) ?? "?"}B ${w.all}');
           return;
         }
-        _log('[env] ${e.value} ✓ (${(bytes.length / 1024).toStringAsFixed(0)}KB)');
+        _log(
+            '[env] ${e.value} ✓ (${(bytes.length / 1024).toStringAsFixed(0)}KB)');
       } catch (ex) {
         _stage(StageId.env, StageStatus.failed, detail: 'asset ${e.key} 读取失败');
         _log('[env] $ex');
@@ -912,20 +948,29 @@ class RootChain extends ChangeNotifier {
         r' echo RESET=$(getprop sys.resettype 2>/dev/null);'
         r' echo LASTB=$(getprop sys.boot.reason.last 2>/dev/null);');
     for (final l in r.out.split('\n')) {
-      if (l.startsWith('KSUAPP=') || l.startsWith('KSUDIR=') || l.startsWith('SUWHICH=')) {
+      if (l.startsWith('KSUAPP=') ||
+          l.startsWith('KSUDIR=') ||
+          l.startsWith('SUWHICH=')) {
         _log('[status] ${l.trim()}');
       }
     }
     // ↓ 供 preflight 与界面使用
     ksuAppInstalled = (RegExp(r'^KSUAPP=(\d+)', multiLine: true)
-            .firstMatch(r.out)
-            ?.group(1) ?? '0') != '0';
+                .firstMatch(r.out)
+                ?.group(1) ??
+            '0') !=
+        '0';
     ksuDirReady = RegExp(r'^KSUDIR=/', multiLine: true).hasMatch(r.out);
-    suPath = RegExp(r'^SUWHICH=(\S+)', multiLine: true).firstMatch(r.out)?.group(1) ?? '';
+    suPath = RegExp(r'^SUWHICH=(\S+)', multiLine: true)
+            .firstMatch(r.out)
+            ?.group(1) ??
+        '';
     ksuAppVersion = _normVer(
-        RegExp(r'^KSUV=(\S+)', multiLine: true).firstMatch(r.out)?.group(1) ?? '');
+        RegExp(r'^KSUV=(\S+)', multiLine: true).firstMatch(r.out)?.group(1) ??
+            '');
     lastResetType =
-        RegExp(r'^RESET=(\S+)', multiLine: true).firstMatch(r.out)?.group(1) ?? '';
+        RegExp(r'^RESET=(\S+)', multiLine: true).firstMatch(r.out)?.group(1) ??
+            '';
     if (lastResetType.toLowerCase().contains('panic') ||
         lastResetType.toLowerCase().contains('abnormal')) {
       _log('[status] 上次重启类型=$lastResetType（kernel panic ⇒ 命中后落地失败，属已知代价）');
@@ -978,7 +1023,7 @@ class RootChain extends ChangeNotifier {
     if (enf == 'Permissive' && !skipReason.containsKey(StageId.permissive)) {
       skipReason[StageId.permissive] = 'SELinux 已是 Permissive';
     }
-    assetsReady = asset >= 4;   // 资产已在位：_runEnv 里跳过重复写入，但校准照跑
+    assetsReady = asset >= 4; // 资产已在位：_runEnv 里跳过重复写入，但校准照跑
     if (mods > 0 && ksu == 0) {
       for (final id in const [
         StageId.env,
@@ -1006,8 +1051,11 @@ class RootChain extends ChangeNotifier {
     health['S'] = suc || suPath.isNotEmpty ? '1' : '0';
     devState = composeDevState();
     _log('[status] $devState');
-    if (ksuAppInstalled && ksuAppVersion.isNotEmpty && ksuAppVersion != kKsuManagerVersion) {
-      _log('[status] ⚠ KernelSU 管理器 v$ksuAppVersion 与本模板内核（v$kKsuManagerVersion）不同；'
+    if (ksuAppInstalled &&
+        ksuAppVersion.isNotEmpty &&
+        ksuAppVersion != kKsuManagerVersion) {
+      _log(
+          '[status] ⚠ KernelSU 管理器 v$ksuAppVersion 与本模板内核（v$kKsuManagerVersion）不同；'
           '若 ⑦⑧ 异常，先换回 v$kKsuManagerVersion 再试');
     }
     if (skipReason.isNotEmpty) {
@@ -1022,10 +1070,14 @@ class RootChain extends ChangeNotifier {
       final saved = await Calibration.load();
       calib.applyFrom(saved);
       final curBoot =
-          (await ShizukuShell.run('cat /proc/sys/kernel/random/boot_id')).out.trim();
+          (await ShizukuShell.run('cat /proc/sys/kernel/random/boot_id'))
+              .out
+              .trim();
       final need = calib.vermagic.isEmpty ||
           calib.items.isEmpty ||
-          (saved.bootId.isNotEmpty && curBoot.isNotEmpty && saved.bootId != curBoot) ||
+          (saved.bootId.isNotEmpty &&
+              curBoot.isNotEmpty &&
+              saved.bootId != curBoot) ||
           calib.items.any((e) => !e.ok);
       if (!need) {
         _log('[calib] 使用已保存校准（同 boot）：内核=${calib.kernelVersion} '
@@ -1045,8 +1097,8 @@ class RootChain extends ChangeNotifier {
   }
 
   /// 所有阶段是否都处于「完成或已满足跳过」——用于界面显示完成态
-  bool get allDoneOrSkipped => stages.every((s) =>
-      s.status == StageStatus.ok || s.status == StageStatus.skipped);
+  bool get allDoneOrSkipped => stages.every(
+      (s) => s.status == StageStatus.ok || s.status == StageStatus.skipped);
 
   bool statusOkOrSkipped(StageId id) {
     final st = _byId[id]!.status;
@@ -1074,7 +1126,8 @@ class RootChain extends ChangeNotifier {
       s.runs++;
       await ShizukuShell.run(_prepCmd());
       final logPath = '$workDir/s0_${_ts()}.log';
-      final env = 'P645_STAGE=1 P645_STAGE_FROM=0 P645_STAGE_TO=1 P645_STAGE_TRIES=4 P645_ATTEMPTS=1 '
+      final env =
+          'P645_STAGE=1 P645_STAGE_FROM=0 P645_STAGE_TO=1 P645_STAGE_TRIES=4 P645_ATTEMPTS=1 '
           'P645_KIDS=0 P645_CRED_FARM=0 P645_DRAIN_AFTER=0 P645_THREAD_FILL=0 P645_FILL_SELF=0 '
           'P645_LEAK_FORK=0 P645_FORK_AFTER=0 P645_PRE_UM_MB=0 P645_TIMERS=54000 P645_REPEATS=520 '
           'P645_NDEL=7 P645_DEL_RUN_MS=2500 P645_CONC=1 P645_ANON_MB=8 P645_FREEZE=1 P645_V8=1 '
@@ -1124,12 +1177,12 @@ class RootChain extends ChangeNotifier {
     await ShizukuShell.run('pkill -x x645');
     // ② 删临时产物（保留 workDir 下的日志到清理前先不删，便于排查）
     final r = await ShizukuShell.run(
-      'rm -f /tmp/ksyms.txt /tmp/kt*.ko /data/local/tmp/kt*.ko '
-      '/data/local/tmp/ROOTED_* /data/local/tmp/shizuku.log 2>/dev/null; '
-      'rm -rf $workDir/pc $workDir/x645 $workDir/ml2 $workDir/ksupatch '
-      '$workDir/koquery $workDir/ksu_template.ko $workDir/ksu_run.ko '
-      '$workDir/module.ko $workDir/ksyms.bin.gz 2>/dev/null; '
-      'ls $workDir 2>/dev/null | tr "\n" " "; echo; echo CLEAN_OK');
+        'rm -f /tmp/ksyms.txt /tmp/kt*.ko /data/local/tmp/kt*.ko '
+        '/data/local/tmp/ROOTED_* /data/local/tmp/shizuku.log 2>/dev/null; '
+        'rm -rf $workDir/pc $workDir/x645 $workDir/ml2 $workDir/ksupatch '
+        '$workDir/koquery $workDir/ksu_template.ko $workDir/ksu_run.ko '
+        '$workDir/module.ko $workDir/ksyms.bin.gz 2>/dev/null; '
+        'ls $workDir 2>/dev/null | tr "\n" " "; echo; echo CLEAN_OK');
     _log('[clean] 剩余（仅日志）：${r.out.split('\n').first}');
   }
 
@@ -1174,8 +1227,16 @@ class RootChain extends ChangeNotifier {
       if (i <= 0) continue;
       final k = line.substring(0, i).trim();
       final v = line.substring(i + 1).trim();
-      if (k == 'T' || k == 'W' || k == 'M' || k == 'P' || k == 'C' || k == 'E' ||
-          k == 'G' || k == 'K' || k == 'A' || k == 'S') {
+      if (k == 'T' ||
+          k == 'W' ||
+          k == 'M' ||
+          k == 'P' ||
+          k == 'C' ||
+          k == 'E' ||
+          k == 'G' ||
+          k == 'K' ||
+          k == 'A' ||
+          k == 'S') {
         if (health[k] != v) {
           health[k] = v;
           changed = true;
@@ -1184,7 +1245,8 @@ class RootChain extends ChangeNotifier {
     }
     if (r.via.isNotEmpty && shizukuVia != r.via) {
       shizukuVia = r.via;
-      _log('[env] Shizuku 接口: ${r.via == 'api' ? 'Shizuku.newProcess' : 'AIDL newProcess'}');
+      _log(
+          '[env] Shizuku 接口: ${r.via == 'api' ? 'Shizuku.newProcess' : 'AIDL newProcess'}');
       changed = true;
     }
     // 拿到数据说明 Shizuku 通了 ⇒ 打开 App 后就能开始轮询（之前只有 start() 里才置位）
@@ -1216,7 +1278,12 @@ class RootChain extends ChangeNotifier {
         : 'KSU 管理器 未装';
     return [
       if (enf.isEmpty) 'SELinux=?' else 'SELinux=$enf',
-      if (ksu > 0) 'KSU 已加载' else if (pwn > 0) 'root 模块已加载 · KSU 未加载' else 'KSU 未加载',
+      if (ksu > 0)
+        'KSU 已加载'
+      else if (pwn > 0)
+        'root 模块已加载 · KSU 未加载'
+      else
+        'KSU 未加载',
       ksuAppText,
       hasSu ? 'su 可用${suPath.isEmpty ? "" : "（$suPath）"}' : 'su 不可用',
       '资产 $asset/4',
@@ -1230,7 +1297,7 @@ class RootChain extends ChangeNotifier {
   /// **跑链期间直接 return** —— 运行时的检测逻辑回到 v1.0.16（不做 detectStatus / slabinfo），
   /// 因为 v1.0.17 曾用 3s/5s 定时器在竞态窗口里跑这些重活，把 panic 率从 12% 推到 100%。
   Future<void> refreshStatus({bool withDetect = true}) async {
-    if (running) return;          // 跑链期间一律不探测
+    if (running) return; // 跑链期间一律不探测
     await refreshHealth(force: true);
     if (withDetect) {
       try {
@@ -1255,7 +1322,7 @@ class RootChain extends ChangeNotifier {
           shizukuOk = true;
           _log('[health] Shizuku 已授权，开始每 5s 刷新状态');
         }
-        await refreshHealth();   // 只刷健康条（轻量），不跑 detectStatus
+        await refreshHealth(); // 只刷健康条（轻量），不跑 detectStatus
       } catch (_) {
       } finally {
         _healthBusy = false;
@@ -1310,7 +1377,8 @@ class RootChain extends ChangeNotifier {
         return;
       }
     }
-    _stage(StageId.probe, StageStatus.failed, detail: '无候选（perf 不可用/未 permissive）');
+    _stage(StageId.probe, StageStatus.failed,
+        detail: '无候选（perf 不可用/未 permissive）');
     lastError = '候选进程没有产出 cred';
     _advice();
   }
@@ -1330,7 +1398,8 @@ class RootChain extends ChangeNotifier {
     final s = _byId[stage]!;
     s.runs++;
     final logPath = '$workDir/${stage.name}_${_ts()}.log';
-    var env = 'P645_STAGE=1 P645_STAGE_FROM=$stageFrom P645_STAGE_TO=2 P645_STAGE_TRIES=$tries '
+    var env =
+        'P645_STAGE=1 P645_STAGE_FROM=$stageFrom P645_STAGE_TO=2 P645_STAGE_TRIES=$tries '
         'P645_ATTEMPTS=1 P645_KIDS=0 P645_CRED_FARM=0 P645_DRAIN_AFTER=0 P645_THREAD_FILL=0 '
         'P645_FILL_SELF=0 P645_LEAK_FORK=0 P645_FORK_AFTER=0 P645_PRE_UM_MB=0 P645_TIMERS=54000 '
         'P645_REPEATS=520 P645_NDEL=7 P645_DEL_RUN_MS=2500 P645_CONC=1 P645_ANON_MB=8 P645_FREEZE=1 '
@@ -1366,11 +1435,10 @@ class RootChain extends ChangeNotifier {
         _stage(StageId.phase1, StageStatus.failed, detail: '候选消失');
         return;
       }
-      final targets =
-        creds
-            .take(8)
-            .map((c) => _hex(c + BigInt.from(calib.offCapBset)))
-            .join(',');
+      final targets = creds
+          .take(8)
+          .map((c) => _hex(c + BigInt.from(calib.offCapBset)))
+          .join(',');
       final lg = await _runShot(
         stage: StageId.phase1,
         stageFrom: 1,
@@ -1505,7 +1573,8 @@ class RootChain extends ChangeNotifier {
     for (var i = 0; i < 6; i++) {
       final r = await ShizukuShell.run(
           'cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null');
-      final t = int.tryParse(RegExp(r'\d+').firstMatch(r.out)?.group(0) ?? '') ?? 0;
+      final t =
+          int.tryParse(RegExp(r'\d+').firstMatch(r.out)?.group(0) ?? '') ?? 0;
       if (t <= 0) return;
       health['T'] = '$t';
       notifyListeners();
@@ -1513,7 +1582,8 @@ class RootChain extends ChangeNotifier {
         if (i > 0) _log('[temp] ${(t / 1000).toStringAsFixed(1)}°C 已回落，开打');
         return;
       }
-      _log('[temp] 机身 ${(t / 1000).toStringAsFixed(1)}°C 偏热，等 10s 降频恢复（第 ${i + 1}/6 次）');
+      _log(
+          '[temp] 机身 ${(t / 1000).toStringAsFixed(1)}°C 偏热，等 10s 降频恢复（第 ${i + 1}/6 次）');
       // 顺手把屏幕开着、别让系统进 doze
       await ShizukuShell.run('input keyevent 224 2>/dev/null');
       await _sleep(10000);
@@ -1521,9 +1591,9 @@ class RootChain extends ChangeNotifier {
   }
 
   Future<bool> _ksuSuReady() async {
-    final r = await ShizukuShell.run(
-        'command -v su >/dev/null 2>&1 && echo Y || '
-        '([ -x /data/adb/ksud ] && echo Y) || echo N');
+    final r =
+        await ShizukuShell.run('command -v su >/dev/null 2>&1 && echo Y || '
+            '([ -x /data/adb/ksud ] && echo Y) || echo N');
     return r.out.contains('Y');
   }
 
@@ -1544,7 +1614,9 @@ class RootChain extends ChangeNotifier {
         '; for d in "\$B"/lib/*; do [ -f "\$d/libksud.so" ] && echo LIB=\$d; done'
         '; echo DEVDIR=/data/user_de/0/$pkg'
         '; echo HAVEDEV=\$([ -d /data/user_de/0/$pkg ] && echo 1 || echo 0)');
-    final lib = RegExp(r'^LIB=(\S+)', multiLine: true).firstMatch(r.out)?.group(1) ?? '';
+    final lib =
+        RegExp(r'^LIB=(\S+)', multiLine: true).firstMatch(r.out)?.group(1) ??
+            '';
     if (lib.isEmpty) {
       _log('[ksu] 找不到 libksud.so（pm path 拿不到 nativeLibDir）：${r.out.trim()}');
       return false;
@@ -1556,7 +1628,8 @@ class RootChain extends ChangeNotifier {
         ' 2>&1; echo INSTALL_RC=\$?'
         '; ls -l /data/adb/ksud /data/adb/ksu/bin/ksud 2>&1 | head -3'
         '; echo SUCHK=\$(command -v su 2>/dev/null || echo none)';
-    final x = await ShizukuShell.run('echo ${_shq(cmd)} | nc 127.0.0.1 5556 2>&1');
+    final x =
+        await ShizukuShell.run('echo ${_shq(cmd)} | nc 127.0.0.1 5556 2>&1');
     _log('[ksu] 安装结果：${x.out.trim()}');
     final ok = RegExp(r'INSTALL_RC=0').hasMatch(x.out) ||
         RegExp(r'/data/adb/ksud').hasMatch(x.out);
@@ -1579,7 +1652,8 @@ class RootChain extends ChangeNotifier {
           '; echo ---LASTKMSG---'
           '; [ -f /proc/last_kmsg ] && grep -aE "Kernel panic|Unable to handle|Internal error|BUG:|Oops" /proc/last_kmsg | tail -8'
           '; echo ---END---';
-      final r = await ShizukuShell.run('echo ${_shq(cmd)} | nc 127.0.0.1 5556 2>&1');
+      final r =
+          await ShizukuShell.run('echo ${_shq(cmd)} | nc 127.0.0.1 5556 2>&1');
       final t = r.out.trim();
       if (t.isEmpty) return;
       _log('[crash] 上次重启现场：');
@@ -1599,15 +1673,16 @@ class RootChain extends ChangeNotifier {
     final m = <String, String>{};
     try {
       final r = await ShizukuShell.run(
-        'echo MODCNT=\$(grep -c "^kernelsu" /proc/modules 2>/dev/null || echo 0)'
-        '; echo SYSFS=\$([ -d /sys/module/kernelsu ] && echo 1 || echo 0)'
-        '; echo MODLINE=\$(grep "^kernelsu" /proc/modules 2>/dev/null | head -1 | cut -c1-90)'
-        '; echo SU=\$(command -v su 2>/dev/null || ls /data/adb/ksu/bin/su 2>/dev/null || echo)'
-        '; echo KSUDIR=\$([ -d /data/adb/ksu ] && echo 1 || echo 0)'
-        '; echo APP=\$(pm list packages 2>/dev/null | grep -c me.weishu.kernelsu)');
+          'echo MODCNT=\$(grep -c "^kernelsu" /proc/modules 2>/dev/null || echo 0)'
+          '; echo SYSFS=\$([ -d /sys/module/kernelsu ] && echo 1 || echo 0)'
+          '; echo MODLINE=\$(grep "^kernelsu" /proc/modules 2>/dev/null | head -1 | cut -c1-90)'
+          '; echo SU=\$(command -v su 2>/dev/null || ls /data/adb/ksu/bin/su 2>/dev/null || echo)'
+          '; echo KSUDIR=\$([ -d /data/adb/ksu ] && echo 1 || echo 0)'
+          '; echo APP=\$(pm list packages 2>/dev/null | grep -c me.weishu.kernelsu)');
       for (final line in r.out.split('\n')) {
         final i = line.indexOf('=');
-        if (i > 0) m[line.substring(0, i).trim()] = line.substring(i + 1).trim();
+        if (i > 0)
+          m[line.substring(0, i).trim()] = line.substring(i + 1).trim();
       }
     } catch (_) {}
     return m;
@@ -1690,14 +1765,15 @@ class RootChain extends ChangeNotifier {
     _stage(StageId.ksu, StageStatus.running, detail: '等候选进程自加载…');
     // 首选：候选进程已拿到全 caps，自己在 post_root 里跑 ksupatch + ml2（不依赖 root shell）
     for (var i = 0; i < 12; i++) {
-      final n = int.tryParse(
-              (await ShizukuShell.run('grep -c ^kernelsu /proc/modules 2>/dev/null'))
-                      .out
-                      .trim()) ??
+      final n = int.tryParse((await ShizukuShell.run(
+                  'grep -c ^kernelsu /proc/modules 2>/dev/null'))
+              .out
+              .trim()) ??
           0;
       if (n > 0) {
         _log('[ksu] 候选进程已自行加载 kernelsu（无需 root shell）');
-        final sc = await ShizukuShell.run('cat $workDir/ksu_self.log 2>/dev/null | tail -6');
+        final sc = await ShizukuShell.run(
+            'cat $workDir/ksu_self.log 2>/dev/null | tail -6');
         if (sc.out.trim().isNotEmpty) _log(sc.all);
         await _afterKsuLoaded();
         _stage(StageId.ksu, StageStatus.ok, detail: 'kernelsu 已加载（自加载路径）');
@@ -1723,7 +1799,8 @@ class RootChain extends ChangeNotifier {
         'echo PATCH_RC2=\$?; '
         './ml2 ksu_run.ko allow_shell=1; echo LOAD_RC=\$?; '
         'grep -c kernelsu /proc/modules; dmesg | grep -i kernelsu | tail -6';
-    final r = await ShizukuShell.run('echo ${_shq(cmd)} | nc 127.0.0.1 5556 2>&1');
+    final r =
+        await ShizukuShell.run('echo ${_shq(cmd)} | nc 127.0.0.1 5556 2>&1');
     _log(r.all);
     await _sleep(2000);
     final chk = await ShizukuShell.run('grep -c kernelsu /proc/modules');
@@ -1761,14 +1838,16 @@ class RootChain extends ChangeNotifier {
       final out = r.out.trim();
       final first = out.isEmpty ? '(空)' : out.split('\n').first;
       _log('[verify] $p → $first');
-      if (RegExp(r'uid=0\(root\)').hasMatch(out) || out.contains('u:r:ksu:s0')) {
+      if (RegExp(r'uid=0\(root\)').hasMatch(out) ||
+          out.contains('u:r:ksu:s0')) {
         hitPath = p;
         hitLine = first;
         break;
       }
     }
     if (hitLine != null) {
-      _stage(StageId.verify, StageStatus.ok, detail: 'su 可用（$hitPath）· $hitLine');
+      _stage(StageId.verify, StageStatus.ok,
+          detail: 'su 可用（$hitPath）· $hitLine');
       success = true;
       phase = '越狱成功';
       _log('[verify] 成功：$hitLine');
@@ -1786,7 +1865,8 @@ class RootChain extends ChangeNotifier {
     final sysfs = (st['SYSFS'] ?? '0') == '1';
     final appInstalled = (int.tryParse(st['APP'] ?? '0') ?? 0) > 0;
     final dirExists = (st['KSUDIR'] ?? '0') == '1';
-    _log('[verify] 现场：kernelsu 模块=${ksuLoaded ? "有" : "无"} · sysfs=${sysfs ? "有" : "无"}'
+    _log(
+        '[verify] 现场：kernelsu 模块=${ksuLoaded ? "有" : "无"} · sysfs=${sysfs ? "有" : "无"}'
         ' · 管理器=${appInstalled ? "已装${ksuAppVersion.isEmpty ? "" : " v$ksuAppVersion"}" : "未装"}'
         ' · /data/adb/ksu=${dirExists ? "已初始化" : "未初始化"}');
 
@@ -1799,7 +1879,8 @@ class RootChain extends ChangeNotifier {
     } else if (ksuLoaded && !appInstalled) {
       why = 'KernelSU 模块已加载，但没装 KernelSU 管理器 ⇒ 没有 su。装好管理器并打开一次，再重跑 ⑦⑧';
     } else if (ksuLoaded && !sysfs) {
-      why = 'kernelsu 在 /proc/modules 但 /sys/module 没有它 ⇒ 加载不完整（看 dmesg 的 ksu 行）';
+      why =
+          'kernelsu 在 /proc/modules 但 /sys/module 没有它 ⇒ 加载不完整（看 dmesg 的 ksu 行）';
     } else if (!ksuLoaded) {
       why = 'su 不存在且 kernelsu 模块不在 /proc/modules ⇒ ⑦ 其实没成功，重跑 ⑦';
     } else {

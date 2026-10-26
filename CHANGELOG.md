@@ -1,6 +1,22 @@
 # 变更记录
 
 ## v1.0.17 — 2026-10-26
+- **新增「检查更新」**：启动 2 秒后（可关）向 GitHub 读**最新正式 Release**（
+  `GET /repos/No-World/rootkit/releases/latest`），与本机 `kAppVersion` 按数字分段比较，
+  把「有新版 / 已是最新 / 检查失败」写进日志（`[update]`）并在标题弹窗里说清楚。
+  - 「去下载」= **打开对应 Release 页面**（APK 挂在那个页面里），不直拉 APK 直链；
+    没挂 APK（刚发 Release、CI 还在构建）时界面会提示「稍后再看」。
+  - 自动弹窗只在「有新版本 / 没点过跳过 / `chain.busy`=false（不在跑链） / 没别的弹窗压着」时出现；
+    「跳过此版本」记在 App 私有 prefs（`update.skip`），下次开机不再为这个版本弹窗，手动检查仍会提示。
+  - 选项里新增**「启动时检查更新」开关（默认开）** + 「检查更新」手动入口（带当前/线上版本与失败原因）。
+    状态条上有新版时多一颗琥珀色可点胶囊「新版本 vX.Y.Z」，点开就是更新弹窗。
+  - 实现只用 `dart:io` 的 HttpClient（不引第三方包）；任何网络/限流/JSON 错误都变成
+    `UpdateCheck.error` 里的人话，**不影响越狱主流程**；新增 `INTERNET` 权限（仅此项需要联网）。
+  - 版本比较有单测（`test/updater_test.dart`）：`1.0.9 < 1.0.17`、`v` 前缀、`-prtest`/`+10018` 后缀、缺段补 0。
+- **CI：`actions/cache@v4 → v5`**（清 GitHub 的 `Node.js 20 is deprecated` 警告，已把 v4 强升到 Node 24）：
+  v4 的 `action.yml` 是 `runs.using: node20`，v5 是 `node24` 且输入/输出与 v4 完全一致（纯 runtime 升级）；
+  v6 只是迁 ESM，不急跟。其它 action 已是 node24（`checkout@v5`/`setup-java@v6`/`upload-artifact@v7`/
+  `action-gh-release@v3`），`flutter-action@v2` 是 composite 类型（无 node runtime）。
 - **★ 修 panic 率过高（真凶：跑链期间还在每 3 秒做重活）**
   实测统计（App 自己的 app.log，同一台机器同一天）：
   · v1.0.16：8 次开打 → 7 次拿到判据（有泄漏/有 verdict），1 次中断

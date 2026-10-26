@@ -7,6 +7,7 @@ import 'chain.dart';
 import 'version.dart';
 import 'shizuku.dart';
 import 'github_icon.dart';
+import 'updater.dart';
 
 /// 版本号（与 pubspec 的 version 保持一致）
 // 版本号在 lib/version.dart（chain.dart 也要用，避免循环 import）
@@ -48,31 +49,53 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   final RootChain chain = RootChain();
-  final GlobalKey _logCardKey = GlobalKey();   // 日志卡片（用于"从卡片放大"的起点矩形）
+  final GlobalKey _logCardKey = GlobalKey(); // 日志卡片（用于"从卡片放大"的起点矩形）
   final GlobalKey _logBodyKey = GlobalKey();
   final ScrollController _logScroll = ScrollController();
   bool _shizuku = false;
   bool _stagesExpanded = false; // 阶段列表默认折叠
-  Timer? _shizukuPoll;          // Shizuku 授权状态轮询
+  Timer? _shizukuPoll; // Shizuku 授权状态轮询
   bool _pollBusy = false;
   bool _statusProbed = false;
+
+  // ---- 更新检查（GitHub Release）----
+  UpdateCheck? _update; // 最近一次检查结果（null = 本次启动还没查过）
+  bool _updateBusy = false; // 正在检查
+  DateTime? _updateTriedAt; // 上次发起检查的时间（失败后不频繁重试）
+  String _updateSkipped = ''; // 用户点过「跳过此版本」的版本号
+  bool _updateAutoShown = false; // 本次启动是否已自动弹过更新窗
 
   @override
   void initState() {
     super.initState();
     chain.addListener(_onChange);
     WidgetsBinding.instance.addObserver(this);
-    chain.loadOptions();
+    _bootOptions();
     _refreshShizuku();
     _startShizukuPoll();
-    chain.startHealthPolling();   // 空闲期每 5s 刷状态；跑链期间自动静默
+    chain.startHealthPolling(); // 空闲期每 5s 刷状态；跑链期间自动静默
     _maybeShowDisclaimer();
+  }
+
+  /// 启动收尾：先读回选项（含「启动时检查更新」开关），再按开关决定要不要查更新
+  ///
+  /// 不在 initState 里 await：读选项要走 Shizuku 通道，不能阻塞首帧。
+  Future<void> _bootOptions() async {
+    await chain.loadOptions();
+    final skip = await ShizukuShell.getPref('update.skip');
+    if (skip != null && skip.isNotEmpty && mounted) {
+      setState(() => _updateSkipped = skip);
+    }
+    // 等首帧 / 免责声明稳住再发请求，开屏不抢带宽
+    await Future<void>.delayed(const Duration(seconds: 2));
+    if (mounted) _maybeCheckUpdate();
   }
 
   /// 主动轮询 Shizuku 授权状态：用户在别的界面授权/撤销后，本界面 3 秒内跟上
   void _startShizukuPoll() {
     _shizukuPoll?.cancel();
-    _shizukuPoll = Timer.periodic(const Duration(seconds: 3), (_) => _pollShizuku());
+    _shizukuPoll =
+        Timer.periodic(const Duration(seconds: 3), (_) => _pollShizuku());
   }
 
   /// 约定：任何"额外的后台工作"（状态探测、更新检查、网络请求）都必须先看 [chain.busy]
@@ -109,6 +132,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _refreshShizuku();
       _startShizukuPoll();
       chain.startHealthPolling();
+      _maybeCheckUpdate(); // 回前台顺手查一次（内部先看 chain.busy）
     } else if (state == AppLifecycleState.paused) {
       _shizukuPoll?.cancel();
       _shizukuPoll = null;
@@ -148,7 +172,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     if (_statusProbed) return;
     _statusProbed = true;
     chain.detectStatus().catchError((Object e) {
-      _statusProbed = false;   // 失败允许下次重试
+      _statusProbed = false; // 失败允许下次重试
     });
   }
 
@@ -187,7 +211,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       case StageStatus.failed:
         return const Color(0xFFE05B5B);
       case StageStatus.skipped:
-        return const Color(0xFF6FA8A0);      // 完成态但略淡，区别"本次执行"与"已满足跳过"
+        return const Color(0xFF6FA8A0); // 完成态但略淡，区别"本次执行"与"已满足跳过"
       case StageStatus.pending:
         return Colors.white38;
     }
@@ -202,7 +226,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       case StageStatus.failed:
         return Icons.error_rounded;
       case StageStatus.skipped:
-        return Icons.check_circle_rounded;   // 跳过 = 已满足，视觉上按完成态处理
+        return Icons.check_circle_rounded; // 跳过 = 已满足，视觉上按完成态处理
       case StageStatus.pending:
         return Icons.radio_button_unchecked_rounded;
     }
@@ -213,12 +237,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     return Scaffold(
       appBar: AppBar(
         title: GestureDetector(
-          onLongPress: _showSuccessDialog,   // 长按标题：预览成功弹窗（不跑链，仅看 UI）
+          onLongPress: _showSuccessDialog, // 长按标题：预览成功弹窗（不跑链，仅看 UI）
           child: const Row(
             children: [
               Text('越狱助手'),
               SizedBox(width: 6),
-              Text('v$kAppVersion', style: TextStyle(fontSize: 11, color: Colors.white38)),
+              Text('v$kAppVersion',
+                  style: TextStyle(fontSize: 11, color: Colors.white38)),
             ],
           ),
         ),
@@ -307,7 +332,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   Widget _headerCard() {
     final done = chain.stages
-        .where((s) => s.status == StageStatus.ok || s.status == StageStatus.skipped)
+        .where((s) =>
+            s.status == StageStatus.ok || s.status == StageStatus.skipped)
         .length;
     final total = chain.stages.length;
     return Card(
@@ -355,7 +381,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                   ),
                   child: Text('$done / $total ›',
-                      style: const TextStyle(fontSize: 12, color: Colors.white54)),
+                      style:
+                          const TextStyle(fontSize: 12, color: Colors.white54)),
                 ),
               ],
             ),
@@ -422,7 +449,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         : '管理器 未装');
     items.add((h['S'] ?? '0').trim() == '1' ? 'su ✓' : 'su ✗');
     if ((h['A'] ?? '').isNotEmpty) items.add('资产 ${h['A']}/4');
-    if (chain.lastResetType.toLowerCase().contains('panic')) items.add('上次 panic');
+    if (chain.lastResetType.toLowerCase().contains('panic'))
+      items.add('上次 panic');
     final kv = chain.calib.kernelVersion;
     if (kv.isNotEmpty) {
       items.add('内核 ${kv.split('-').take(2).join('-')}');
@@ -432,18 +460,31 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       spacing: 6,
       runSpacing: 4,
       children: [
-        for (final s in items)
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-            decoration: BoxDecoration(
-              color: Colors.white10,
-              borderRadius: BorderRadius.circular(5),
-            ),
-            child: Text(s,
-                style: const TextStyle(fontSize: 9.5, color: Colors.white54)),
-          ),
+        for (final s in items) _chip(s),
+        // 有新版本时多一颗可点的琥珀色胶囊（点开更新弹窗）
+        if (_update?.hasUpdate == true)
+          _chip('新版本 v${_update!.latestVersion}',
+              highlight: true, onTap: _showUpdateDialog),
       ],
     );
+  }
+
+  /// 状态条上的小胶囊（[highlight] 用于「有新版本」这类需要看见的提示）
+  Widget _chip(String text, {bool highlight = false, VoidCallback? onTap}) {
+    final box = Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: highlight ? const Color(0x2EFFC857) : Colors.white10,
+        borderRadius: BorderRadius.circular(5),
+        border: highlight ? Border.all(color: const Color(0x59FFC857)) : null,
+      ),
+      child: Text(text,
+          style: TextStyle(
+              fontSize: 9.5,
+              color: highlight ? const Color(0xFFFFC857) : Colors.white54)),
+    );
+    if (onTap == null) return box;
+    return GestureDetector(onTap: onTap, child: box);
   }
 
   /// 首次启动免责声明（勾「不再显示」后永久记住）
@@ -464,14 +505,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       barrierDismissible: false,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx2, setSt) => AlertDialog(
-          icon: const Icon(Icons.warning_amber_rounded, size: 40, color: Color(0xFFFFC857)),
+          icon: const Icon(Icons.warning_amber_rounded,
+              size: 40, color: Color(0xFFFFC857)),
           title: const Text('免责声明', textAlign: TextAlign.center),
           content: SingleChildScrollView(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               mainAxisSize: MainAxisSize.min,
               children: [
-                const Text('本工具仅用于「本人自有设备」的学习与研究，用于理解 Android 内核的'
+                const Text(
+                    '本工具仅用于「本人自有设备」的学习与研究，用于理解 Android 内核的'
                     '权限模型、SELinux 与内核模块加载机制。',
                     style: TextStyle(fontSize: 12.5, height: 1.5)),
                 const SizedBox(height: 8),
@@ -483,7 +526,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                   decoration: BoxDecoration(
                     color: const Color(0xFF3A2C12),
                     borderRadius: const BorderRadius.all(Radius.circular(9)),
-                    border: Border.all(color: const Color(0xFFD8A13A), width: 1),
+                    border:
+                        Border.all(color: const Color(0xFFD8A13A), width: 1),
                   ),
                   child: Row(
                     crossAxisAlignment: CrossAxisAlignment.start,
@@ -507,7 +551,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 ),
                 const SizedBox(height: 8),
                 const Text('运行过程中设备可能内核 panic 重启，属已知现象；请确保已备份重要数据。',
-                    style: TextStyle(fontSize: 11.5, color: Colors.white54, height: 1.4)),
+                    style: TextStyle(
+                        fontSize: 11.5, color: Colors.white54, height: 1.4)),
               ],
             ),
           ),
@@ -534,9 +579,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
     if (dontShow) {
       await ShizukuShell.setPref('disclaimer.hidden', '1');
-      await ShizukuShell.run(
-          'echo 1 > /data/local/tmp/rk/.disclaimer_hidden');
+      await ShizukuShell.run('echo 1 > /data/local/tmp/rk/.disclaimer_hidden');
     }
+    // 开屏弹窗关掉了：若更新检查早就出结果（有新版）但当时没机会弹，现在补一次
+    _maybeAutoPopupUpdate();
   }
 
   Future<void> _showCalibDialog() async {
@@ -564,15 +610,21 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     child: Row(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Icon(it.ok ? Icons.check_circle_rounded : Icons.error_rounded,
+                        Icon(
+                            it.ok
+                                ? Icons.check_circle_rounded
+                                : Icons.error_rounded,
                             size: 14,
-                            color: it.ok ? const Color(0xFF4CAF80) : const Color(0xFFE05B5B)),
+                            color: it.ok
+                                ? const Color(0xFF4CAF80)
+                                : const Color(0xFFE05B5B)),
                         const SizedBox(width: 6),
                         Expanded(
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              Text(it.name, style: const TextStyle(fontSize: 12.5)),
+                              Text(it.name,
+                                  style: const TextStyle(fontSize: 12.5)),
                               Text(it.value,
                                   style: const TextStyle(
                                       fontFamily: 'monospace',
@@ -580,7 +632,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                                       color: Colors.white54)),
                               if (it.note.isNotEmpty)
                                 Text(it.note,
-                                    style: const TextStyle(fontSize: 10, color: Colors.white38)),
+                                    style: const TextStyle(
+                                        fontSize: 10, color: Colors.white38)),
                             ],
                           ),
                         ),
@@ -589,12 +642,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                   ),
                 const SizedBox(height: 6),
                 Text('零写目标 selinux 别名：${c.selinuxAliasHex}',
-                    style: const TextStyle(fontFamily: 'monospace', fontSize: 10.5,
+                    style: const TextStyle(
+                        fontFamily: 'monospace',
+                        fontSize: 10.5,
                         color: Color(0xFF4FA3E3))),
                 if (!c.items.any((e) => e.name == '内核物理基址' && e.ok))
                   const Padding(
                     padding: EdgeInsets.only(top: 6),
-                    child: Text('提示：物理基址需 root 读 /proc/iomem；拿不到时请用该机 boot.img 推导后手动填入。',
+                    child: Text(
+                        '提示：物理基址需 root 读 /proc/iomem；拿不到时请用该机 boot.img 推导后手动填入。',
                         style: TextStyle(fontSize: 10.5, color: Colors.orange)),
                   ),
               ],
@@ -609,7 +665,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             },
             child: const Text('手填物理基址'),
           ),
-          TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('关闭')),
+          TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('关闭')),
         ],
       ),
     );
@@ -636,20 +694,27 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               style: const TextStyle(fontFamily: 'monospace'),
             ),
             const SizedBox(height: 8),
-            const Text('要求 2MB 对齐、0x80000000–0xFFFFFFFF。\n'
+            const Text(
+                '要求 2MB 对齐、0x80000000–0xFFFFFFFF。\n'
                 '取法：① root 下读 /proc/iomem 的 “Kernel code”（自动）；'
                 '② 上传本机 boot.img → 识别内核版本/哈希 → 命中记录即自动套用；'
                 '③ 用已知同型号的值。',
                 style: TextStyle(fontSize: 11, color: Colors.white54)),
             const SizedBox(height: 6),
             Text('当前别名：${chain.calib.selinuxAliasHex}',
-                style: const TextStyle(fontFamily: 'monospace', fontSize: 10.5,
+                style: const TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 10.5,
                     color: Color(0xFF4FA3E3))),
           ],
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.of(ctx).pop(false), child: const Text('取消')),
-          FilledButton(onPressed: () => Navigator.of(ctx).pop(true), child: const Text('应用')),
+          TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('取消')),
+          FilledButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text('应用')),
         ],
       ),
     );
@@ -658,7 +723,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     if (v == null || !chain.calib.setPhysBase(v)) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('地址无效：需 2MB 对齐且在 0x80000000–0xFFFFFFFF')),
+          const SnackBar(
+              content: Text('地址无效：需 2MB 对齐且在 0x80000000–0xFFFFFFFF')),
         );
       }
       return;
@@ -674,60 +740,63 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       context: context,
       barrierDismissible: false,
       builder: (ctx) => AlertDialog(
-        icon: const Icon(Icons.verified_rounded, size: 44, color: Color(0xFF4CAF80)),
+        icon: const Icon(Icons.verified_rounded,
+            size: 44, color: Color(0xFF4CAF80)),
         title: const Text('越狱成功 🎉', textAlign: TextAlign.center),
         content: SingleChildScrollView(
           child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text('su 已验证通过：', style: TextStyle(fontSize: 13)),
-            SizedBox(height: 4),
-            const SelectableText('uid=0(root) … context=u:r:ksu:s0',
-                style: TextStyle(fontFamily: 'monospace', fontSize: 11.5,
-                    color: Color(0xFF4CAF80))),
-            const SizedBox(height: 10),
-            const Text('KernelSU 面板如果还显示「未安装 / 未工作」，通常是管理器状态没刷新。',
-                style: TextStyle(fontSize: 12)),
-            const SizedBox(height: 6),
-            const Text('建议顺序：① 先试「软重启」（只重启框架，KSU 模块保留）→ ② 再打开 KernelSU。',
-                style: TextStyle(fontSize: 12)),
-            const SizedBox(height: 6),
-            const Text('软重启无效时，再用右上角的「重启」（正常重启；重启后需要重新运行本工具）。',
-                style: TextStyle(fontSize: 11, color: Colors.white54)),
-            const SizedBox(height: 6),
-            const Text('屏幕常亮 / 关 WiFi·蓝牙 等选项的影响已自动恢复原状。',
-                style: TextStyle(fontSize: 11, color: Color(0xFF4CAF80))),
-            const SizedBox(height: 12),
-            const Divider(height: 1, color: Colors.white10),
-            const SizedBox(height: 10),
-            const Text('如果对你有帮助，可以请作者喝杯咖啡',
-                style: TextStyle(fontSize: 12, color: Color(0xFFFFC857))),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                Expanded(
-                  child: _QrTile(
-                    asset: 'assets/qr_wechat.png',
-                    label: '微信',
-                    fileName: 'rootkit_wechat.png',
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('su 已验证通过：', style: TextStyle(fontSize: 13)),
+              SizedBox(height: 4),
+              const SelectableText('uid=0(root) … context=u:r:ksu:s0',
+                  style: TextStyle(
+                      fontFamily: 'monospace',
+                      fontSize: 11.5,
+                      color: Color(0xFF4CAF80))),
+              const SizedBox(height: 10),
+              const Text('KernelSU 面板如果还显示「未安装 / 未工作」，通常是管理器状态没刷新。',
+                  style: TextStyle(fontSize: 12)),
+              const SizedBox(height: 6),
+              const Text('建议顺序：① 先试「软重启」（只重启框架，KSU 模块保留）→ ② 再打开 KernelSU。',
+                  style: TextStyle(fontSize: 12)),
+              const SizedBox(height: 6),
+              const Text('软重启无效时，再用右上角的「重启」（正常重启；重启后需要重新运行本工具）。',
+                  style: TextStyle(fontSize: 11, color: Colors.white54)),
+              const SizedBox(height: 6),
+              const Text('屏幕常亮 / 关 WiFi·蓝牙 等选项的影响已自动恢复原状。',
+                  style: TextStyle(fontSize: 11, color: Color(0xFF4CAF80))),
+              const SizedBox(height: 12),
+              const Divider(height: 1, color: Colors.white10),
+              const SizedBox(height: 10),
+              const Text('如果对你有帮助，可以请作者喝杯咖啡',
+                  style: TextStyle(fontSize: 12, color: Color(0xFFFFC857))),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: _QrTile(
+                      asset: 'assets/qr_wechat.png',
+                      label: '微信',
+                      fileName: 'rootkit_wechat.png',
+                    ),
                   ),
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: _QrTile(
-                    asset: 'assets/qr_alipay.png',
-                    label: '支付宝',
-                    fileName: 'rootkit_alipay.png',
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: _QrTile(
+                      asset: 'assets/qr_alipay.png',
+                      label: '支付宝',
+                      fileName: 'rootkit_alipay.png',
+                    ),
                   ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 4),
-            const Text('点图放大 · 长按保存到相册',
-                style: TextStyle(fontSize: 10, color: Colors.white38)),
-          ],
-        ),
+                ],
+              ),
+              const SizedBox(height: 4),
+              const Text('点图放大 · 长按保存到相册',
+                  style: TextStyle(fontSize: 10, color: Colors.white38)),
+            ],
+          ),
         ),
         contentPadding: const EdgeInsets.fromLTRB(20, 8, 20, 4),
         actionsPadding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
@@ -779,9 +848,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       final ok = await chain.softReboot();
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text(ok
-            ? '已发出软重启，等桌面恢复后再打开 KernelSU（模块仍在）'
-            : '软重启被拒；请用右上角「重启」做正常重启'),
+        content: Text(
+            ok ? '已发出软重启，等桌面恢复后再打开 KernelSU（模块仍在）' : '软重启被拒；请用右上角「重启」做正常重启'),
       ));
     } else if (soft == 0) {
       // 打开前先杀掉 KernelSU 后台，让它重新读取模块状态
@@ -801,11 +869,212 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
+  // ===================== 更新检查（GitHub Release） =====================
+  // 约定（见 chain.busy 注释）：跑链期间一律不检查、不弹窗 ——
+  // 网络请求 / shell spawn 都可能干扰竞态窗口。
+
+  /// 自动检查的入口：开关关掉 / 正在跑链 / 10 分钟内查过 ⇒ 不发请求
+  Future<void> _maybeCheckUpdate() async {
+    if (_updateBusy || !chain.optUpdateCheck || chain.busy) return;
+    final last = _updateTriedAt;
+    if (last != null &&
+        DateTime.now().difference(last) < const Duration(minutes: 10)) {
+      return;
+    }
+    await _checkUpdate();
+  }
+
+  /// 真正发请求；[manual] = 用户点了「检查更新」，此时无论如何都弹结果
+  Future<void> _checkUpdate({bool manual = false}) async {
+    if (_updateBusy) return;
+    _updateBusy = true;
+    _updateTriedAt = DateTime.now();
+    if (mounted) setState(() {});
+    final r = await checkForUpdate(current: kAppVersion);
+    if (!mounted) {
+      _updateBusy = false;
+      return;
+    }
+    setState(() {
+      _update = r;
+      _updateBusy = false;
+    });
+    // 日志留一行：排障时能看出「查过 / 为什么没更新」
+    chain.addLog(r.error != null
+        ? '[update] 检查失败：${r.error}'
+        : '[update] 当前 v${r.current}，线上 v${r.latestVersion}'
+            '${r.hasUpdate ? '（有新版）' : '（已是最新）'}');
+    if (manual) {
+      await _showUpdateDialog();
+    } else {
+      _maybeAutoPopupUpdate();
+    }
+  }
+
+  /// 自动弹更新窗（幂等）：本次启动只自动弹一次，点过「跳过此版本」的不再弹
+  void _maybeAutoPopupUpdate() {
+    final r = _update;
+    if (r == null || !r.hasUpdate || _updateAutoShown) return;
+    if (r.latest!.version == _updateSkipped) return;
+    if (!_canAutoPopup) return; // 开屏免责声明/选项弹窗还开着？等它关了再补
+    _updateAutoShown = true;
+    _showUpdateDialog();
+  }
+
+  /// 自动弹窗的前置条件：不在跑链（每轮 `input tap` 可能点到弹窗按钮上）、没有别的弹窗压着
+  bool get _canAutoPopup {
+    if (!mounted || chain.busy) return false;
+    return ModalRoute.of(context)?.isCurrent ?? true;
+  }
+
+  /// 更新弹窗：有新版 → 去 Release 页面（APK 在 Release 里下）；没新版/失败也给出明确结论
+  Future<void> _showUpdateDialog() async {
+    final r = _update;
+    if (!mounted || r == null) return;
+    final rel = r.latest;
+    var skip = false;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        icon: Icon(
+          r.error != null
+              ? Icons.cloud_off_rounded
+              : r.hasUpdate
+                  ? Icons.system_update_rounded
+                  : Icons.check_circle_rounded,
+          size: 34,
+          color: r.error != null
+              ? Colors.orange
+              : r.hasUpdate
+                  ? const Color(0xFFFFC857)
+                  : const Color(0xFF4CAF80),
+        ),
+        title: Text(
+          r.error != null
+              ? '检查更新失败'
+              : r.hasUpdate
+                  ? '发现新版本 v${rel!.version}'
+                  : '已是最新版本',
+          textAlign: TextAlign.center,
+          style: const TextStyle(fontSize: 16),
+        ),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                '当前 v${r.current}'
+                '${rel == null ? '' : '  ·  线上 v${rel.version}'}',
+                style: const TextStyle(fontSize: 12, color: Colors.white60),
+              ),
+              if (r.error != null) ...[
+                const SizedBox(height: 8),
+                Text(r.error!,
+                    style: const TextStyle(fontSize: 12.5, height: 1.4)),
+                const SizedBox(height: 6),
+                const Text('越狱主流程不受影响，可以继续用当前版本。',
+                    style: TextStyle(fontSize: 11.5, color: Colors.white38)),
+              ],
+              if (r.hasUpdate) ...[
+                if (rel!.summary().isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(maxHeight: 200),
+                    child: SingleChildScrollView(
+                      child: SelectableText(
+                        rel.summary(),
+                        style: const TextStyle(
+                            fontSize: 11.5,
+                            height: 1.45,
+                            color: Colors.white70),
+                      ),
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 8),
+                Text(
+                  rel.apkSize > 0
+                      ? '安装包 ${formatBytes(rel.apkSize)}，在 Release 页面下载'
+                      : 'APK 还在上传（刚发的 Release 要等 CI 构建完），稍后再看',
+                  style: const TextStyle(fontSize: 11, color: Colors.white38),
+                ),
+              ],
+            ],
+          ),
+        ),
+        actions: [
+          if (r.error != null)
+            TextButton(
+              onPressed: () {
+                Navigator.of(ctx).pop();
+                _checkUpdate(manual: true);
+              },
+              child: const Text('重试'),
+            ),
+          if (r.hasUpdate)
+            TextButton(
+              onPressed: () {
+                skip = true;
+                Navigator.of(ctx).pop();
+              },
+              child: const Text('跳过此版本'),
+            ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: Text(r.hasUpdate ? '稍后' : '关闭'),
+          ),
+          FilledButton(
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              _openReleasePage(rel);
+            },
+            child: Text(r.hasUpdate ? '去下载' : '打开发布页'),
+          ),
+        ],
+      ),
+    );
+    if (skip && rel != null) await _skipUpdateVersion(rel.version);
+  }
+
+  /// 「跳过此版本」：记在 App 私有 prefs（和选项同一套），下次开机不再自动弹这个版本
+  Future<void> _skipUpdateVersion(String version) async {
+    _updateSkipped = version;
+    await ShizukuShell.setPref('update.skip', version);
+    chain.addLog('[update] 已跳过 v$version（手动「检查更新」仍会提示）');
+    if (mounted) setState(() {});
+  }
+
+  /// 下载 = 打开对应的 Release 页面（APK 挂在那个页面里）
+  Future<void> _openReleasePage(GitHubRelease? rel) async {
+    final url = rel?.htmlUrl ?? kReleasesPageUrl;
+    final ok = await ShizukuShell.openUrl(url);
+    if (!ok && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('没有可用的浏览器，请手动访问 $url')),
+      );
+    }
+  }
+
+  /// 选项里「检查更新」那一行的副标题
+  String _updateHint() {
+    if (_updateBusy) return '正在检查 GitHub 上的最新版本…';
+    final u = _update;
+    if (u == null) {
+      final off = chain.optUpdateCheck ? '' : '（启动时检查已关）';
+      return '当前 v$kAppVersion$off · 点这里查 GitHub 最新 Release';
+    }
+    return u.statusLine;
+  }
+
   Future<void> _showOptions() async {
     await showDialog<void>(
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx2, setSt) => AlertDialog(
+          // 选项变多了，小屏上不滚会溢出
+          scrollable: true,
           title: const Row(
             children: [
               Icon(Icons.tune_rounded, size: 20),
@@ -845,7 +1114,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 contentPadding: EdgeInsets.zero,
                 value: chain.optCleanup,
                 title: const Text('成功后清理残留文件', style: TextStyle(fontSize: 14)),
-                subtitle: const Text('停掉 5556 root shell、删除 /data/local/tmp/rk 里的原生件与临时文件'
+                subtitle: const Text(
+                    '停掉 5556 root shell、删除 /data/local/tmp/rk 里的原生件与临时文件'
                     '（已加载的模块不受影响；下次运行会自动重新部署）',
                     style: TextStyle(fontSize: 11)),
                 onChanged: (v) async {
@@ -867,7 +1137,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     }
                   },
                   icon: const Icon(Icons.biotech_rounded, size: 18),
-                  label: const Text('重新校准（5 项自动探测）', style: TextStyle(fontSize: 13)),
+                  label: const Text('重新校准（5 项自动探测）',
+                      style: TextStyle(fontSize: 13)),
                 ),
               ),
               SwitchListTile(
@@ -876,7 +1147,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 value: chain.optWifiOff,
                 title: const Text('运行前关闭 WiFi / 蓝牙（开飞行模式）',
                     style: TextStyle(fontSize: 14)),
-                subtitle: const Text('命中率更高（射频干扰更少）。代价：Shizuku 的无线调试会断开；'
+                subtitle: const Text(
+                    '命中率更高（射频干扰更少）。代价：Shizuku 的无线调试会断开；'
                     '重启后需要先重新打开 WiFi、在开发者选项里重新开启「无线调试」，'
                     '才能再启动 Shizuku（或者用电脑 adb 启动，不需要 WiFi）',
                     style: TextStyle(fontSize: 11)),
@@ -886,11 +1158,53 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 },
               ),
               const Divider(height: 14),
+              // 更新检查：自动开关（默认开）+ 手动入口
+              SwitchListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                value: chain.optUpdateCheck,
+                title: const Text('启动时检查更新', style: TextStyle(fontSize: 14)),
+                subtitle: const Text(
+                    '打开 App 时向 GitHub 查一次最新 Release（默认开）；'
+                    '关掉只影响自动检查，下面的「检查更新」仍可手动查',
+                    style: TextStyle(fontSize: 11)),
+                onChanged: (v) async {
+                  await chain.setOptions(updateCheck: v);
+                  if (ctx2.mounted) setSt(() {});
+                },
+              ),
+              ListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.system_update_rounded, size: 20),
+                title: const Text('检查更新', style: TextStyle(fontSize: 14)),
+                subtitle:
+                    Text(_updateHint(), style: const TextStyle(fontSize: 11)),
+                trailing: _updateBusy
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2))
+                    : Icon(
+                        _update?.hasUpdate == true
+                            ? Icons.arrow_forward_rounded
+                            : Icons.refresh_rounded,
+                        size: 16,
+                      ),
+                onTap: _updateBusy
+                    ? null
+                    : () {
+                        Navigator.of(ctx).pop();
+                        _checkUpdate(manual: true);
+                      },
+              ),
+              const Divider(height: 14),
               ListTile(
                 dense: true,
                 contentPadding: EdgeInsets.zero,
                 leading: const GithubMark(size: 20),
-                title: const Text('GitHub 项目主页', style: TextStyle(fontSize: 14)),
+                title:
+                    const Text('GitHub 项目主页', style: TextStyle(fontSize: 14)),
                 subtitle: const Text(kRepoUrl, style: TextStyle(fontSize: 11)),
                 trailing: const Icon(Icons.open_in_new_rounded, size: 16),
                 onTap: () {
@@ -926,7 +1240,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 child: Row(
                   children: [
                     const Text('历史日志（含上次运行）',
-                        style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
+                        style: TextStyle(
+                            fontSize: 15, fontWeight: FontWeight.w600)),
                     const Spacer(),
                     IconButton(
                       tooltip: '复制',
@@ -1015,7 +1330,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       '| nc -w 3 127.0.0.1 5556 2>/dev/null',
       timeoutMs: 8000,
     );
-    await ShizukuShell.run('svc power reboot 2>/dev/null || reboot', timeoutMs: 8000);
+    await ShizukuShell.run('svc power reboot 2>/dev/null || reboot',
+        timeoutMs: 8000);
   }
 
   /// 取日志卡片当前在屏幕上的矩形（动效起点）
@@ -1041,7 +1357,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               child: Row(
                 children: [
                   const Text('日志（全屏）',
-                      style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
+                      style:
+                          TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
                   const Spacer(),
                   IconButton(
                     tooltip: '复制',
@@ -1091,7 +1408,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 child: Row(
                   children: [
                     const Text('日志（全屏）',
-                        style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
+                        style: TextStyle(
+                            fontSize: 15, fontWeight: FontWeight.w600)),
                     const Spacer(),
                     IconButton(
                       tooltip: '复制',
@@ -1130,7 +1448,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   Future<void> _showStagesDialog() async {
     final done = chain.stages
-        .where((s) => s.status == StageStatus.ok || s.status == StageStatus.skipped)
+        .where((s) =>
+            s.status == StageStatus.ok || s.status == StageStatus.skipped)
         .length;
     await showDialog<void>(
       context: context,
@@ -1180,14 +1499,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       title: Text(s.title,
           style: TextStyle(
             fontSize: 12.5,
-            color: s.status == StageStatus.pending ? Colors.white54 : Colors.white,
+            color:
+                s.status == StageStatus.pending ? Colors.white54 : Colors.white,
             fontWeight: s.status == StageStatus.running
                 ? FontWeight.w600
                 : FontWeight.normal,
           )),
       subtitle: Text(
         [
-          if (s.status == StageStatus.skipped && s.detail.isNotEmpty) '已满足（跳过）· ${s.detail}',
+          if (s.status == StageStatus.skipped && s.detail.isNotEmpty)
+            '已满足（跳过）· ${s.detail}',
           if (s.status != StageStatus.skipped && rate.isNotEmpty) rate,
           if (s.status != StageStatus.skipped && s.detail.isNotEmpty) s.detail,
         ].join(' · '),
@@ -1197,7 +1518,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       ),
       trailing: s.status == StageStatus.running
           ? const SizedBox(
-              width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 2))
+              width: 12,
+              height: 12,
+              child: CircularProgressIndicator(strokeWidth: 2))
           : null,
     );
   }
@@ -1214,9 +1537,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           children: [
             const Row(
               children: [
-                Icon(Icons.lightbulb_outline, size: 14, color: Color(0xFFFFC857)),
+                Icon(Icons.lightbulb_outline,
+                    size: 14, color: Color(0xFFFFC857)),
                 SizedBox(width: 5),
-                Text('建议', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+                Text('建议',
+                    style:
+                        TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
               ],
             ),
             const SizedBox(height: 4),
@@ -1226,7 +1552,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 child: Text('· $s',
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(fontSize: 11, color: Colors.white70)),
+                    style:
+                        const TextStyle(fontSize: 11, color: Colors.white70)),
               ),
           ],
         ),
@@ -1253,7 +1580,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       buf.writeln('lastError: ${chain.lastError}');
     }
     buf
-      ..writeln('阶段: ${chain.stages.map((s) => '${s.title}=${s.status.name}').join(' ')}')
+      ..writeln(
+          '阶段: ${chain.stages.map((s) => '${s.title}=${s.status.name}').join(' ')}')
       ..writeln('--- 日志 ${lines.length} 行 ---')
       ..writeln(lines.join('\n'));
     await Clipboard.setData(ClipboardData(text: buf.toString()));
@@ -1276,7 +1604,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             child: Row(
               children: [
                 const Text('日志',
-                    style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+                    style:
+                        TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
                 const Spacer(),
                 IconButton(
                   tooltip: '复制全部日志',
@@ -1333,7 +1662,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           child: FilledButton.icon(
             onPressed: busy ? null : () => chain.start(),
             icon: const Icon(Icons.play_arrow_rounded, size: 18),
-            label: Text(busy ? '执行中…' : '开始越狱', style: const TextStyle(fontSize: 13)),
+            label: Text(busy ? '执行中…' : '开始越狱',
+                style: const TextStyle(fontSize: 13)),
             style: FilledButton.styleFrom(
               padding: const EdgeInsets.symmetric(vertical: 11),
             ),
@@ -1364,7 +1694,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 }
 
-
 /// 从某个矩形（例如日志卡片）展开成全屏的路由。
 /// 进入：从 from 矩形放大到全屏（圆角 16 -> 0，略淡入）
 /// 退出：反向收缩回 from 矩形
@@ -1392,12 +1721,15 @@ class _ExpandFromRectRoute<T> extends PageRouteBuilder<T> {
   Widget buildTransitions(BuildContext context, Animation<double> animation,
       Animation<double> secondaryAnimation, Widget child) {
     final size = MediaQuery.of(context).size;
-    final t = CurvedAnimation(parent: animation, curve: Curves.easeOutCubic,
+    final t = CurvedAnimation(
+        parent: animation,
+        curve: Curves.easeOutCubic,
         reverseCurve: Curves.easeInCubic);
-    final begin = from ?? Rect.fromCenter(
-        center: Offset(size.width / 2, size.height * 0.75),
-        width: size.width * 0.9,
-        height: 160);
+    final begin = from ??
+        Rect.fromCenter(
+            center: Offset(size.width / 2, size.height * 0.75),
+            width: size.width * 0.9,
+            height: 160);
     return AnimatedBuilder(
       animation: t,
       builder: (ctx, _) {
@@ -1469,7 +1801,8 @@ class _QrTile extends StatelessWidget {
   }
 
   /// 保存结果用弹窗提示（用户要求：保存时弹窗）
-  static Future<void> _saveWithDialog(BuildContext ctx, String asset, String fileName) async {
+  static Future<void> _saveWithDialog(
+      BuildContext ctx, String asset, String fileName) async {
     final msg = await ShizukuShell.saveImage(asset, fileName);
     if (!ctx.mounted) return;
     final ok = msg.startsWith('saved');
@@ -1477,11 +1810,14 @@ class _QrTile extends StatelessWidget {
       context: ctx,
       builder: (dctx) => AlertDialog(
         icon: Icon(ok ? Icons.check_circle_rounded : Icons.error_rounded,
-            size: 38, color: ok ? const Color(0xFF4CAF80) : const Color(0xFFE05B5B)),
+            size: 38,
+            color: ok ? const Color(0xFF4CAF80) : const Color(0xFFE05B5B)),
         title: Text(ok ? '已保存到相册' : '保存失败',
             textAlign: TextAlign.center, style: const TextStyle(fontSize: 16)),
         content: Text(
-          ok ? '路径：${msg.replaceFirst('saved: ', '')}\n\n可在系统相册 → Pictures/RootKit 里找到。' : msg,
+          ok
+              ? '路径：${msg.replaceFirst('saved: ', '')}\n\n可在系统相册 → Pictures/RootKit 里找到。'
+              : msg,
           style: const TextStyle(fontSize: 12.5, height: 1.5),
           textAlign: TextAlign.center,
         ),

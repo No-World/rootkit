@@ -29,7 +29,8 @@ class ShizukuShell {
     }
   }
 
-  static Future<bool> requestPermission({Duration timeout = const Duration(seconds: 20)}) async {
+  static Future<bool> requestPermission(
+      {Duration timeout = const Duration(seconds: 20)}) async {
     try {
       final r = await _ch
           .invokeMethod<bool>('request')
@@ -81,8 +82,8 @@ class ShizukuShell {
   /// 把 APK 内的图片保存到相册（Android 10+ 无需存储权限）
   static Future<String> saveImage(String asset, String name) async {
     try {
-      return await _ch.invokeMethod<String>('saveImage',
-              {'asset': asset, 'name': name}) ??
+      return await _ch.invokeMethod<String>(
+              'saveImage', {'asset': asset, 'name': name}) ??
           'save fail';
     } catch (e) {
       return 'save fail: $e';
