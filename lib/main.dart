@@ -922,6 +922,19 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                   SwitchListTile(
                     dense: true,
                     contentPadding: EdgeInsets.zero,
+                    value: chain.optDim,
+                    title: const Text('运行时把屏幕压到最暗',
+                        style: TextStyle(fontSize: 14)),
+                    subtitle: const Text('屏幕是 SoC 之外最大的热源；跑完自动恢复原亮度',
+                        style: TextStyle(fontSize: 11)),
+                    onChanged: (v) async {
+                      await chain.setOptions(dim: v);
+                      if (ctx2.mounted) setSt(() {});
+                    },
+                  ),
+                  SwitchListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
                     value: chain.optStrictTemp,
                     title: const Text('严格温度（>44°C 先等降温）',
                         style: TextStyle(fontSize: 14)),

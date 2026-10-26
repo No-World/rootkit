@@ -125,6 +125,11 @@ class RootChain extends ChangeNotifier {
   /// 严格温度闸：>44°C 先等降温（panic 代价远大于等待代价）
   bool optStrictTemp = true;
 
+  /// 运行时把屏幕亮度压到最低。屏幕是 SoC 之外最大的热源，
+  /// 真机上 1 档与中高亮差 2–3°C；跑链时屏幕内容没人看，压暗只赚不亏。
+  bool optDim = true;
+  static const int kDimBrightness = 1;
+
   Future<void> loadOptions() async {
     final a = await ShizukuShell.getPref('opt.wifiOff');
     final b = await ShizukuShell.getPref('opt.tap');
@@ -138,11 +143,13 @@ class RootChain extends ChangeNotifier {
     if (e2 != null) optKillBg = e2 == '1';
     final f2 = await ShizukuShell.getPref('opt.strictTemp');
     if (f2 != null) optStrictTemp = f2 == '1';
+    final g2 = await ShizukuShell.getPref('opt.dim');
+    if (g2 != null) optDim = g2 == '1';
     notifyListeners();
   }
 
   Future<void> setOptions({bool? wifiOff, bool? tap, bool? stayOn, bool? cleanup,
-      bool? killBg, bool? strictTemp}) async {
+      bool? killBg, bool? strictTemp, bool? dim}) async {
     if (wifiOff != null) {
       optWifiOff = wifiOff;
       await ShizukuShell.setPref('opt.wifiOff', wifiOff ? '1' : '0');
@@ -167,6 +174,10 @@ class RootChain extends ChangeNotifier {
       optStrictTemp = strictTemp;
       await ShizukuShell.setPref('opt.strictTemp', strictTemp ? '1' : '0');
     }
+    if (dim != null) {
+      optDim = dim;
+      await ShizukuShell.setPref('opt.dim', dim ? '1' : '0');
+    }
     _advice();
     notifyListeners();
   }
@@ -179,13 +190,15 @@ class RootChain extends ChangeNotifier {
         r'echo S=$(settings get global stay_on_while_plugged_in);'
         r'echo A=$(settings get global airplane_mode_on);'
         r'echo W=$(settings get global wifi_on);'
-        r'echo B=$(settings get global bluetooth_on)');
+        r'echo B=$(settings get global bluetooth_on);'
+        r'echo L=$(settings get system screen_brightness);'
+        r'echo M=$(settings get system screen_brightness_mode)');
     for (final line in r.out.split('\n')) {
       final i = line.indexOf('=');
       if (i <= 0) continue;
       final k = line.substring(0, i).trim();
       final v = line.substring(i + 1).trim();
-      if ('TSAWB'.contains(k) && v.isNotEmpty && v != 'null') _orig[k] = v;
+      if ('TSAWBLM'.contains(k) && v.isNotEmpty && v != 'null') _orig[k] = v;
     }
     _optApplied = true;
     String g(String k) => _orig[k] ?? '(未记录)';
@@ -221,7 +234,7 @@ class RootChain extends ChangeNotifier {
         if (i <= 0) continue;
         final k = line.substring(0, i).trim();
         final v = line.substring(i + 1).trim();
-        if ('TSAWB'.contains(k) && v.isNotEmpty && v != 'null') _orig[k] = v;
+        if ('TSAWBLM'.contains(k) && v.isNotEmpty && v != 'null') _orig[k] = v;
       }
       if (_orig.isEmpty) return;
       _log('[opt] 发现上次运行遗留的设置快照（很可能是 panic 重启），正在按记录还原：'
@@ -272,6 +285,14 @@ class RootChain extends ChangeNotifier {
     if (s0 == null || s0 == 'null' || s0 == '0') {
       b.write('svc power stayon false; ');
     }
+    final l = _orig['L'];
+    final m = _orig['M'];
+    if (m != null && m != 'null') {
+      b.write('settings put system screen_brightness_mode $m; ');
+    }
+    if (l != null && l != 'null') {
+      b.write('settings put system screen_brightness $l; ');
+    }
     if (all || optWifiOff) {
       final a = _orig['A'];
       if (a != null) {
@@ -286,7 +307,7 @@ class RootChain extends ChangeNotifier {
     b.write('true');
     final r = await ShizukuShell.run(b.toString());
     await ShizukuShell.run('rm -f $_optSnapPath');
-    _log('[env] 已恢复原设置（屏幕超时/常亮/飞行模式）rc=${r.code}');
+    _log('[env] 已恢复原设置（屏幕超时/常亮/亮度/飞行模式）rc=${r.code}');
     _optApplied = false;
   }
 
@@ -301,6 +322,10 @@ class RootChain extends ChangeNotifier {
     if (optTap) b.write('input keyevent 224; input tap 540 1200; ');
     if (optStayOn) {
       b.write('svc power stayon true; settings put system screen_off_timeout 1800000; ');
+    }
+    if (optDim) {
+      b.write('settings put system screen_brightness_mode 0; '
+          'settings put system screen_brightness $kDimBrightness; ');
     }
     if (optWifiOff) {
       // 只开飞行模式：WiFi/蓝牙由系统在切换飞行模式时自行关闭，
@@ -1331,7 +1356,10 @@ class RootChain extends ChangeNotifier {
           'P645_NDEL=7 P645_DEL_RUN_MS=2500 P645_CONC=1 P645_ANON_MB=8 P645_FREEZE=1 P645_V8=1 '
           'P645_DRAIN_WAIT_MS=25000 P645_PIPE512=64 P645_SOCKS=64 P645_SOCK_MB=8 P645_UHID=0 '
           'P645_MODE=4 P645_ANON2_MB=1024 P645_PIPE_DRAIN=1 P645_PIPE_K=4 P645_SCAN_STOP=1 '
-          'P645_THRESH=32 P645_RING_GO=0 P645_FORCE_LEFT=${calib.selinuxZeroTargetHex} P645_LOG=$logPath';
+          'P645_THRESH=32 P645_RING_GO=0 P645_FORCE_LEFT=${calib.selinuxZeroTargetHex} '
+          // PRE_PIPES 决定 uid 2000 的 64MB 管道预算用得早不早：
+          // 20000 会把预算占满 ⇒ 后面 PIPE512=64 的 512KB 管道必然 EPERM（实测 errno=1）。
+          'P645_PRE_PIPES=$kPrePipes P645_LOG=$logPath';
       // 温度闸 + 环境探针
       await _cooldownGate();
       if (!await _ensureAwake()) {
@@ -1612,7 +1640,7 @@ class RootChain extends ChangeNotifier {
         'P645_REPEATS=520 P645_NDEL=7 P645_DEL_RUN_MS=2500 P645_CONC=1 P645_ANON_MB=8 P645_FREEZE=1 '
         'P645_V8=1 P645_DRAIN_WAIT_MS=25000 P645_PIPE512=64 P645_SOCKS=64 P645_SOCK_MB=8 P645_UHID=0 '
         'P645_MODE=4 P645_ANON2_MB=1024 P645_PIPE_DRAIN=1 P645_PIPE_K=4 P645_SCAN_STOP=1 '
-        'P645_THRESH=32 P645_RING_GO=0 P645_LOG=$logPath';
+        'P645_THRESH=32 P645_RING_GO=0 P645_PRE_PIPES=$kPrePipes P645_LOG=$logPath';
     if (tryList != null && tryList.isNotEmpty) {
       env += " P645_TRY_LIST='$tryList'";
     }
@@ -1932,6 +1960,9 @@ class RootChain extends ChangeNotifier {
   /// 另外两点也照抄：
   ///   · 读数做取值范围校验（只接受 10000–120000，挡掉异常/瞬时的坏值）
   ///   · **跑链期间不读**（同类实现的监控面板此时直接显示"已暂停读取"）
+  /// 开打前预创建的 pipe 数。A/B 实测（docs/2026-10-26_AB_管道预算与panic率.md）：
+  /// 占满 uid 2000 的 64MB 管道预算后，后续 PIPE512=64 的 512KB 管道一定 EPERM。
+  static const int kPrePipes = 20000;
   static const int _tempBestMc = 40000;    // ≤40 最佳
   static const int _tempOkMc = 55000;      // ≤55 可用；>55 偏高
   static const int _tempGateTries = 30;    // 最多等 30×10s = 5 分钟
@@ -1988,7 +2019,10 @@ class RootChain extends ChangeNotifier {
     final r = await ShizukuShell.run(
         'echo "stage=$stage temp_mc=$t uptime=\$(cut -d. -f1 /proc/uptime) '
         'memfree=\$(grep MemFree /proc/meminfo | tr -s " " | cut -d" " -f2) '
-        'procs=\$(ls /proc | grep -cE "^[0-9]")\n'
+        'procs=\$(ls /proc | grep -cE "^[0-9]") '
+        // 频率与充电状态：热降频会改变竞态窗口的时间尺度，事后统计必须能分开这两者
+        'cpu=\$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null) '
+        'chg=\$(cat /sys/class/power_supply/battery/status 2>/dev/null) '
         'ts=\$(date +%H:%M:%S)" >> /data/local/tmp/rk/meta.log 2>/dev/null');
     // 失败无所谓，纯诊断用
     if (r.code != 0) return;
