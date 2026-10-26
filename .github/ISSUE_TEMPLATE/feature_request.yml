@@ -1,0 +1,35 @@
+name: 功能建议
+description: 希望增加/改进的功能（不含适配新内核，请用「适配申请」）
+title: '[建议] '
+labels: ['enhancement']
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: 你想要什么
+      placeholder: 例如：支持批量备份已装模块 / 加一个「只做 permissive」的开关
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: 为什么（使用场景）
+      description: 现在你是怎么绕过去的？这个功能能省掉哪一步？
+    validations:
+      required: true
+
+  - type: textarea
+    id: alt
+    attributes:
+      label: 你考虑过的替代方案（可选）
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: 范围确认
+      options:
+        - label: 这是「App 功能」需求，不是「新机型/新内核适配」（后者请开「适配申请」）
+          required: true

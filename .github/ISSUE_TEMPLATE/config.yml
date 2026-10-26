@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 先读 README（已知限制 / 适配步骤）
+    url: https://github.com/No-World/rootkit#readme
+    about: 大多数「卡住/闪退」都能在这里自助解决
+  - name: 我看不懂日志，想先问问
+    url: https://github.com/No-World/rootkit/discussions
+    about: 讨论区更适合开放式提问（若未开启讨论，请直接开 Bug 报告）
