@@ -429,7 +429,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       items.add('${(t / 1000).toStringAsFixed(1)}°C $tag');
     }
     if ((h['W'] ?? '').isNotEmpty) items.add(h['W']!);
-    if ((h['M'] ?? '').isNotEmpty) items.add('内存 ${h['M']}MB');
+    // M 现在是 '7G/14G' 形式（旧版是 14858/15011MB），别再加 MB 后缀
+    if ((h['M'] ?? '').isNotEmpty) items.add('内存 ${h['M']}');
     if ((h['P'] ?? '').isNotEmpty) items.add('posix ${h['P']}');
     if ((h['C'] ?? '').isNotEmpty) items.add('cred ${h['C']}');
     if ((h['E'] ?? '').isNotEmpty) items.add(h['E']!);
