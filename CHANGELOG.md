@@ -1,6 +1,12 @@
 # 变更记录
 
 ## v1.0.17 — 2026-10-26
+- **CI 构建告警清理**：`compileOptions` 从 Java 1.8 提到 **17**（AGP 8.x 本身跑在 17 上，
+  旧的 1_8 会刷 `source value 8 is obsolete / target value 8 is obsolete` 两条 javac 警告）。
+  `MaterialIcons-Regular.otf was tree-shaken … 99.7%` 那条是**正常提示**（图标字体按需裁剪，
+  1.6MB → 4.8KB），不需要处理。
+- **测试包签名固定生效**：上一发验证 APK 的 `Signer #1 SHA-256` = `8F:CD:CE:47:…:D8:03:ED`，
+  从此 PR 测试包可直接覆盖安装（`adb install -r`），不再 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`。
 - **状态区（温度/唤醒/内存/slab/SELinux）改成每 5 秒主动刷新**
   之前只在「运行中」的 20s 心跳里刷，空闲时温度一直是打开 App 时的旧值。
   现在：前台每 5s 轮询（值没变化就不重绘整屏），回到前台立即刷一次，退到后台暂停；
