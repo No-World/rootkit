@@ -1960,9 +1960,16 @@ class RootChain extends ChangeNotifier {
   /// 另外两点也照抄：
   ///   · 读数做取值范围校验（只接受 10000–120000，挡掉异常/瞬时的坏值）
   ///   · **跑链期间不读**（同类实现的监控面板此时直接显示"已暂停读取"）
-  /// 开打前预创建的 pipe 数。A/B 实测（docs/2026-10-26_AB_管道预算与panic率.md）：
-  /// 占满 uid 2000 的 64MB 管道预算后，后续 PIPE512=64 的 512KB 管道一定 EPERM。
-  static const int kPrePipes = 20000;
+  /// 开打前预创建的 pipe 数。**这个值直接决定 512KB 管道载体能不能建起来**：
+  /// uid 2000 的管道页预算 = pipe-user-pages-soft = 16384 页（64MB），
+  /// 每多一个 pipe 就吃掉若干页，预算一满，后续 fcntl(F_SETPIPE_SZ, 512KB) 全部 EPERM。
+  ///
+  /// 真机 A/B（docs/2026-10-26_AB_管道预算与panic率.md，冷机 25–32°C）：
+  ///   PRE_PIPES=20000 → F_SETPIPE_SZ=-1(EPERM)  命中/落位 12/19 = 63%
+  ///   PRE_PIPES=512   → F_SETPIPE_SZ=524288     命中/落位 30/34 = 88%
+  ///   PRE_PIPES=2048  → 又变 -1（2048×8页 = 16384，正好撞上限）
+  /// 所以只能取 ≤512。
+  static const int kPrePipes = 512;
   static const int _tempBestMc = 40000;    // ≤40 最佳
   static const int _tempOkMc = 55000;      // ≤55 可用；>55 偏高
   static const int _tempGateTries = 30;    // 最多等 30×10s = 5 分钟
