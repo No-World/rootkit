@@ -910,10 +910,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     value: chain.optWifiOff,
                     title: const Text('运行前关闭 WiFi / 蓝牙（开飞行模式）',
                         style: TextStyle(fontSize: 14)),
-                    subtitle: const Text('只开飞行模式（WiFi/蓝牙由系统自行关闭，不单独去关）。'
-                        '命中率更高（射频干扰更少）。代价：Shizuku 的无线调试会断开；'
-                        '重启后需要先重新打开 WiFi、在开发者选项里重新开启「无线调试」，'
-                        '才能再启动 Shizuku（或者用电脑 adb 启动，不需要 WiFi）',
+                    subtitle: const Text('只切飞行模式，WiFi/蓝牙交给系统自己关。'
+                        '命中率更高（射频干扰更少）。代价：Shizuku 无线调试会断；'
+                        '重启后要先开 WiFi、在开发者选项里重开「无线调试」，'
+                        '才能再启动 Shizuku（用电脑 adb 启动则不需要 WiFi）',
                         style: TextStyle(fontSize: 11)),
                     onChanged: (v) async {
                       await chain.setOptions(wifiOff: v);
@@ -958,7 +958,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                           minimumSize: const Size(0, 28),
                           tapTargetSize: MaterialTapTargetSize.shrinkWrap),
                       icon: const Icon(Icons.restore_rounded, size: 15),
-                      label: const Text('立即恢复运行前的系统设置（超时/常亮/飞行/WiFi/蓝牙）',
+                      label: const Text('立即恢复运行前的系统设置（超时/常亮/飞行模式）',
                           style: TextStyle(fontSize: 11.5)),
                       onPressed: () async {
                         await chain.restoreOptions();
