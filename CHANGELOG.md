@@ -43,8 +43,11 @@
   正常跑完仍走原来的 restore（同时删掉快照文件）。
   现场证据：设备上 `screen_off_timeout=1800000`、`stay_on_while_plugged_in=15`（15 是用户自己
   在开发者选项里开的），而快照文件不存在 —— 正是「panic 后内存快照丢失」的后果。
-- **新增「开打前清理后台」选项（默认关闭）**：每发之前执行 `am kill-all`，回收**可回收**的后台进程
-  （前台/常驻/白名单不动），并记录 `[killbg:*] 进程 N → M`。动机：后台 App 多时
+- **新增「开打前清理后台」选项（默认关闭）**：**只清理第三方 App 的后台进程**
+  （`pm list packages -3` ∩ 正在运行的进程 → `am kill <pkg>`，只杀可安全杀的后台；
+  系统/供应商服务、Shizuku、KernelSU 一律不动），并记录 `[killbg:*] 只清第三方后台：N 个（列表）· 进程 a → b`。
+  坑：① 不能用 `am kill-all`——真机上它把系统后台服务一起杀了；
+  ② 进程名要用 `ps -A -o args`，`-o NAME` 截断到 15 字符，长包名匹配不上。动机：后台 App 多时
   ① 全局 pipe 页预算被占（日志里 `v8_pipe first F_SETPIPE_SZ=-1 errno=1`）、
   ② 页回收竞争变强 ⇒ 落位失败 ⇒ panic。软重启即可全部恢复（进程本来会重建）。
   同时新增 `[envprobe:*]`：每发前记录 唤醒态 / MemAvailable / Dirty / SwapFree / 进程数 /

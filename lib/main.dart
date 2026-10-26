@@ -872,9 +872,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 contentPadding: EdgeInsets.zero,
                 value: chain.optKillBg,
                 title: const Text('开打前清理后台（默认关）', style: TextStyle(fontSize: 14)),
-                subtitle: const Text('每发之前执行 am kill-all，回收可回收的后台进程。'
-                    '后台多时会抢 pipe 页预算/干扰页回收，落位更容易失败（进而 panic）；'
-                    '只影响后台，前台与常驻不受影响，软重启即可全部恢复',
+                subtitle: const Text('每发之前只清理**第三方 App** 的后台进程'
+                    '（系统/供应商服务、Shizuku、KernelSU 一律不动）。'
+                    '后台多时会抢 pipe 页预算、干扰页回收，落位更容易失败（进而 panic）；'
+                    '被杀的后台重新打开即恢复，软重启可全部复原',
                     style: TextStyle(fontSize: 11)),
                 onChanged: (v) async {
                   await chain.setOptions(killBg: v);

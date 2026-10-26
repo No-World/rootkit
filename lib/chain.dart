@@ -1742,24 +1742,42 @@ class RootChain extends ChangeNotifier {
 
   /// 开打前清理后台（默认关闭；开关在「选项」里）
   ///
-  /// - `am kill-all`：让系统回收**可回收**的后台进程（前台/常驻/白名单不动），最安全的一档
-  /// - 不做 `am force-stop` 逐个杀：会打断用户正在用的 App，风险与收益不成比例
-  /// - 副作用：Shizuku 自己也可能被回收 ⇒ 之后复核权限，掉线就提示重新授权
+  /// **只清理第三方 App 的后台进程，绝不碰系统/供应商服务。**
+  /// 实现要点（踩过的坑）：
+  /// - 不用 `am kill-all`：它会连系统里的后台服务一起杀（用户实测被杀后相机/蓝牙等服务异常）。
+  /// - 不用 `pm list packages` 之外的白名单：取 `pm list packages -3`（第三方）与当前在跑的进程名求交集，
+  ///   再用 `am kill <pkg>`（只杀**可安全杀**的后台进程，前台不动）。
+  /// - 进程名必须用 `ps -A -o args`（完整 cmdline）；`-o NAME` 会被截断到 15 字符，
+  ///   长包名（com.tencent.mobileqq）根本匹配不上。
+  /// - 显式跳过：本 App 自己、Shizuku、KernelSU 管理器（杀了会断掉自己的通道）。
   Future<void> _killBackground(String tag) async {
     if (!optKillBg) return;
-    final b = await ShizukuShell.run('ls /proc 2>/dev/null | grep -cE "^[0-9]"');
-    final n0 = int.tryParse(b.out.trim()) ?? 0;
-    await ShizukuShell.run('am kill-all 2>/dev/null');
+    final before = await ShizukuShell.run('ls /proc 2>/dev/null | grep -cE "^[0-9]"');
+    final n0 = int.tryParse(before.out.trim()) ?? 0;
+    final r = await ShizukuShell.run(
+        'TP=\$(pm list packages -3 2>/dev/null | cut -d: -f2)'
+        '; K=""; N=0'
+        '; while read p; do'
+        ' case "\$p" in'
+        ' com.noworld.rootkit*|moe.shizuku.privileged.api|me.weishu.kernelsu) continue;;'
+        ' esac'
+        ' printf "%s\\n" "\$TP" | grep -Fxq "\$p" || continue'
+        ' am kill "\$p" >/dev/null 2>&1'
+        ' K="\$K\$p,"; N=\$((N+1))'
+        ' done <<EOF2'
+        '\$(ps -A -o args 2>/dev/null | sed "s/[: ].*//" | sort -u)'
+        'EOF2'
+        '; echo KILLED=\$N; echo LIST=\$K');
+    final out = r.out;
+    final n = RegExp(r'KILLED=(\d+)').firstMatch(out)?.group(1) ?? '0';
+    final list = RegExp(r'LIST=(.*)').firstMatch(out)?.group(1)?.trim() ?? '';
     await _sleep(1200);
-    final a = await ShizukuShell.run('ls /proc 2>/dev/null | grep -cE "^[0-9]"');
-    final n1 = int.tryParse(a.out.trim()) ?? 0;
-    if (n0 > 0 && n1 > 0) {
-      _log('[killbg:$tag] am kill-all：进程 $n0 → $n1（回收 ${n0 - n1}）');
-    } else {
-      _log('[killbg:$tag] am kill-all 完成');
-    }
+    final after = await ShizukuShell.run('ls /proc 2>/dev/null | grep -cE "^[0-9]"');
+    final n1 = int.tryParse(after.out.trim()) ?? 0;
+    _log('[killbg:$tag] 只清第三方后台：$n 个${list.isEmpty ? "" : "（$list）"}'
+        '${(n0 > 0 && n1 > 0) ? " · 进程 $n0 → $n1" : ""}');
     if (!await ShizukuShell.checkPermission()) {
-      _log('[killbg:$tag] ⚠ Shizuku 掉线（可能被一并回收）：请重新授权后再跑');
+      _log('[killbg:$tag] ⚠ Shizuku 掉线：请重新授权后再跑');
     }
   }
 
