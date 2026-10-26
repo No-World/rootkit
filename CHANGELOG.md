@@ -29,9 +29,13 @@
 - **ksud 用户态安装加两道闸**（因为测试版出现过早期 panic，怀疑与"往半加载的 KSU 模块发 prctl"有关）：
   · `/sys/module/kernelsu` 不存在 ⇒ 直接跳过（模块没真正注册，戳它会崩）
   · 每个 boot 只试一次（`/data/local/tmp/rk/.ksud_tried_<boot_id>` 标记），避免反复戳内核
-- **正式开始后，链路运行期间不做任何额外探测/更新检查**：`detectStatus`（3s）、`refreshHealth`（5s）、
-  以及以后接的更新检查/网络请求一律让路（新增 `chain.busy` 作为统一判据）。
-  开跑前那一次温度/状态读取用 `refreshHealth(force: true)` 例外，保证 `[temp]` 闸有数据可用。
+- **检测逻辑按"是否在跑"分流**（最终版）：
+  · **空闲期**：`startHealthPolling()` 每 5s 刷健康条（温度/内存/slab/SELinux）。
+    打开 App、授权成功、切回前台都会立刻刷一次（不再等第一个 5s）。
+  · **运行期**：回到 v1.0.16 的行为 —— `refreshHealth` / `detectStatus` **一律不跑**，
+    只剩「开打前一次温度闸（`refreshHealth(force: true)` 的等价：直接读 thermal_zone0）」
+    与 20s 心跳里的 prep；跑完一轮后再统一刷一次。
+  · 统一判据 `chain.busy`（= running），以后接的更新检查/网络请求也必须先看它。
 - **跑链时暂停轮询**：5s 一次的 shell spawn 会干扰竞态窗口（影响命中率/panic），运行期间自动停。
 - **新增「上次重启现场」采集**（`[crash]`）：拿到 root 后读 `/sys/fs/pstore/console-ramoops*`、
   `/proc/last_kmsg`、`sys.resettype`，把 `Kernel panic / Unable to handle / BUG: / Call trace`

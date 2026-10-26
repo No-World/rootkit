@@ -65,7 +65,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     chain.loadOptions();
     _refreshShizuku();
     _startShizukuPoll();
-    chain.startHealthPolling();   // 状态区每 5s 主动刷新（不依赖是否在跑）
+    chain.startHealthPolling();   // 空闲期每 5s 刷状态；跑链期间自动静默
     _maybeShowDisclaimer();
   }
 
@@ -85,13 +85,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       if (!mounted) return;
       if (ok && !_shizuku) {
         setState(() => _shizuku = true);
-        _probeStatusOnce();
-        // 授权后立刻拉一次状态（温度/slab 等），不等用户的第一次点击
-        chain.refreshHealth();
+        // 授权成功 ⇒ 立刻开始空闲期轮询（内部先刷一次健康条）
+        chain.startHealthPolling();
       } else if (ok && _shizuku) {
-        // ★ 跑链时绝不探测：detectStatus 会 spawn 一个 shell 跑 getenforce/pm/dumpsys，
-        //   每 3 秒来一次会把竞态窗口的时序彻底打乱（实测 panic 率上升），也抢 CPU。
-        if (!chain.running) _probeStatusOnce();
+        // 这个 3s 定时器只负责"权限还活着吗"（binder 查询，不 spawn 进程）；
+        // 状态刷新交给 startHealthPolling 的 5s 轮询（空闲期才跑）。
       } else if (!ok && _shizuku) {
         // 权限查询可能滞后：用一条真实命令复核，避免图标闪跳
         final r = await ShizukuShell.run('echo RK_OK');
@@ -111,7 +109,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _refreshShizuku();
       _startShizukuPoll();
       chain.startHealthPolling();
-      chain.refreshHealth();
     } else if (state == AppLifecycleState.paused) {
       _shizukuPoll?.cancel();
       _shizukuPoll = null;

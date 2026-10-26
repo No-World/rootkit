@@ -759,6 +759,8 @@ class RootChain extends ChangeNotifier {
       _saveStats();
       _advice();
       notifyListeners();
+      // 跑完一轮：刷新一次状态（事件驱动的最后一个时机）
+      refreshStatus();
     }
   }
 
@@ -1222,26 +1224,38 @@ class RootChain extends ChangeNotifier {
     ].join(' · ');
   }
 
-  /// 状态区（温度/唤醒/内存/slab/SELinux）**每 5 秒主动刷新**，不依赖是否在跑
+  /// 一次性刷新（重）：健康条 + detectStatus
   ///
-  /// 之前只在 running 时的 20s 心跳里刷，所以空闲时温度一直是旧的。
+  /// 触发时机：打开 App、Shizuku 授权成功、切回前台、跑完一轮后。
+  /// **跑链期间直接 return** —— 运行时的检测逻辑回到 v1.0.16（不做 detectStatus / slabinfo），
+  /// 因为 v1.0.17 曾用 3s/5s 定时器在竞态窗口里跑这些重活，把 panic 率从 12% 推到 100%。
+  Future<void> refreshStatus({bool withDetect = true}) async {
+    if (running) return;          // 跑链期间一律不探测
+    await refreshHealth(force: true);
+    if (withDetect) {
+      try {
+        await detectStatus();
+      } catch (_) {}
+    }
+  }
+
+  /// 空闲期：每 5 秒刷新状态；**跑链期间完全不刷**（运行时的行为回到 v1.0.16：
+  /// 只有开打前的一次温度闸 + 20s 心跳的 prep，不做 detectStatus/slabinfo 这类重活）。
   void startHealthPolling() {
     _healthTimer?.cancel();
+    refreshStatus(); // 先立刻刷一次，别等第一个 5s
     _healthTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
-      // 跑链时不轮询：每 5s spawn 一个 shell 会干扰竞态窗口（命中率/panic 都受影响）
       if (_healthBusy || running) return;
       _healthBusy = true;
       try {
-        // ★ 原来这里是 `if (!shizukuOk) return;` —— 死锁：shizukuOk 只在 refreshHealth 成功时置位，
-        //   而 refreshHealth 又被这个守卫拦住 ⇒ 打开 App 授权后永远不会开始轮询（用户实测的 bug）。
-        //   改成用 binder 查一次权限（很便宜，不 spawn 进程）。
+        // 死锁修复：原来守卫是 if(!shizukuOk) return，而 shizukuOk 只在 refreshHealth 成功时置位
         if (!shizukuOk) {
           final ok = await ShizukuShell.checkPermission();
           if (!ok) return;
           shizukuOk = true;
           _log('[health] Shizuku 已授权，开始每 5s 刷新状态');
         }
-        await refreshHealth();
+        await refreshHealth();   // 只刷健康条（轻量），不跑 detectStatus
       } catch (_) {
       } finally {
         _healthBusy = false;
@@ -1493,6 +1507,8 @@ class RootChain extends ChangeNotifier {
           'cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null');
       final t = int.tryParse(RegExp(r'\d+').firstMatch(r.out)?.group(0) ?? '') ?? 0;
       if (t <= 0) return;
+      health['T'] = '$t';
+      notifyListeners();
       if (t < 58000) {
         if (i > 0) _log('[temp] ${(t / 1000).toStringAsFixed(1)}°C 已回落，开打');
         return;
