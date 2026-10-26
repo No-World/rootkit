@@ -31,15 +31,24 @@ android {
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
-    // Java 17：AGP 8.x 本身就跑在 17 上，模板里的 1_8 会在编译时刷两条
-    // "source value 8 is obsolete / target value 8 is obsolete" 的 javac 警告。
+    // 保持 Java 8 字节码：AGP 8.1.0 + JDK 21 上把 target 提到 17 会触发
+    // JdkImageTransform → jlink，而 JDK 21 已移除 jlink 的 system-modules 插件 ⇒ 直接构建失败
+    // （实测："Execution failed for task ':app:compileReleaseJavaWithJavac' > Could not resolve
+    //   all files for configuration ':app:androidJdkImage' … JdkImageTransform … jlink"）。
+    // 想升到 17 必须同时把 AGP 升到 8.6+ / Gradle 8.7+，那是另一件事。
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
+        sourceCompatibility = JavaVersion.VERSION_1_8
+        targetCompatibility = JavaVersion.VERSION_1_8
+        // 但这会刷 "source/target value 8 is obsolete" 两条警告，用 -Xlint:-options 关掉这一类
+        encoding = 'UTF-8'
     }
 
     kotlinOptions {
-        jvmTarget = "17"
+        jvmTarget = JavaVersion.VERSION_1_8
+    }
+
+    tasks.withType(JavaCompile).configureEach {
+        options.compilerArgs += ['-Xlint:-options']
     }
 
     defaultConfig {

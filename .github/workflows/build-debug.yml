@@ -43,6 +43,28 @@ jobs:
 
       # 可选：固定 debug 签名 key。不提供时 runner 每次生成新 key ⇒ 不同次构建之间覆盖安装会签名冲突。
       # 注意：secrets 不能在 steps[*].if 里直接引用（会让整份 workflow 校验失败），要用 env 中转。
+      # 缓存 1：Gradle 依赖 + 构建缓存（Flutter 的 Android 构建里最耗时的一段）
+      # 命中时 android 侧几乎不用重新下载 AGP/Kotlin/依赖；改代码只重编增量部分。
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/**/*.gradle', 'android/**/*.gradle.kts', 'android/gradle/wrapper/gradle-wrapper.properties', 'android/gradle.properties', 'pubspec.lock') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      # 缓存 2：pub 包（flutter_svg / shizuku 等）
+      - name: Cache pub
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('pubspec.lock') }}
+          restore-keys: |
+            pub-${{ runner.os }}-
+
       # 固定测试包签名 key。
       # 坑 1：不固定 ⇒ runner 每次生成新 key，覆盖安装报 INSTALL_FAILED_UPDATE_INCOMPATIBLE。
       # 坑 2：把 key 写到 ~/.android/debug.keystore **没用** —— 实测 CI 上 AGP 仍用自己生成的那把
@@ -64,7 +86,7 @@ jobs:
           echo "::warning::未配置 DEBUG_KEYSTORE_B64 ⇒ 本次测试包用的是 runner 随机生成的 debug key，"
           echo "::warning::下次构建的包无法覆盖安装（会报 INSTALL_FAILED_UPDATE_INCOMPATIBLE）。"
 
-      - run: flutter pub get
+      - run: flutter pub get --no-precompile
 
       # 测试包用 release 构建（AOT）而不是 debug：
       #   实测体积 app-debug.apk 157MB（artifact 71MB） vs app-release.apk 19MB ⇒ 省 3.7 倍
@@ -77,7 +99,7 @@ jobs:
           # 版本号从 pubspec 取，避免 gradle 与 pubspec 不一致
           ver=$(sed -n 's/^version: *\([0-9.]*\)+.*/\1/p' pubspec.yaml | head -1)
           bn=$(sed -n 's/^version: *[0-9.]*+\([0-9]*\).*/\1/p' pubspec.yaml | head -1)
-          flutter build apk --release --target-platform android-arm64 \
+          flutter build apk --release --target-platform android-arm64 --no-pub \
             --build-name "$ver" --build-number "$bn"
 
       # 产物名带版本 + PR 号，手机上看得懂是哪个包
