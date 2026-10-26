@@ -31,33 +31,33 @@ gh pr merge --squash --delete-branch      # 5. 合并（squash，保持 main 单
 
 ## 3. PR 的测试包（怎么在自己手机上验）
 
-每个 PR 的 `debug` 检查会顺手构建一个**可直接装机的测试包**（两种拿法）：
-
-| 拿法 | 地址 | 是否 zip |
-|---|---|---|
-| 直链（推荐） | Releases 里的预发布 `pr-<号>`：`…/releases/download/pr-3/RootKit-v1.0.16-pr3-test.apk` | **不是**，点开就是 apk |
-| Actions Artifacts | PR → Checks → `debug` → 页面底部 | 是（GitHub 强制 zip） |
+每个 PR 的 `debug` 检查会顺手构建一个**可直接装机的测试包**：
 
 | 项 | 值 |
 |---|---|
+| 位置 | PR → Checks → `debug` → 页面底部 **Artifacts**（job summary 里也有直链） |
+| 名字 | `RootKit-v<版本>-pr<PR号>-test`，zip 里是 `.apk` + `.apk.md5` |
 | 包名 | `com.noworld.rootkit.debug` |
 | 构建 | **release / AOT**（与正式版同构），不是 JIT debug 包 |
-| 体积 | **19.0MB**（APK）/ 10.2MB（artifact zip）；debug 包是 157MB / 71MB ⇒ 换 release/AOT 省 7 倍 |
+| 体积 | APK **19.0MB** / artifact zip **10.2MB** |
 | 签名 | debug key ⇒ 可与正式版共存；**不能**覆盖正式版 |
 
 ```bash
+unzip RootKit-v1.0.16-pr3-test.zip
 adb install -r RootKit-v1.0.16-pr3-test.apk
 ```
 
 **坑（都踩过）**：
 
-- **`actions/upload-artifact` 永远打包成 zip**，单文件也一样。要「点开就是 apk」只能挂 Release，
-  所以这里给每个 PR 建预发布 `pr-<号>`，PR 关闭时由 `pr-cleanup.yml` 自动删除。
-- **测试包不要用 `flutter build apk --debug`**：157MB，artifact 压完还有 71MB，
-  下载和装机都慢；改用 `PR_TEST_BUILD=1 flutter build apk --release`（gradle 会给 release
-  追加 `.debug` 包名与 `-prtest` 版本后缀），体积回到 ≈19MB 且行为与正式版一致。
-- **`upload-artifact` 找不到文件时默认只 warn**，会产出一个「没有任何 Artifacts」的绿色运行 ——
-  所以设了 `if-no-files-found: error`。看到「CI 没出包」先看是不是 0 job 的失败运行
+- **Artifacts 下载永远是 zip**，单文件也一样 —— 这是 GitHub 的硬限制，没有参数能改。
+  想要「点开就是 apk」只能挂 Release 资产；本仓库不做（会往 Releases 页面塞一堆 PR 预发布），
+  接受 zip 即可。
+- **测试包不要用 `flutter build apk --debug`**：157MB（zip 71MB），下载和装机都慢。
+  改用 `PR_TEST_BUILD=1 flutter build apk --release` —— gradle 会给 release 追加
+  `.debug` 包名与 `-prtest` 版本后缀，CI 上无 `key.properties` ⇒ 签名落到 debug keystore。
+  体积回到 19MB，行为与正式版一致。
+- **`upload-artifact` 找不到文件时默认只 warn**，会产出「绿色但没有 Artifacts」的运行 ——
+  已设 `if-no-files-found: error`。看到「CI 没出包」先看是不是 0 job 的失败运行
   （workflow 表达式写错时 GitHub 会造一个 0 job 的 failure run，页面上只有一句
   `Invalid workflow file: …`）。
 - 包名带 `.debug` ⇒ 与正式版 `com.noworld.rootkit` 是两个 App，桌面图标同名，别点错。
