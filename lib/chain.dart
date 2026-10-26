@@ -558,12 +558,12 @@ class RootChain extends ChangeNotifier {
           got[name] = addr;
         }
       }
-      if (stext == null || got.isEmpty) {
-        _log('[diag-root:$tag] 内核符号不可读 ⇒ 跳过镜像核对（不影响后续）');
-        return;
-      }
-      if (allZero || stext == BigInt.zero) {
-        _log('[diag-root:$tag] /proc/kallsyms 返回全 0（kptr_restrict 挡着）⇒ 跳过镜像核对');
+      // 这里只应该在'压根没有 root'时才发生（有 root 就一定能把 kptr_restrict 关掉读到真值）。
+      // 所以不再输出含糊的'跳过核对'——读不到本身就说明有问题，要显式报出来。
+      if (stext == null || got.isEmpty || allZero || stext == BigInt.zero) {
+        _log('[diag-root:$tag] ⚠ 内核符号读取失败（读到 ${got.length} 个符号、'
+            '${allZero ? "全为 0x0" : "缺失 _stext"}）⇒ **本次核对无效**，'
+            '既不能判定一致也不能判定不一致；请把这一行报给作者');
         return;
       }
       final bad = <String>[];
