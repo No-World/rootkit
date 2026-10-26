@@ -508,32 +508,46 @@ class RootChain extends ChangeNotifier {
       'init_cred': 0x2563880,
     };
     try {
-      final cmd = 'echo ID=\$(id -u)'
+      // kptr_restrict=2 时 /proc/kallsyms 对所有非特权域返回全 0。
+      // 我们自己的 root shell 是 ID=0，临时关掉再读，读完写回原值。
+      final cmd = 'K=\$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null)'
+          '; echo ID=\$(id -u)'
           '; echo CTX=\$(id -Z 2>/dev/null)'
-          '; echo KPTR=\$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null)'
-          '; echo SU=\$(command -v su 2>/dev/null)'
-          '; echo KSUBIN=\$(ls /data/adb/ksu/bin 2>/dev/null | tr "\\n" ",")'
-          '; echo DMESG_TAIL=\$(dmesg 2>&1 | tail -1 | cut -c1-80)'
+          '; echo KPTR_OLD=\$K'
+          '; echo 0 > /proc/sys/kernel/kptr_restrict 2>/dev/null'
           '; grep -E " (_stext|selinux_state|init_task|commit_creds|prepare_kernel_cred|init_cred)\$"'
           ' /proc/kallsyms 2>/dev/null | head -8'
           '; echo ---DMESG-KSU---'
-          '; dmesg 2>/dev/null | grep -iE "ksu|kernelsu" | tail -10';
+          '; dmesg 2>/dev/null | grep -iE "ksu|kernelsu" | tail -6'
+          '; echo "\$K" > /proc/sys/kernel/kptr_restrict 2>/dev/null';
       final r = await ShizukuShell.run('echo ${_shq(cmd)} | nc 127.0.0.1 5556 2>&1');
-      final txt = r.out.trim();
-      if (txt.isNotEmpty) {
+      // 清洗 nc 回显的 shell 提示与续行标记
+      final lines = <String>[];
+      for (final raw in r.out.split('\n')) {
+        var l = raw.replaceAll('\r', '').trim();
+        if (l.isEmpty) continue;
+        if (l.startsWith("can't find tty fd")) continue;
+        if (l.contains("won't have full job control")) continue;
+        if (l.startsWith(':/data/local/tmp/rk #')) continue;
+        if (l.startsWith('>')) l = l.substring(1).trim();
+        if (l.isEmpty) continue;
+        lines.add(l);
+      }
+      if (lines.isNotEmpty) {
         _log('[diag-root:$tag]');
-        for (final l in txt.split('\n')) {
-          if (l.trim().isNotEmpty) _log('  $l');
+        for (final l in lines) {
+          _log('  $l');
         }
       }
-      // 解析符号表，算相对 _stext 的偏移
       BigInt? stext;
       final got = <String, BigInt>{};
-      for (final l in txt.split('\n')) {
-        final m = RegExp(r'^([0-9a-f]{8,16})\s+\S\s+(\w+)').firstMatch(l.trim());
+      var allZero = true;
+      for (final l in lines) {
+        final m = RegExp(r'^([0-9a-fA-F]{8,16})\s+\S\s+(\w+)').firstMatch(l);
         if (m == null) continue;
         final addr = BigInt.tryParse(m.group(1)!, radix: 16);
         if (addr == null) continue;
+        if (addr != BigInt.zero) allZero = false;
         final name = m.group(2)!;
         if (name == '_stext') {
           stext = addr;
@@ -542,7 +556,11 @@ class RootChain extends ChangeNotifier {
         }
       }
       if (stext == null || got.isEmpty) {
-        _log('[diag-root:$tag] 内核符号不可读（kptr_restrict 或 SELinux 拦截）⇒ 无法核对镜像');
+        _log('[diag-root:$tag] 内核符号不可读 ⇒ 跳过镜像核对（不影响后续）');
+        return;
+      }
+      if (allZero || stext == BigInt.zero) {
+        _log('[diag-root:$tag] /proc/kallsyms 返回全 0（kptr_restrict 挡着）⇒ 跳过镜像核对');
         return;
       }
       final bad = <String>[];
@@ -553,8 +571,7 @@ class RootChain extends ChangeNotifier {
           continue;
         }
         final off = a - stext;
-        final ok = off == BigInt.from(e.value);
-        if (!ok) {
+        if (off != BigInt.from(e.value)) {
           bad.add('${e.key}=0x${off.toUnsigned(64).toRadixString(16)}'
               '(期望0x${e.value.toRadixString(16)})');
         }
@@ -1940,7 +1957,8 @@ class RootChain extends ChangeNotifier {
       // 只在「模块确实注册进 sysfs」且「本 boot 还没试过」时才动 ksud install：
       // 往半加载的 KSU 模块发 prctl 有可能把内核打崩（真机出现过早期 panic，等 [crash] 证实）
       final ks = await _ksuState();
-      final sysfsOk = (ks['SYSFS'] ?? '0') == '1';
+      // 门控用 /proc/modules（有 kernelsu）而不是 /sys/module（后者在 KSU LKM 上可能是缺失的）
+      final sysfsOk = (ks['SYSFS'] ?? '0') == '1' || (ks['MODCNT'] ?? '0') != '0';
       final tried = await ShizukuShell.run(
           'ls /data/local/tmp/rk/.ksud_tried_\$(cat /proc/sys/kernel/random/boot_id) 2>/dev/null');
       if (!sysfsOk) {
@@ -1982,7 +2000,11 @@ class RootChain extends ChangeNotifier {
         ' · su=${(st['SU'] ?? '').isEmpty ? "缺失" : st['SU']}'
         ' · /data/adb/ksu=${(st['KSUDIR'] ?? '0') == '1' ? "已初始化" : "未初始化"}');
     if (modOk && !sysfs) {
-      _log('[ksu] ⚠ 模块在 /proc/modules 里但 /sys/module 没有它 ⇒ 可能是"载入即退出"或加载不完整');
+      // 真机实测：KernelSU LKM 报 "no extended symbol version for module_layout" /
+      // "overflow in relocation type 275"，sysfs 注册失败（/sys/module/kernelsu 确实不存在），
+      // 但 sucompat hook 已生效、su 可用 ⇒ 只记信息，不再当失败信号。
+      _log('[ksu] 注：/sys/module/kernelsu 不存在属已知现象（LKM 的 sysfs 注册失败），'
+          '最终以 su 是否可用为准');
     }
     await _diag('ksu');
     await _diagRoot('ksu');
@@ -2100,8 +2122,6 @@ class RootChain extends ChangeNotifier {
           '再回来重跑 ⑦⑧；若它打开后仍显示"未安装"，把本页日志发给作者（[diag-root] 里有内核镜像核对结果）';
     } else if (ksuLoaded && !appInstalled) {
       why = 'KernelSU 模块已加载，但没装 KernelSU 管理器 ⇒ 没有 su。装好管理器并打开一次，再重跑 ⑦⑧';
-    } else if (ksuLoaded && !sysfs) {
-      why = 'kernelsu 在 /proc/modules 但 /sys/module 没有它 ⇒ 加载不完整（看 dmesg 的 ksu 行）';
     } else if (!ksuLoaded) {
       why = 'su 不存在且 kernelsu 模块不在 /proc/modules ⇒ ⑦ 其实没成功，重跑 ⑦';
     } else {

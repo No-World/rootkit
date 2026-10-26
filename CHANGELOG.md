@@ -1,6 +1,17 @@
 # 变更记录
 
 ## v1.0.17 — 2026-10-26
+- **修两个误报 + 一个真机事实**：
+  · **内核镜像核对误报"不一致"**：`kptr_restrict=2` 时 `/proc/kallsyms` 对所有域返回全 0，
+    旧代码把 0x0 当成"偏移不符"⇒ 打出"这台机器的内核与本机标定不同"。已改成：
+    先在自己 ID=0 的 root shell 里临时把 `kptr_restrict` 置 0、读完写回原值；
+    若仍全 0 则输出「跳过镜像核对」而不是"不一致"。
+  · **`/sys/module/kernelsu` 缺失不是失败**：真机实测 `kernelsu` 在 `/proc/modules`（Live）、
+    `su -c id` = `uid=0 ... context=u:r:ksu:s0` 正常，但 `/sys/module/kernelsu` 确实不存在
+    （dmesg 里那条 `no extended symbol version for module_layout` /
+    `overflow in relocation type 275` 就是它的 sysfs 注册失败）。所以 ⑦ 的门控改用
+    `/proc/modules`，`/sys/module` 只作信息，不再拦 ksud install、也不再判失败。
+  · `[diag-root:*]` 输出清洗：去掉 `nc` 回显的 `:/data/local/tmp/rk #`、`> `、tty 警告。
 - **★ 修 panic 率过高（真凶：跑链期间还在每 3 秒做重活）**
   实测统计（App 自己的 app.log，同一台机器同一天）：
   · v1.0.16：8 次开打 → 7 次拿到判据（有泄漏/有 verdict），1 次中断
