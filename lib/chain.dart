@@ -1574,7 +1574,21 @@ class RootChain extends ChangeNotifier {
     //    而 userspace/ksud/src/utils.rs::install() 就是把自己拷到 /data/adb/ksud + 解出 assets + 建软链。
     //  ⇒ 我们已经有 root（⑥ 的自制模块），可以自己把这一步做掉，**不需要解锁 BL、不需要刷 boot.img**。
     if (await _ksuSuReady() == false) {
-      await _ksuUserspaceInstall();
+      // 只在「模块确实注册进 sysfs」且「本 boot 还没试过」时才动 ksud install：
+      // 往半加载的 KSU 模块发 prctl 有可能把内核打崩（真机出现过早期 panic，等 [crash] 证实）
+      final ks = await _ksuState();
+      final sysfsOk = (ks['SYSFS'] ?? '0') == '1';
+      final tried = await ShizukuShell.run(
+          'ls /data/local/tmp/rk/.ksud_tried_\$(cat /proc/sys/kernel/random/boot_id) 2>/dev/null');
+      if (!sysfsOk) {
+        _log('[ksu] 跳过用户态安装：/sys/module/kernelsu 不存在（模块没真正注册，戳它会崩）');
+      } else if (tried.out.trim().isNotEmpty) {
+        _log('[ksu] 本 boot 已试过 ksud 安装，跳过（避免重复戳内核）');
+      } else {
+        await ShizukuShell.run(
+            'touch /data/local/tmp/rk/.ksud_tried_\$(cat /proc/sys/kernel/random/boot_id)');
+        await _ksuUserspaceInstall();
+      }
     }
     // 3) 还没有 su ⇒ 把 KernelSU 管理器**拉起来一次**
     //    su/ksud 是管理器在"检测到内核"之后才释放到 /data/adb/ksu/bin 的，没人打开它就一直空着。

@@ -8,6 +8,9 @@
   探测时写进日志并在状态条显示「上次 panic」。
 - **打开 App 就开始检测**：`shizukuOk` 之前只在「开始」时置位，导致 5s 轮询的守卫永远拦着；
   现在 `refreshHealth` 一旦拿到数据就置位，授权后立即开跑（不需要先点开始）。
+- **ksud 用户态安装加两道闸**（因为测试版出现过早期 panic，怀疑与"往半加载的 KSU 模块发 prctl"有关）：
+  · `/sys/module/kernelsu` 不存在 ⇒ 直接跳过（模块没真正注册，戳它会崩）
+  · 每个 boot 只试一次（`/data/local/tmp/rk/.ksud_tried_<boot_id>` 标记），避免反复戳内核
 - **跑链时暂停轮询**：5s 一次的 shell spawn 会干扰竞态窗口（影响命中率/panic），运行期间自动停。
 - **新增「上次重启现场」采集**（`[crash]`）：拿到 root 后读 `/sys/fs/pstore/console-ramoops*`、
   `/proc/last_kmsg`、`sys.resettype`，把 `Kernel panic / Unable to handle / BUG: / Call trace`
