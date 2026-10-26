@@ -173,6 +173,37 @@ class RootChain extends ChangeNotifier {
     String g(String k) => _orig[k] ?? '(未记录)';
     _log('[env] 已记录原设置：屏幕超时=${g('T')} 常亮=${g('S')} '
         '飞行=${g('A')} wifi=${g('W')} bt=${g('B')}');
+
+    // ★ 落盘：panic 重启后进程的内存全没了，只有写盘才能在下一次开机时还原设置。
+    //   （用户踩过：一次 panic 之后屏幕超时/常亮/飞行就一直停在工具改过的值）
+    final body = _orig.entries.map((e) => '${e.key}=${e.value}').join('\n');
+    final b64 = base64Encode(utf8.encode(body));
+    await ShizukuShell.run('echo $b64 | base64 -d > $_optSnapPath 2>/dev/null');
+    _log('[env] 原设置已落盘：$_optSnapPath（panic 后下次开 App/开跑会自动还原）');
+  }
+
+  /// 选项快照文件（shell 可写；App 私有目录重启后还在，但 panic 后没法自动执行恢复）
+  String get _optSnapPath => '$workDir/opt_snapshot.txt';
+
+  /// 上次运行没走到「恢复」就结束（panic / 被杀 / 用户强退）⇒ 开机后自动按记录还原
+  Future<void> restoreLeftoverOptions() async {
+    try {
+      final r = await ShizukuShell.run('cat $_optSnapPath 2>/dev/null');
+      final txt = r.out.trim();
+      if (txt.isEmpty) return;
+      for (final line in txt.split('\n')) {
+        final i = line.indexOf('=');
+        if (i <= 0) continue;
+        final k = line.substring(0, i).trim();
+        final v = line.substring(i + 1).trim();
+        if ('TSAWB'.contains(k) && v.isNotEmpty && v != 'null') _orig[k] = v;
+      }
+      if (_orig.isEmpty) return;
+      _log('[opt] 发现上次运行遗留的设置快照（很可能是 panic 重启），正在按记录还原：'
+          '${_orig.entries.map((e) => '${e.key}=${e.value}').join(' ')}');
+      _optApplied = true;
+      await restoreOptions(all: true);
+    } catch (_) {}
   }
 
   /// 立刻关掉"屏幕常亮"（手动按钮用）
@@ -194,8 +225,12 @@ class RootChain extends ChangeNotifier {
   }
 
   /// 把选项改动过的系统设置恢复到运行前的状态
-  Future<void> restoreOptions() async {
-    if (!_optApplied) return;
+  Future<void> restoreOptions({bool all = false}) async {
+    if (!_optApplied) {
+      _log('[opt] 还没有记录运行前的原值（本次启动没跑过），无需恢复；'
+          '若只想关常亮，用「现在关闭常亮」按钮');
+      return;
+    }
     final b = StringBuffer();
     // 注意：这里不再判断 optStayOn —— 只要快照里记过，就按原值恢复。
     // （原来写成 `if (optStayOn && ...)`，用户中途关掉开关后反而恢复不了）
@@ -207,7 +242,7 @@ class RootChain extends ChangeNotifier {
     if (s0 != null && s0 != 'null') {
       b.write('settings put global stay_on_while_plugged_in $s0; ');
     }
-    if (optWifiOff) {
+    if (all || optWifiOff) {
       final a = _orig['A'];
       if (a != null) {
         b.write('settings put global airplane_mode_on $a; ');
@@ -222,6 +257,7 @@ class RootChain extends ChangeNotifier {
     if (b.isEmpty) return;
     b.write('true');
     final r = await ShizukuShell.run(b.toString());
+    await ShizukuShell.run('rm -f $_optSnapPath');
     _log('[env] 已恢复原设置（屏幕超时/常亮/飞行/WiFi/蓝牙）rc=${r.code}');
     _optApplied = false;
   }
@@ -866,6 +902,8 @@ class RootChain extends ChangeNotifier {
 
   Future<void> _runEnv() async {
     _stage(StageId.env, StageStatus.running, detail: '检查 Shizuku…');
+    // 上次 panic 遗留的设置快照：先把系统设置还原，再开始新一轮
+    await restoreLeftoverOptions();
     phase = '环境检查';
     shizukuOk = await ShizukuShell.checkPermission();
     if (!shizukuOk) {
@@ -977,6 +1015,8 @@ class RootChain extends ChangeNotifier {
 
   /// 自上而下探测设备现状：先从“最终目标”往回判，命中就一路跳过前面的步骤。
   Future<void> detectStatus() async {
+    // 先看有没有上次 panic 遗留的设置快照（有就还原掉，别让用户的超时/常亮一直停在工具值）
+    await restoreLeftoverOptions();
     skipReason.clear();
     alreadyRooted = false;
     final r = await ShizukuShell.run(

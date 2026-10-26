@@ -18,6 +18,14 @@
 - **修「打开 App / 授权后不自动开始检测」**：5s 轮询的守卫是 `if (!shizukuOk) return`，
   而 `shizukuOk` 只在 `refreshHealth` 成功时才置位 ⇒ 死锁，永远不轮询。改成用
   `ShizukuShell.checkPermission()`（binder，不 spawn 进程）先翻状态；授权后立即刷一次。
+- **★ 修「panic 之后系统设置回不去」**（用户实测：一次 panic 后屏幕超时一直是 30 分钟）
+  根因：原设置快照只存在内存里（`_orig`），panic 重启后进程消失 ⇒ 再也没有机会还原。
+  修法：快照**落盘**到 `/data/local/tmp/rk/opt_snapshot.txt`（`T/S/A/W/B` 五项 base64 写入），
+  下次打开 App（detectStatus）或开跑（② 入口）时检测到遗留快照就**按记录还原并删除**，
+  日志打 `[opt] 发现上次运行遗留的设置快照（很可能是 panic 重启），正在按记录还原：…`。
+  正常跑完仍走原来的 restore（同时删掉快照文件）。
+  现场证据：设备上 `screen_off_timeout=1800000`、`stay_on_while_plugged_in=15`（15 是用户自己
+  在开发者选项里开的），而快照文件不存在 —— 正是「panic 后内存快照丢失」的后果。
 - **选项里加两个手动按钮**：
   · 「现在关闭常亮（含开发者选项里的『保持唤醒』）」→ `svc power stayon false` +
     把 `screen_off_timeout` 恢复成运行前的值（没记录就 30s）。用户自己开过开发者选项的
