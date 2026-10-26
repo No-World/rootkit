@@ -1,0 +1,119 @@
+name: 问题反馈 · Bug 报告
+description: 闪退、卡在某阶段、命中率异常、重启、相机/系统异常等
+title: '[Bug] '
+labels: ['bug']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ### 先自查（能省你 80% 的时间）
+        1. 读 README §5「已知限制」，以及 Release 说明里的**已知问题**；
+        2. 确认 Shizuku 已安装、已授权、进程还活着（被系统杀掉会表现为「卡在 ①」）；
+        3. 确认屏幕常亮、已关 WiFi/蓝牙、机身不烫（>60°C 会降频，命中率直接归零）；
+        4. 命中失败属正常概率（单发 permissive ≈77% / cred 写 ≈59%），多点几次「开始」再看。
+
+        > ⚠️ 请不要在日志里贴一卡通号、账号、IMEI、手机号等隐私信息。
+
+  - type: input
+    id: device
+    attributes:
+      label: 机型
+      placeholder: 例如 荣耀 Magic9（MLY-AN00）
+    validations:
+      required: true
+
+  - type: input
+    id: system
+    attributes:
+      label: 系统版本 + 安全补丁
+      placeholder: 例如 MagicOS 11.0.0.110 / ASB 2026-09-01
+    validations:
+      required: true
+
+  - type: input
+    id: kernel
+    attributes:
+      label: 完整内核版本
+      description: '`uname -r` 或 `cat /proc/version` 的**整串**（差一个字符就算不同内核）'
+      placeholder: 6.12.58-android16-6-g3a7ac1674240-abogki541502914-4k
+    validations:
+      required: true
+
+  - type: input
+    id: appver
+    attributes:
+      label: 越狱助手版本
+      description: App 标题栏右侧的版本号
+      placeholder: 1.0.16
+    validations:
+      required: true
+
+  - type: dropdown
+    id: stage
+    attributes:
+      label: 卡在哪一步
+      options:
+        - '① SELinux → Permissive'
+        - '② 环境检查 / 校准'
+        - '③ 权限探测（候选进程）'
+        - '④ cap_bset 清零'
+        - '⑤ cap_effective 提权'
+        - '⑥ 加载内核模块'
+        - '⑦ 加载 KernelSU'
+        - '⑧ su 验证'
+        - 全部走完但 su 不可用
+        - 直接闪退 / 白屏
+        - 其它（现象里说明）
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: 现象
+      description: 你看到什么？期望是什么？
+      placeholder: 例如：点开始后 ④ 连续 3 次未命中，然后设备重启
+    validations:
+      required: true
+
+  - type: dropdown
+    id: reboot
+    attributes:
+      label: 过程中设备是否重启过
+      options: ['没有', '重启过 1 次', '重启过多次', '每次都重启']
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志
+      description: |
+        App 内「日志」卡片 → 全屏 → 「复制全部」粘贴到这里。
+        若设备重启过，重启后另外贴一份内核日志（最关键）：
+        ```
+        adb shell su -c 'dmesg | tail -200'      # 有 root 时
+        adb shell dmesg | tail -200              # 或
+        ```
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 其它补充（可选）
+      description: 是否改过内核/模块/系统分区？是否装过别的 root 方案（KSU/Magisk/APatch）？是否开过「成功后清理」？
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 确认
+      options:
+        - label: 我已阅读 README §5「已知限制」与对应 Release 说明
+          required: true
+        - label: 我知道这是自担风险的越狱工具，且我操作的是自有设备
+          required: true
+        - label: 日志中不含我的隐私信息（账号/IMEI/手机号等）
+          required: true

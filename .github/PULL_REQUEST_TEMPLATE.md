@@ -1,18 +1,23 @@
+## 选一个模板（点击下面的链接，PR 页面会带上对应结构）
+
+- [🐞 缺陷修复 `bugfix.md`](?template=bugfix.md) —— 现象 / 根因 / 修法 / 验证 四件套
+- [✨ 新功能 `feature.md`](?template=feature.md)
+- [📱 适配新机型/新内核 `adaptation.md`](?template=adaptation.md) —— 5 项标定值 + 真机验证清单
+- [🔧 构建 / CI / 文档 `chore.md`](?template=chore.md)
+
+---
+
+不确定选哪个？那就按下面这个最小结构写，四项缺一不可：
+
+```markdown
 ## 改了什么
 
-<!-- 一段话说清：改动了哪些文件/行为 -->
+## 为什么
 
-## 为什么改
+## 怎么验证的（可复现的判据）
 
-<!-- 现象 → 根因（有日志/tombstone 就贴关键几行） -->
+## 风险 / 回滚
+```
 
-## 怎么验证的
-
-<!-- 真机/CI 判据。例如：dmesg 报错条数 成片→0；相机 devices 0→23；整链 ROOT_OK -->
-
-## 检查清单
-
-- [ ] 只动了本 PR 声明的范围（没有顺手改别的）
-- [ ] 改了载荷/模块 → 注明了 md5 与来源
-- [ ] 改了阶段逻辑 → 已更新 CHANGELOG（现象/根因/修法/验证）
-- [ ] 不含私钥、`key.properties`、真实收款码、设备序列号/IP/口令
+> 分支规则：`main` 只收 PR；`feat/*` `fix/*` `chore/*` 开分支 → PR → `build-debug` 绿 → squash 合并。
+> 详见 [CONTRIBUTING.md](../CONTRIBUTING.md)。
