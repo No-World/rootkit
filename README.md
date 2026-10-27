@@ -61,6 +61,14 @@ KSU 加载成功后自动跳转 KernelSU。
     `physBase` / `selinux_state` 偏移 / 模块 vermagic / 离线符号表 不同而**在「环境检查」被拦住**；
   - 想支持别的内核，按 [§6 适配其他内核](#6-适配其他内核换机型--换内核版本) 重做 5 项标定；
 - **Shizuku** 已安装并运行（无线调试启动；重启后需重新启动）；
+- **KernelSU 管理器 App 必须已安装：`v3.3.1`**
+  （与本仓库 `assets/ksu_template.ko.gz` 同源；版本不同时 App 只在日志里警告，但可能对不上协议）。
+  **`su` 是这个管理器释放到 `/data/adb/ksu/bin` 的**，没装它 → 模块能加载、⑧ 一定没有 `su`。
+  环境检查会先探测：没装就直接拦下并提示，不会白跑几分钟。
+  **不需要点管理器里的「安装/修复」**——那是解锁后改 boot.img 的注入流程，与本路径无关：
+  App 在加载完模块后会自己执行 `libksud.so install`（KernelSU 源码里管理器"安装"按钮的第二步），
+  把 `/data/adb/ksud` 放好，`su` 才会被内核劫持出来（`kernel/feature/sucompat.c`）。
+  已实测同内核镜像的其它机型（荣耀 WIN RT2 / BRT-AN00）也能通过 ①–⑦。
 - 本 App 首次运行需在 Shizuku 弹窗里授权。
 
 > 说明：App 以 **shell（uid 2000）** 身份执行（Shizuku 通道），与 `adb shell` 等价；
@@ -128,9 +136,15 @@ cp android/key.properties.example android/key.properties    # 填自己的 keyst
   若你用的是旧版并已中招：**硬重启**恢复（软重启只重启 zygote，内核状态不变，无效）。
 
 
-- **单轮成功率 ≈65%**：唯一的统计性失败是"命中后 landing 失败 → 内核 panic 重启"（实测约 35%/轮）；
-  重启后需 `pm install -r` 重装（APK 常驻 `/data/local/tmp/rk_latest.apk`，约 30 秒），然后重跑。
-- 命中率受屏幕/温度/射频影响（App 每轮前会自动点屏 + 开飞行模式）；
+- **成功率（真机 120+ 发实测，详见 [`docs/04-benchmark.md`](docs/04-benchmark.md)）**：
+  `PRE_PIPES` 从 20000 调到 512 后，落位率 **62% → 80%**（A/B 各 26 发）。
+  失败主要是"命中后落位失败 → 内核 panic 重启"，统计上约 **10–30%**。
+  > 关于温度：网上常见"越热越差"的说法，**本项目自己的数据不支持**——
+  > 179 发里 15 次 panic 全部发生在 ≤34°C，≥35°C 的 32 发没有 panic。
+  > 但温度样本没有随机化（存在混杂），所以仍保留保守的温度闸（见选项「温度闸强度」），
+  > 只是它属于经验措施，不是被数据证明的结论。
+- panic 重启后需 `pm install -r` 重装（APK 常驻 `/data/local/tmp/rk_latest.apk`，约 30 秒），然后重跑。
+- 命中率还受屏幕/射频影响（App 每轮前会自动点屏 + 开飞行模式）；
 - permissive 零写会清掉 `selinux_state.initialized`，本链用 pwn4 模块在拿到 root 后恢复；
 - KSU 用的是 6.12.76 官方 LKM + kallsyms ABS 静态绑定（本机 69 个符号未导出），
   模块与内核结构体若有差异可能崩，属已知风险。
@@ -273,3 +287,4 @@ CI `build-debug` 绿了才合并。发版 = 合并进 `main` → 打 tag → 发
 | [`docs/01-cve-2026-64560.md`](docs/01-cve-2026-64560.md) | 漏洞机制、两个写原语、cred 两阶段写、模块加载三门槛、KSU 三种符号绑定、实测量化 |
 | [`docs/02-architecture.md`](docs/02-architecture.md) | App 架构：Shizuku 双接口、阶段机、资产流水线、5 项自动校准、体积与失败面 |
 | [`docs/03-roadmap.md`](docs/03-roadmap.md) | 适配其他内核的步骤、rootless 路径、稳定性与风险表、明确不做/不可达的项 |
+| [`docs/04-benchmark.md`](docs/04-benchmark.md) | **实测基准**：160+ 发参数 A/B（管道页预算、喷页量、delete 线程、阈值）、成功率/panic 统计、可复现命令与判定口径，以及「温度因素被数据推翻」的更正记录 |

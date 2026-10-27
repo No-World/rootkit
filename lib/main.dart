@@ -4,11 +4,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'chain.dart';
+import 'version.dart';
 import 'shizuku.dart';
 import 'github_icon.dart';
 
 /// 版本号（与 pubspec 的 version 保持一致）
-const String kAppVersion = '1.0.16';
+// 版本号在 lib/version.dart（chain.dart 也要用，避免循环 import）
 
 /// 项目主页（AppBar 与选项里都可一键跳转）
 const String kRepoUrl = 'https://github.com/No-World/rootkit';
@@ -52,7 +53,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   final ScrollController _logScroll = ScrollController();
   bool _shizuku = false;
   bool _stagesExpanded = false; // 阶段列表默认折叠
-  Timer? _shizukuPoll;          // Shizuku 授权状态轮询
+  Timer? _shizukuPoll;   // Shizuku 授权状态轮询（3s，仅 binder 查询）
+  Timer? _coolTick;   // 冷却倒计时用（1s，纯 UI，不 spawn shell）
   bool _pollBusy = false;
   bool _statusProbed = false;
 
@@ -64,6 +66,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     chain.loadOptions();
     _refreshShizuku();
     _startShizukuPoll();
+    chain.startHealthPolling();   // 空闲期每 5s 刷状态；跑链期间自动静默
     _maybeShowDisclaimer();
   }
 
@@ -73,6 +76,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _shizukuPoll = Timer.periodic(const Duration(seconds: 3), (_) => _pollShizuku());
   }
 
+  /// 约定：任何"额外的后台工作"（状态探测、更新检查、网络请求）都必须先看 [chain.busy]
+  /// —— 跑链期间一律不做，避免干扰竞态窗口（见 CHANGELOG v1.0.17 的 panic 分析）。
   Future<void> _pollShizuku() async {
     if (!mounted || _pollBusy) return;
     _pollBusy = true;
@@ -81,9 +86,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       if (!mounted) return;
       if (ok && !_shizuku) {
         setState(() => _shizuku = true);
-        _probeStatusOnce();
+        // 授权成功 ⇒ 立刻开始空闲期轮询（内部先刷一次健康条）
+        chain.startHealthPolling();
       } else if (ok && _shizuku) {
-        _probeStatusOnce();
+        // 这个 3s 定时器只负责"权限还活着吗"（binder 查询，不 spawn 进程）；
+        // 状态刷新交给 startHealthPolling 的 5s 轮询（空闲期才跑）。
       } else if (!ok && _shizuku) {
         // 权限查询可能滞后：用一条真实命令复核，避免图标闪跳
         final r = await ShizukuShell.run('echo RK_OK');
@@ -102,15 +109,36 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     if (state == AppLifecycleState.resumed) {
       _refreshShizuku();
       _startShizukuPoll();
+      chain.startHealthPolling();
     } else if (state == AppLifecycleState.paused) {
       _shizukuPoll?.cancel();
       _shizukuPoll = null;
+      chain.stopHealthPolling();
     }
   }
 
   bool _celebrated = false;
 
+  /// 冷却倒计时：只在「运行中或冷却中」时每秒刷一次 UI（纯 setState，不 spawn 任何进程）
+  void _ensureCoolTick() {
+    final need = chain.running || chain.startCooldownLeft > 0;
+    if (!need) {
+      _coolTick?.cancel();
+      _coolTick = null;
+      return;
+    }
+    _coolTick ??= Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      setState(() {});
+      if (!chain.running && chain.startCooldownLeft == 0) {
+        _coolTick?.cancel();
+        _coolTick = null;
+      }
+    });
+  }
+
   void _onChange() {
+    _ensureCoolTick();
     if (!mounted) return;
     setState(() {});
     if (chain.success && !_celebrated) {
@@ -152,6 +180,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   @override
   void dispose() {
     _shizukuPoll?.cancel();
+    _coolTick?.cancel();
+    chain.stopHealthPolling();
     WidgetsBinding.instance.removeObserver(this);
     chain.removeListener(_onChange);
     chain.dispose();
@@ -360,22 +390,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               ),
             ),
             const SizedBox(height: 7),
-            Padding(
-              padding: const EdgeInsets.only(bottom: 4),
-              child: Text(
-                  _shizuku
-                      ? (chain.devState.isEmpty
-                          ? '现状：正在探测…'
-                          : '现状：${chain.devState}')
-                      : 'Shizuku 未授权：点右上角盾牌图标授权后自动探测设备状态',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                      fontSize: 10.5,
-                      color: _shizuku
-                          ? const Color(0xFF4FA3E3)
-                          : const Color(0xFFD8A13A))),
-            ),
+            if (!_shizuku)
+              const Padding(
+                padding: EdgeInsets.only(bottom: 4),
+                child: Text('Shizuku 未授权：点右上角盾牌图标授权后自动探测设备状态',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontSize: 10.5, color: Color(0xFFD8A13A))),
+              ),
             _healthRow(),
             if (chain.lastError != null) ...[
               const SizedBox(height: 5),
@@ -392,16 +414,42 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
+  /// 状态条：**一行看完**设备现状（原来"现状"那行已并进来）
+  ///
+  /// 顺序按"越靠前越容易出问题"排：温度 → 内存/slab → SELinux → 模块/KSU 管理器/su/资产 → 内核。
+  /// 全部来自 5s 轮询的 health，不需要打开 App 后再点开始。
   Widget _healthRow() {
     final h = chain.health;
     final items = <String>[];
     final t = int.tryParse(h['T'] ?? '');
-    if (t != null) items.add('${(t / 1000).toStringAsFixed(1)}°C');
+    if (t != null && t > 0) {
+      // 分档与参考实现一致：≤40 最佳 / ≤55 可用 / >55 偏高
+      final tier = RootChain.tempTier(t);
+      final tag = tier == 0 ? '最佳' : (tier == 1 ? '可用' : '偏高');
+      items.add('${(t / 1000).toStringAsFixed(1)}°C $tag');
+    }
     if ((h['W'] ?? '').isNotEmpty) items.add(h['W']!);
-    if ((h['M'] ?? '').isNotEmpty) items.add('内存 ${h['M']}MB');
+    // M 现在是 '7G/14G' 形式（旧版是 14858/15011MB），别再加 MB 后缀
+    if ((h['M'] ?? '').isNotEmpty) items.add('内存 ${h['M']}');
     if ((h['P'] ?? '').isNotEmpty) items.add('posix ${h['P']}');
     if ((h['C'] ?? '').isNotEmpty) items.add('cred ${h['C']}');
     if ((h['E'] ?? '').isNotEmpty) items.add(h['E']!);
+    // 下面这几项原来在"现状：…"那一行，现在并进同一条状态带
+    final ksu = int.tryParse((h['K'] ?? '0').trim()) ?? 0;
+    final pwn = int.tryParse((h['G'] ?? '0').trim()) ?? 0;
+    if (ksu > 0) {
+      items.add('KSU 已加载');
+    } else if (pwn > 0) {
+      items.add('root 模块 $pwn');
+    } else {
+      items.add('KSU 未加载');
+    }
+    items.add(chain.ksuAppInstalled
+        ? '管理器 ${chain.ksuAppVersion.isEmpty ? "已装" : "v${chain.ksuAppVersion}"}'
+        : '管理器 未装');
+    items.add((h['S'] ?? '0').trim() == '1' ? 'su ✓' : 'su ✗');
+    if ((h['A'] ?? '').isNotEmpty) items.add('资产 ${h['A']}/4');
+    if (chain.lastResetType.toLowerCase().contains('panic')) items.add('上次 panic');
     final kv = chain.calib.kernelVersion;
     if (kv.isNotEmpty) {
       items.add('内核 ${kv.split('-').take(2).join('-')}');
@@ -781,110 +829,250 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Future<void> _showOptions() async {
+    final maxH = MediaQuery.of(context).size.height * 0.72;
     await showDialog<void>(
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx2, setSt) => AlertDialog(
-          title: const Row(
+          // 关闭按钮放在标题右侧（原来在最底部，屏幕矮时够不到）
+          titlePadding: const EdgeInsets.fromLTRB(20, 12, 8, 0),
+          contentPadding: const EdgeInsets.fromLTRB(20, 4, 12, 8),
+          title: Row(
             children: [
-              Icon(Icons.tune_rounded, size: 20),
-              SizedBox(width: 8),
-              Text('选项', style: TextStyle(fontSize: 16)),
-            ],
-          ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              SwitchListTile(
-                dense: true,
-                contentPadding: EdgeInsets.zero,
-                value: chain.optTap,
-                title: const Text('每轮自动点屏', style: TextStyle(fontSize: 14)),
-                subtitle: const Text('防止息屏/doze 让命中率归零（建议开）',
-                    style: TextStyle(fontSize: 11)),
-                onChanged: (v) async {
-                  await chain.setOptions(tap: v);
-                  if (ctx2.mounted) setSt(() {});
-                },
-              ),
-              SwitchListTile(
-                dense: true,
-                contentPadding: EdgeInsets.zero,
-                value: chain.optStayOn,
-                title: const Text('保持屏幕常亮', style: TextStyle(fontSize: 14)),
-                subtitle: const Text('运行期间不让屏幕熄灭（建议开）',
-                    style: TextStyle(fontSize: 11)),
-                onChanged: (v) async {
-                  await chain.setOptions(stayOn: v);
-                  if (ctx2.mounted) setSt(() {});
-                },
-              ),
-              SwitchListTile(
-                dense: true,
-                contentPadding: EdgeInsets.zero,
-                value: chain.optCleanup,
-                title: const Text('成功后清理残留文件', style: TextStyle(fontSize: 14)),
-                subtitle: const Text('停掉 5556 root shell、删除 /data/local/tmp/rk 里的原生件与临时文件'
-                    '（已加载的模块不受影响；下次运行会自动重新部署）',
-                    style: TextStyle(fontSize: 11)),
-                onChanged: (v) async {
-                  await chain.setOptions(cleanup: v);
-                  if (ctx2.mounted) setSt(() {});
-                },
-              ),
-              const Divider(height: 12),
-              Align(
-                alignment: Alignment.centerLeft,
-                child: TextButton.icon(
-                  onPressed: () async {
-                    Navigator.of(ctx).pop();
-                    setState(() => chain.phase = '校准中');
-                    await chain.calib.detect(log: chain.addLogFromCalib);
-                    if (mounted) {
-                      setState(() => chain.phase = '空闲');
-                      _showCalibDialog();
-                    }
-                  },
-                  icon: const Icon(Icons.biotech_rounded, size: 18),
-                  label: const Text('重新校准（5 项自动探测）', style: TextStyle(fontSize: 13)),
-                ),
-              ),
-              SwitchListTile(
-                dense: true,
-                contentPadding: EdgeInsets.zero,
-                value: chain.optWifiOff,
-                title: const Text('运行前关闭 WiFi / 蓝牙（开飞行模式）',
-                    style: TextStyle(fontSize: 14)),
-                subtitle: const Text('命中率更高（射频干扰更少）。代价：Shizuku 的无线调试会断开；'
-                    '重启后需要先重新打开 WiFi、在开发者选项里重新开启「无线调试」，'
-                    '才能再启动 Shizuku（或者用电脑 adb 启动，不需要 WiFi）',
-                    style: TextStyle(fontSize: 11)),
-                onChanged: (v) async {
-                  await chain.setOptions(wifiOff: v);
-                  if (ctx2.mounted) setSt(() {});
-                },
-              ),
-              const Divider(height: 14),
-              ListTile(
-                dense: true,
-                contentPadding: EdgeInsets.zero,
-                leading: const GithubMark(size: 20),
-                title: const Text('GitHub 项目主页', style: TextStyle(fontSize: 14)),
-                subtitle: const Text(kRepoUrl, style: TextStyle(fontSize: 11)),
-                trailing: const Icon(Icons.open_in_new_rounded, size: 16),
-                onTap: () {
-                  Navigator.of(ctx).pop();
-                  _openRepo();
-                },
+              const Icon(Icons.tune_rounded, size: 20),
+              const SizedBox(width: 8),
+              const Text('选项', style: TextStyle(fontSize: 16)),
+              const Spacer(),
+              IconButton(
+                tooltip: '关闭',
+                visualDensity: VisualDensity.compact,
+                icon: const Icon(Icons.close_rounded, size: 20),
+                onPressed: () => Navigator.of(ctx).pop(),
               ),
             ],
           ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(ctx).pop(),
-              child: const Text('关闭'),
+          // 设置项可上下滑动：内容比屏幕高时不再被截断
+          content: ConstrainedBox(
+            constraints: BoxConstraints(maxHeight: maxH),
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SwitchListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    value: chain.optTap,
+                    title: const Text('每轮自动点屏', style: TextStyle(fontSize: 14)),
+                    subtitle: const Text('息屏/doze 会让命中率归零',
+                        style: TextStyle(fontSize: 11)),
+                    onChanged: (v) async {
+                      await chain.setOptions(tap: v);
+                      if (ctx2.mounted) setSt(() {});
+                    },
+                  ),
+                  SwitchListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    value: chain.optStayOn,
+                    title: const Text('保持屏幕常亮', style: TextStyle(fontSize: 14)),
+                    subtitle: const Text('运行期间不让屏幕熄灭',
+                        style: TextStyle(fontSize: 11)),
+                    onChanged: (v) async {
+                      await chain.setOptions(stayOn: v);
+                      if (ctx2.mounted) setSt(() {});
+                    },
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.only(left: 2, bottom: 4),
+                    child: Align(
+                      alignment: Alignment.centerLeft,
+                      child: TextButton.icon(
+                        style: TextButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(horizontal: 4),
+                            minimumSize: const Size(0, 28),
+                            tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+                        icon: const Icon(Icons.brightness_2_rounded, size: 15),
+                        label: const Text('现在关闭常亮（含开发者选项里的「保持唤醒」）',
+                            style: TextStyle(fontSize: 11.5)),
+                        onPressed: () async {
+                          await chain.disableStayOnNow();
+                          if (ctx2.mounted) {
+                            ScaffoldMessenger.of(ctx2).showSnackBar(const SnackBar(
+                                content: Text('已关闭常亮并恢复屏幕超时')));
+                          }
+                        },
+                      ),
+                    ),
+                  ),
+                  SwitchListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    value: chain.optWifiOff,
+                    title: const Text('运行前打开飞行模式',
+                        style: TextStyle(fontSize: 14)),
+                    subtitle: const Text('射频干扰更少，命中率更高。'
+                        '代价：Shizuku 无线调试会断开，重启后要重新开「无线调试」'
+                        '（用电脑 adb 启动则不受影响）',
+                        style: TextStyle(fontSize: 11)),
+                    onChanged: (v) async {
+                      await chain.setOptions(wifiOff: v);
+                      if (ctx2.mounted) setSt(() {});
+                    },
+                  ),
+                  SwitchListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    value: chain.optDim,
+                    title: const Text('运行时把屏幕压到最暗',
+                        style: TextStyle(fontSize: 14)),
+                    subtitle: const Text('屏幕是 SoC 之外最大的热源；跑完自动恢复原亮度',
+                        style: TextStyle(fontSize: 11)),
+                    onChanged: (v) async {
+                      await chain.setOptions(dim: v);
+                      if (ctx2.mounted) setSt(() {});
+                    },
+                  ),
+                  ListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('参数集（PRE_PIPES）', style: TextStyle(fontSize: 14)),
+                    subtitle: Text(
+                        chain.optParamSet == ParamSet.classic
+                            ? 'classic = v1.0.16 参数：PRE_PIPES=20000，预建管道占满 64MB 预算，'
+                                '512KB 载体必然 EPERM，落位约 62%'
+                            : 'modern = 新版参数：PRE_PIPES=512，512KB 管道载体生效，'
+                                '落位约 80%（真机 A/B 各 26 发）',
+                        style: const TextStyle(fontSize: 11)),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 6),
+                    child: SegmentedButton<ParamSet>(
+                      style: const ButtonStyle(
+                        visualDensity: VisualDensity.compact,
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                      segments: const [
+                        ButtonSegment(value: ParamSet.modern, label: Text('modern')),
+                        ButtonSegment(value: ParamSet.classic, label: Text('classic')),
+                      ],
+                      selected: {chain.optParamSet},
+                      onSelectionChanged: (sel) async {
+                        await chain.setOptions(paramSet: sel.first);
+                        if (ctx2.mounted) setSt(() {});
+                      },
+                    ),
+                  ),
+                  ListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('温度闸强度', style: TextStyle(fontSize: 14)),
+                    subtitle: Text(chain.optTempGate.desc,
+                        style: const TextStyle(fontSize: 11)),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 6),
+                    child: SegmentedButton<TempGate>(
+                      style: const ButtonStyle(
+                        visualDensity: VisualDensity.compact,
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                      segments: const [
+                        ButtonSegment(value: TempGate.light, label: Text('轻度')),
+                        ButtonSegment(value: TempGate.normal, label: Text('中等')),
+                        ButtonSegment(value: TempGate.strict, label: Text('重度')),
+                      ],
+                      selected: {chain.optTempGate},
+                      onSelectionChanged: (sel) async {
+                        await chain.setOptions(tempGate: sel.first);
+                        if (ctx2.mounted) setSt(() {});
+                      },
+                    ),
+                  ),
+                  SwitchListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    value: chain.optKillBg,
+                    title: const Text('运行前清理第三方后台',
+                        style: TextStyle(fontSize: 14)),
+                    subtitle: const Text('系统服务、Shizuku、KernelSU 不动。'
+                        '后台少了更不容易失败（进而 panic）',
+                        style: TextStyle(fontSize: 11)),
+                    onChanged: (v) async {
+                      await chain.setOptions(killBg: v);
+                      if (ctx2.mounted) setSt(() {});
+                    },
+                  ),
+                  SwitchListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    value: chain.optCleanup,
+                    title: const Text('成功后清理残留文件', style: TextStyle(fontSize: 14)),
+                    subtitle: const Text('停掉 root shell、删掉 /data/local/tmp/rk 里的文件。'
+                        '已加载的模块不受影响，下次运行会自动重新部署',
+                        style: TextStyle(fontSize: 11)),
+                    onChanged: (v) async {
+                      await chain.setOptions(cleanup: v);
+                      if (ctx2.mounted) setSt(() {});
+                    },
+                  ),
+                  const Divider(height: 16),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: TextButton.icon(
+                      style: TextButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(horizontal: 4),
+                          minimumSize: const Size(0, 28),
+                          tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+                      icon: const Icon(Icons.restore_rounded, size: 15),
+                      label: const Text('立即恢复运行前的系统设置（超时/常亮/飞行模式）',
+                          style: TextStyle(fontSize: 11.5)),
+                      onPressed: () async {
+                        await chain.restoreOptions();
+                        if (ctx2.mounted) {
+                          ScaffoldMessenger.of(ctx2).showSnackBar(const SnackBar(
+                              content: Text('已恢复运行前的系统设置')));
+                        }
+                      },
+                    ),
+                  ),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: TextButton.icon(
+                      style: TextButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(horizontal: 4),
+                          minimumSize: const Size(0, 30),
+                          tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+                      onPressed: () async {
+                        Navigator.of(ctx).pop();
+                        setState(() => chain.phase = '校准中');
+                        await chain.calib.detect(log: chain.addLogFromCalib);
+                        if (mounted) {
+                          setState(() => chain.phase = '空闲');
+                          _showCalibDialog();
+                        }
+                      },
+                      icon: const Icon(Icons.biotech_rounded, size: 16),
+                      label: const Text('重新校准（5 项自动探测）',
+                          style: TextStyle(fontSize: 11.5)),
+                    ),
+                  ),
+                  const Divider(height: 16),
+                  ListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    leading: const GithubMark(size: 20),
+                    title: const Text('GitHub 项目主页', style: TextStyle(fontSize: 14)),
+                    subtitle: const Text(kRepoUrl, style: TextStyle(fontSize: 11)),
+                    trailing: const Icon(Icons.open_in_new_rounded, size: 16),
+                    onTap: () {
+                      Navigator.of(ctx).pop();
+                      _openRepo();
+                    },
+                  ),
+                ],
+              ),
             ),
-          ],
+          ),
         ),
       ),
     );
@@ -910,12 +1098,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     IconButton(
                       tooltip: '复制',
                       icon: const Icon(Icons.copy_rounded, size: 19),
-                      onPressed: () {
-                        Clipboard.setData(ClipboardData(text: lines.join('\n')));
-                        ScaffoldMessenger.of(ctx).showSnackBar(
-                          const SnackBar(content: Text('已复制到剪贴板')),
-                        );
-                      },
+                      onPressed: () =>
+                          _copyLogs(lines, label: '历史日志', ctx: ctx),
                     ),
                     IconButton(
                       icon: const Icon(Icons.close_rounded, size: 21),
@@ -1029,12 +1213,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                   IconButton(
                     tooltip: '复制',
                     icon: const Icon(Icons.copy_rounded, size: 19),
-                    onPressed: () {
-                      Clipboard.setData(ClipboardData(text: chain.logs.join('\n')));
-                      ScaffoldMessenger.of(ctx).showSnackBar(
-                        const SnackBar(content: Text('已复制到剪贴板')),
-                      );
-                    },
+                    onPressed: () => _copyLogs(chain.logs, ctx: ctx),
                   ),
                   IconButton(
                     tooltip: '关闭',
@@ -1084,12 +1263,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     IconButton(
                       tooltip: '复制',
                       icon: const Icon(Icons.copy_rounded, size: 19),
-                      onPressed: () {
-                        Clipboard.setData(ClipboardData(text: chain.logs.join('\n')));
-                        ScaffoldMessenger.of(ctx).showSnackBar(
-                          const SnackBar(content: Text('已复制到剪贴板')),
-                        );
-                      },
+                      onPressed: () => _copyLogs(chain.logs, ctx: ctx),
                     ),
                     IconButton(
                       tooltip: '关闭',
@@ -1227,6 +1401,36 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
+  /// 一键复制：把「版本 + 设备现状 + 阶段结果 + 日志」一起复制
+  ///
+  /// 只复制日志时，别人拿到截图/文本不知道你跑的是哪个版本、卡在哪个阶段；
+  /// 这里把这三样拼在头部，配合 App 里的 [diag:*] 行，远程排障不用再问一轮。
+  Future<void> _copyLogs(List<String> lines,
+      {String label = '日志', BuildContext? ctx}) async {
+    final buf = StringBuffer()
+      ..writeln('=== 越狱助手 v$kAppVersion $label ===')
+      ..writeln('时间: ${DateTime.now().toString().substring(0, 19)}')
+      ..writeln('设备: ${chain.devState}');
+    final bad = chain.stages
+        .where((s) => s.status == StageStatus.failed)
+        .map((s) => '${s.title}=${s.detail}')
+        .join(' | ');
+    if (bad.isNotEmpty) buf.writeln('失败阶段: $bad');
+    if (chain.lastError != null && chain.lastError!.isNotEmpty) {
+      buf.writeln('lastError: ${chain.lastError}');
+    }
+    buf
+      ..writeln('阶段: ${chain.stages.map((s) => '${s.title}=${s.status.name}').join(' ')}')
+      ..writeln('--- 日志 ${lines.length} 行 ---')
+      ..writeln(lines.join('\n'));
+    await Clipboard.setData(ClipboardData(text: buf.toString()));
+    final c = ctx ?? context;
+    if (!c.mounted) return;
+    ScaffoldMessenger.of(c).showSnackBar(
+      SnackBar(content: Text('已复制 ${lines.length} 行（含版本与阶段摘要）')),
+    );
+  }
+
   Widget _logCard() {
     return Card(
       key: _logCardKey,
@@ -1241,6 +1445,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 const Text('日志',
                     style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
                 const Spacer(),
+                IconButton(
+                  tooltip: '复制全部日志',
+                  visualDensity: VisualDensity.compact,
+                  icon: const Icon(Icons.copy_all_rounded, size: 18),
+                  onPressed: () => _copyLogs(chain.logs),
+                ),
                 IconButton(
                   tooltip: '上次运行日志',
                   visualDensity: VisualDensity.compact,
@@ -1283,14 +1493,23 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   Widget _buttons() {
     final busy = chain.running;
+    final cool = chain.startCooldownLeft;   // >0 = 冷却中，禁止再次点「开始」
     return Row(
       children: [
         Expanded(
           flex: 5,
           child: FilledButton.icon(
-            onPressed: busy ? null : () => chain.start(),
-            icon: const Icon(Icons.play_arrow_rounded, size: 18),
-            label: Text(busy ? '执行中…' : '开始越狱', style: const TextStyle(fontSize: 13)),
+            // 连点保护：运行中 或 冷却中 一律禁用（连点只会让设备反复重启升温）
+            onPressed: (busy || cool > 0 || !chain.canStart) ? null : () => chain.start(),
+            icon: Icon(busy
+                ? Icons.hourglass_top_rounded
+                : (cool > 0 ? Icons.thermostat_rounded : Icons.play_arrow_rounded),
+                size: 18),
+            label: Text(
+                busy
+                    ? '执行中…'
+                    : (cool > 0 ? '冷却中 ${cool}s' : '开始越狱'),
+                style: const TextStyle(fontSize: 13)),
             style: FilledButton.styleFrom(
               padding: const EdgeInsets.symmetric(vertical: 11),
             ),

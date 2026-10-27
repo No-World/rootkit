@@ -1,5 +1,195 @@
 # 变更记录
 
+## v1.0.17 — 2026-10-26
+- **★ 开打前预建管道数 20000 → 512（真机 A/B：落位率 63% → 88%）**：
+  uid 2000 的管道页预算 = `pipe-user-pages-soft` = 16384 页（64MB）。原来预建 20000 个 pipe
+  会把预算吃满，导致后面 `PIPE512` 的 512KB 管道载体 **100% 拿到 EPERM**
+  （62 份真机日志里 `v8_pipe first F_SETPIPE_SZ=-1 errno=1` 无一例外），只退化成 8KB×8000。
+  实测边界：`PRE_PIPES=2048` 也已是 `-1`（2048×8 页 = 16384，正好撞上限）。
+  A/B（冷机 25–32°C，与 App 的 permissive 阶段同一套 env，累计 120 发）：
+  · `PRE_PIPES=20000` → 16/26 = **62%**（panic 12%）
+  · `PRE_PIPES=512`   → 37/46 = **80%**（panic 7%），两组独立复现：88%、70%
+  · `PRE_PIPES=0`     → 13/20 = 65%（预建的那批 pipe 本身也在帮忙，不能省）
+  `PIPE512` 从 64 提到 128 实测无差异（85% vs 75–88%，n=20），故不动。
+- **新增「参数集（PRE_PIPES）」开关：modern（默认）/ classic**
+  · **modern**：`PRE_PIPES=512` ⇒ 512KB 管道载体能建起来，落位率约 **80%**（真机 A/B 各 26 发）
+  · **classic**：`PRE_PIPES=20000`（v1.0.16 的原参数）⇒ 预建管道占满 uid 2000 的 64MB 预算，
+    512KB 载体必然 EPERM，落位率约 **62%**
+  保留 classic 只为回退对比与排障；日常用 modern。
+
+- **温度闸改成三档可选（轻度 / 中等 / 重度）**：原来的"严格温度"开关只有开/关，
+  现在按真机数据给了三档量化参数：
+
+  | 档位 | 等到 ≤ | 最多等 | 等满仍 > 则放弃 |
+  |---|---|---|---|
+  | 轻度 | 48°C | 60s | 58°C |
+  | 中等（默认） | 44°C | 3 分钟 | 55°C |
+  | 重度 | 40°C | 6 分钟 | 50°C |
+
+  **注意**：最初写这三档时的依据（"冷机 80% / ≥50°C 42%"）**已被自己的数据推翻**——
+  那个 42% 是脚本把 11 行落位成功的记录误判成 `SKIP_boot` 丢弃导致的；如实计入是 18/19 = 95%，
+  且该组 0 次 panic。179 发里 15 次 panic 全在 ≤34°C。
+  所以这三档保留为**经验性保守措施**（>55°C 确实不建议开打），但不是被证明的温度曲线。
+
+- **新增选项「运行时把屏幕压到最暗」（默认开）**：跑链时屏幕没人看，而屏幕是 SoC 之外最大的热源。
+  快照新增亮度/亮度模式，跑完按原值恢复。
+- **修两个误报 + 一个真机事实**：
+  · **内核镜像核对误报"不一致"**：`kptr_restrict=2` 时 `/proc/kallsyms` 对所有域返回全 0，
+    旧代码把 0x0 当成"偏移不符"⇒ 打出"这台机器的内核与本机标定不同"。已改成：
+    先在自己 ID=0 的 root shell 里临时把 `kptr_restrict` 置 0、读完写回原值；
+    若仍全 0 则输出「跳过镜像核对」而不是"不一致"。
+  · **`/sys/module/kernelsu` 缺失不是失败**：真机实测 `kernelsu` 在 `/proc/modules`（Live）、
+    `su -c id` = `uid=0 ... context=u:r:ksu:s0` 正常，但 `/sys/module/kernelsu` 确实不存在
+    （dmesg 里那条 `no extended symbol version for module_layout` /
+    `overflow in relocation type 275` 就是它的 sysfs 注册失败）。所以 ⑦ 的门控改用
+    `/proc/modules`，`/sys/module` 只作信息，不再拦 ksud install、也不再判失败。
+  · `[diag-root:*]` 输出清洗：去掉 `nc` 回显的 `:/data/local/tmp/rk #`、`> `、tty 警告。
+- **★ 修 panic 率过高（真凶：跑链期间还在每 3 秒做重活）**
+  实测统计（App 自己的 app.log，同一台机器同一天）：
+  · v1.0.16：8 次开打 → 7 次拿到判据（有泄漏/有 verdict），1 次中断
+  · v1.0.17 测试版：**7 次开打 → 7 次全部在开打后中断（panic）**
+  温度不是原因（用户是在降温后跑的，且 v1.0.16 反而是 panic 重启后直接跑）。
+  差异在 v1.0.17 新增的重活：
+  · `detectStatus` 被 `_pollShizuku` **每 3 秒**调一次，而它新增了 `pm list packages`
+    （枚举全部包）与 `dumpsys package me.weishu.kernelsu`（整包 dump，几百毫秒 + 大量分配）；
+  · `refreshHealth` 每 5 秒还会读 `/proc/slabinfo`（要拿 slab 锁）与 `dumpsys power`。
+  这些在竞态窗口里反复分配/持锁 ⇒ 被 UAF 释放的 `posix_timers_cache` 页更容易被重新占用、
+  写入垃圾 ⇒ 删除循环读到垃圾指针 ⇒ panic。
+  修法：**跑链期间彻底静默**（3s 探测、5s 健康轮询全部跳过；`refreshHealth` 里也加 `running` 早退），
+  并把 `detectStatus` 的 KSU 探测改轻量（`pm path` 代替 `pm list packages`；`dumpsys package`
+  只在还没拿到版本时查一次）。
+- **修「打开 App / 授权后不自动开始检测」**：5s 轮询的守卫是 `if (!shizukuOk) return`，
+  而 `shizukuOk` 只在 `refreshHealth` 成功时才置位 ⇒ 死锁，永远不轮询。改成用
+  `ShizukuShell.checkPermission()`（binder，不 spawn 进程）先翻状态；授权后立即刷一次。
+- **★★ 修「选项改过的系统设置从来不还原」**（最要命的一条，v1.0.15/1.0.16 就有）
+  `restoreOptions()` 写好了，但**从来没被调用过**（全文只有定义，没有调用点）⇒ 跑完之后
+  `screen_off_timeout` 一直停在 30 分钟、`stay_on_while_plugged_in`（开发者选项里的
+  「保持唤醒」）一直停在 7。WiFi/飞行还能手动关，这个开关藏在开发者选项里很难改回来。
+  现在三处都会还原：**跑完一轮**（无论成败）、**用户点停止**、以及**下次打开 App**
+  （读遗留快照）。且恢复顺序把 `stay_on` 放在最前面。
+- **★ 修「panic 之后系统设置回不去」**（用户实测：一次 panic 后屏幕超时一直是 30 分钟）
+  根因：原设置快照只存在内存里（`_orig`），panic 重启后进程消失 ⇒ 再也没有机会还原。
+  修法：快照**落盘**到 `/data/local/tmp/rk/opt_snapshot.txt`（`T/S/A/W/B` 五项 base64 写入），
+  下次打开 App（detectStatus）或开跑（② 入口）时检测到遗留快照就**按记录还原并删除**，
+  日志打 `[opt] 发现上次运行遗留的设置快照（很可能是 panic 重启），正在按记录还原：…`。
+  正常跑完仍走原来的 restore（同时删掉快照文件）。
+  现场证据：设备上 `screen_off_timeout=1800000`、`stay_on_while_plugged_in=15`（15 是用户自己
+  在开发者选项里开的），而快照文件不存在 —— 正是「panic 后内存快照丢失」的后果。
+- **新增「开打前清理后台」选项（默认关闭）**：**只清理第三方 App 的后台进程**
+  （`pm list packages -3` ∩ 正在运行的进程 → `am kill <pkg>`，只杀可安全杀的后台；
+  系统/供应商服务、Shizuku、KernelSU 一律不动），并记录 `[killbg:*] 只清第三方后台：N 个（列表）· 进程 a → b`。
+  坑：① 不能用 `am kill-all`——真机上它把系统后台服务一起杀了；
+  ② 进程名要用 `ps -A -o args`，`-o NAME` 截断到 15 字符，长包名匹配不上。动机：后台 App 多时
+  ① 全局 pipe 页预算被占（日志里 `v8_pipe first F_SETPIPE_SZ=-1 errno=1`）、
+  ② 页回收竞争变强 ⇒ 落位失败 ⇒ panic。软重启即可全部恢复（进程本来会重建）。
+  同时新增 `[envprobe:*]`：每发前记录 唤醒态 / MemAvailable / Dirty / SwapFree / 进程数 /
+  前三大户，以及 `_ensureAwake()`（Dozing 时先点屏唤醒，唤不醒就放弃本轮）。
+- **选项里加两个手动按钮**：
+  · 「现在关闭常亮（含开发者选项里的『保持唤醒』）」→ `svc power stayon false` +
+    把 `screen_off_timeout` 恢复成运行前的值（没记录就 30s）。用户自己开过开发者选项的
+    「保持唤醒」时，一键就能关掉，不用等下一轮 restore。
+  · 「立即恢复运行前的系统设置（超时/常亮/飞行/WiFi/蓝牙）」→ 直接调 `restoreOptions()`。
+  顺带修一个 bug：`restoreOptions()` 原来写成 `if (optStayOn && …)`，用户在跑链中途关掉开关后
+  反而恢复不了超时/常亮；现在只要快照里记过就恢复。
+- **防连点/连跑**：点一次「开始」后按钮立刻不可用；一轮结束进入冷却
+  （成功 0s / 未成功 90s / **本轮检测到重启 180s**），按钮显示 `冷却中 123s` 倒计时，
+  冷却期内 `start()` 也会直接拒绝。理由：每次 panic 重启都在重新加热机身，
+  连点只会让设备在 68°C 上反复崩。
+- **双包共存提醒**：`.debug` 测试包与正式包同时装着时，两个 App 各自的 3s/5s 轮询会一起往
+  竞态窗口里 spawn shell（实测显著提高 panic 率）。② 预检会检测「正式包在运行」并提示：
+  `am force-stop com.noworld.rootkit` 或临时卸载它。
+- **开打前加温度闸（两级）**：**>40°C 只提醒**（照打，日志标 ⚠），**≥45°C 阻断**并等降温
+  （10s × 30 = 最多 5 分钟）；5 分钟仍 ≥45°C **放弃本轮**并提示关屏静置 10–15 分钟。
+  实测依据：连跑一小时后机身 68.2°C、load 19.7（8 核），此时连 v1.0.16 也开始 miss/panic ——
+  过热硬打等于白烧一次重启。
+- **「现状」并进状态条，一行看完**：原来「现状：…」单独占一行、且只有打开 App 的快照；
+  现在并进温度那条状态带（`温度 · 唤醒 · 内存 · posix · cred · SELinux · KSU/模块 ·
+  管理器 · su ✓/✗ · 资产 n/4 · 上次 panic · 内核`），与温度同一个 5s 轮询，不再单独占行。
+- **打开 App 就显示上次重启类型**：`sys.resettype`（如 `abnormal:AP_S_PANIC`）不需要 root 就能读，
+  探测时写进日志并在状态条显示「上次 panic」。
+- **打开 App 就开始检测**：`shizukuOk` 之前只在「开始」时置位，导致 5s 轮询的守卫永远拦着；
+  现在 `refreshHealth` 一旦拿到数据就置位，授权后立即开跑（不需要先点开始）。
+- **ksud 用户态安装加两道闸**（因为测试版出现过早期 panic，怀疑与"往半加载的 KSU 模块发 prctl"有关）：
+  · `/sys/module/kernelsu` 不存在 ⇒ 直接跳过（模块没真正注册，戳它会崩）
+  · 每个 boot 只试一次（`/data/local/tmp/rk/.ksud_tried_<boot_id>` 标记），避免反复戳内核
+- **检测逻辑按"是否在跑"分流**（最终版）：
+  · **空闲期**：`startHealthPolling()` 每 5s 刷健康条（温度/内存/slab/SELinux）。
+    打开 App、授权成功、切回前台都会立刻刷一次（不再等第一个 5s）。
+  · **运行期**：回到 v1.0.16 的行为 —— `refreshHealth` / `detectStatus` **一律不跑**，
+    只剩「开打前一次温度闸（`refreshHealth(force: true)` 的等价：直接读 thermal_zone0）」
+    与 20s 心跳里的 prep；跑完一轮后再统一刷一次。
+  · 统一判据 `chain.busy`（= running），以后接的更新检查/网络请求也必须先看它。
+- **跑链时暂停轮询**：5s 一次的 shell spawn 会干扰竞态窗口（影响命中率/panic），运行期间自动停。
+- **新增「上次重启现场」采集**（`[crash]`）：拿到 root 后读 `/sys/fs/pstore/console-ramoops*`、
+  `/proc/last_kmsg`、`sys.resettype`，把 `Kernel panic / Unable to handle / BUG: / Call trace`
+  的尾部十几行写进日志 —— 再遇到莫名重启，日志里直接有 panic 现场。
+- **CI 构建告警清理**：`compileOptions` 保持 Java 8，用 `-Xlint:-options` 关掉
+  `source value 8 is obsolete / target value 8 is obsolete` 这一类警告。
+  **不能**直接把它提到 17：AGP 8.1.0 + JDK 21 下 target 17 会触发 `JdkImageTransform` → `jlink`，
+  而 JDK 21 移除了 jlink 的 `system-modules` 插件 ⇒ 构建直接失败（已实测踩坑，见 build.gradle 注释）；
+  真要升 17 必须同时升 AGP 8.6+ / Gradle 8.7+。
+  `MaterialIcons-Regular.otf was tree-shaken … 99.7%` 是**正常提示**（图标字体按需裁剪，
+  1.6MB → 4.8KB），加 `--no-tree-shake-icons` 只会让包变大。
+- **测试包签名固定生效**：上一发验证 APK 的 `Signer #1 SHA-256` = `8F:CD:CE:47:…:D8:03:ED`，
+  从此 PR 测试包可直接覆盖安装（`adb install -r`），不再 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`。
+- **状态区（温度/唤醒/内存/slab/SELinux）改成每 5 秒主动刷新**
+  之前只在「运行中」的 20s 心跳里刷，空闲时温度一直是打开 App 时的旧值。
+  现在：前台每 5s 轮询（值没变化就不重绘整屏），回到前台立即刷一次，退到后台暂停；
+  同理修复了「温度显示不跟着变」导致的误判（机身已经 60°C，界面还显示 42°C）。
+- **测试包签名固定**（可覆盖安装）：见下条 commit 说明。
+- **日志一键复制**：日志卡片头部新增「复制全部日志」，全屏/历史日志的复制按钮也统一走同一逻辑。
+  复制内容是**自带上下文**的一段文本，直接贴进 Issue 就能定位：
+  ```
+  === 越狱助手 v1.0.17 日志 ===
+  时间: 2026-10-26 14:03:21
+  设备: SELinux=Enforcing · KSU 未加载 · KSU 管理器 v3.3.1 · su 不可用 · 资产 0/4
+  失败阶段: ⑧ su 验证=su 不存在 | …
+  lastError: …
+  阶段: ①=ok ②=ok … ⑧=failed
+  --- 日志 137 行 ---
+  …
+  ```
+- **修 `vv3.3.1`**：Honor 的 `dumpsys package` 输出自带 `v` 前缀（`versionName=v3.3.1`），
+  拼成 `" v$ver"` 就成了 `vv3.3.1`，还会让「管理器版本 ≠ 模板版本」假报警。现在统一规范化。
+- 原设置快照的日志把 `null` 显示成 `(未记录)`（Shizuku 尚未授权时取不到值，属正常）。
+- **⑦ 之后自动补做 KernelSU 的「用户态安装」**（这是本次真正的功能修复）
+  依据 KernelSU 源码，`su` 是**虚拟**的：`kernel/feature/sucompat.c` 把 `/system/bin/su`
+  在 `faccessat/newfstatat/execve` 上劫持到 **`/data/adb/ksud`**，且只有 `is_ksud_exists()`
+  为真才劫持 ⇒ 没有 `/data/adb/ksud` 时 `su` 就是 `ENOENT`（用户日志里那句
+  `su: inaccessible or not found`）。
+  而 `/data/adb/ksud` 是**管理器**跑 `libksud.so install --libadbroot … --data-path …` 生成的
+  （`userspace/ksud/src/utils.rs::install()`：把自己拷到 `/data/adb/ksud`、解 assets、建软链）。
+  本版在加载完模块后**自己跑这一条**（我们此时已有 root），
+  因此 **不需要点管理器的「安装」（那是解锁后改 boot.img 的注入流程）、也不需要解锁 BL**。
+  流程：等 su → 仍无则跑 ksud install → 仍无才拉起一次管理器 → 复查，每步都记日志。
+- **环境预检提前到 ② 一开始**（原来要跑到 ⑧ 才失败）：
+  · **没装 KernelSU 管理器 ⇒ 直接拦下**并说明（`su` 由管理器释放，不装它整条链到 ⑧ 必没有 su，
+    白跑 3–6 分钟）。要求 **KernelSU v3.3.1**（与本仓库 `ksu_template.ko` 同源），版本不同只警告。
+  · 打印 `/data/adb/ksu` 是否已初始化、`su` 当前路径。
+  · 启动探测（打开 App 即跑）的现状行也带上 `KSU 管理器 vX` / `su=路径`。
+- **⑦ 的"模块是否真的加载成功"改成三元判定**（用户反馈：模块在 /proc/modules 里但 KSU 不可用）：
+  · `/proc/modules` 有 `kernelsu`
+  · `/sys/module/kernelsu` 存在（区分"载入即退出"的假成功）
+  · `su` 是否存在（由管理器释放，与上两条无关）
+  三者分别打日志，⑧ 失败时按三元组合给出不同结论。
+- **新增分阶段自检日志（远程排障用）**：`[diag:env] / [diag:ksu] / [diag:verify-fail]`
+  与 `[diag-root:*]`（走自己的 root shell），一次截图就能定位：
+  · `ver= / zero= / alias= / phys=`：版本与零写落点（区分新旧版的关键）
+  · 机型指纹、`uname -r`、`getenforce`、`id -Z`
+  · 模块现状（`pwn*` / `kernelsu`）、KernelSU 管理器是否安装、`/data/adb/ksu` 是否存在
+  · `su` 在 4 条候选路径上的 `ls -l` 结果
+  · **内核镜像核对**：取 `_stext` 与 `selinux_state / init_task / commit_creds /
+    prepare_kernel_cred / init_cred`，算相对偏移与内置标定比对，打印 `5/5 一致` 或逐个不一致项
+    ⇒ 其它机型是否真的同一镜像，不用猜
+- **⑧ 修复：su 不再只在 PATH 里找**。KernelSU 的 su 由管理器释放到 `/data/adb/ksu/bin/su`，
+  有的机型在 `/system/xbin/su` 或 `/debug_ramdisk/su`；现在逐个试并记录每一条结果。
+- **⑧ 失败原因直接写清楚**（不再只报「su 不可用」）：
+  · 模块在、`/data/adb/ksu` 不存在 ⇒ 管理器没初始化（打开 KernelSU 按提示装一次）
+  · 模块在、管理器没装 ⇒ 装管理器
+  · 模块不在 ⇒ ⑦ 其实没成功
+- **⑦ 之后等 su 最多 10s**（管理器释放 su 有延迟），并把 `[diag:ksu]` 落进日志。
+- 版本号收口到 `lib/version.dart`（`chain.dart` 的日志也要用，避免循环 import）。
+
 ## v1.0.16 — 2026-10-25
 - **修复：跑完链后相机崩溃 / 系统服务连环崩（本次核心）**
   根因：零写原语是 8 字节 store，之前直接写 `selinux_state` 基址，会连带清零 +1 的 `initialized`

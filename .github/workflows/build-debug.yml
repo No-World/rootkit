@@ -1,7 +1,7 @@
 name: build-debug
 
 # 列表里一眼看出这是哪个 PR / 哪个分支（旧版直接显示 '2/merge'，看不出是什么）
-run-name: debug ${{ github.head_ref || github.ref_name }}
+run-name: debug ${{ github.head_ref || github.ref_name }} @ ${{ github.sha }}
 
 # PR / main（合并结果）/ 手动。只在 PR 和 main 上跑：
 # 以前对 push 用了 branches: ['**']，导致「推分支」+「开/更新 PR」同一提交触发两份一样的构建。
@@ -25,6 +25,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
+      # 固定 debug 签名 key（仓库 Secret）。放在 job 级：step 级 env 在 if 里不生效。
+      DEBUG_KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
     steps:
       - uses: actions/checkout@v5
 
@@ -41,16 +43,50 @@ jobs:
 
       # 可选：固定 debug 签名 key。不提供时 runner 每次生成新 key ⇒ 不同次构建之间覆盖安装会签名冲突。
       # 注意：secrets 不能在 steps[*].if 里直接引用（会让整份 workflow 校验失败），要用 env 中转。
-      - name: Use stable debug keystore (optional)
-        env:
-          DEBUG_KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+      # 缓存 1：Gradle 依赖 + 构建缓存（Flutter 的 Android 构建里最耗时的一段）
+      # 命中时 android 侧几乎不用重新下载 AGP/Kotlin/依赖；改代码只重编增量部分。
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/**/*.gradle', 'android/**/*.gradle.kts', 'android/gradle/wrapper/gradle-wrapper.properties', 'android/gradle.properties', 'pubspec.lock') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      # 缓存 2：pub 包（flutter_svg / shizuku 等）
+      - name: Cache pub
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('pubspec.lock') }}
+          restore-keys: |
+            pub-${{ runner.os }}-
+
+      # 固定测试包签名 key。
+      # 坑 1：不固定 ⇒ runner 每次生成新 key，覆盖安装报 INSTALL_FAILED_UPDATE_INCOMPATIBLE。
+      # 坑 2：把 key 写到 ~/.android/debug.keystore **没用** —— 实测 CI 上 AGP 仍用自己生成的那把
+      #       （APK 证书指纹 ≠ 放进去的 keystore），所以这里解到 workspace 并用 PR_TEST_KEYSTORE
+      #       传给 gradle（见 android/app/build.gradle 的 signingConfigs.prtest）。
+      - name: Decode test signing key
         if: env.DEBUG_KEYSTORE_B64 != ''
         run: |
-          mkdir -p ~/.android
-          echo "$DEBUG_KEYSTORE_B64" | base64 -d > ~/.android/debug.keystore
-          ls -la ~/.android/debug.keystore
+          mkdir -p "$GITHUB_WORKSPACE/ci"
+          echo "$DEBUG_KEYSTORE_B64" | base64 -d > "$GITHUB_WORKSPACE/ci/test.keystore"
+          chmod 600 "$GITHUB_WORKSPACE/ci/test.keystore"
+          keytool -list -keystore "$GITHUB_WORKSPACE/ci/test.keystore" -storepass android \
+            -alias androiddebugkey | grep -iE "androiddebugkey|SHA-256" || true
+          echo "PR_TEST_KEYSTORE=$GITHUB_WORKSPACE/ci/test.keystore" >> "$GITHUB_ENV"
 
-      - run: flutter pub get
+      - name: Warn if debug keystore is not pinned
+        if: env.DEBUG_KEYSTORE_B64 == ''
+        run: |
+          echo "::warning::未配置 DEBUG_KEYSTORE_B64 ⇒ 本次测试包用的是 runner 随机生成的 debug key，"
+          echo "::warning::下次构建的包无法覆盖安装（会报 INSTALL_FAILED_UPDATE_INCOMPATIBLE）。"
+
+      - run: flutter pub get --no-precompile
 
       # 测试包用 release 构建（AOT）而不是 debug：
       #   实测体积 app-debug.apk 157MB（artifact 71MB） vs app-release.apk 19MB ⇒ 省 3.7 倍
@@ -63,7 +99,7 @@ jobs:
           # 版本号从 pubspec 取，避免 gradle 与 pubspec 不一致
           ver=$(sed -n 's/^version: *\([0-9.]*\)+.*/\1/p' pubspec.yaml | head -1)
           bn=$(sed -n 's/^version: *[0-9.]*+\([0-9]*\).*/\1/p' pubspec.yaml | head -1)
-          flutter build apk --release --target-platform android-arm64 \
+          flutter build apk --release --target-platform android-arm64 --no-pub \
             --build-name "$ver" --build-number "$bn"
 
       # 产物名带版本 + PR 号，手机上看得懂是哪个包
@@ -71,10 +107,13 @@ jobs:
         id: pack
         run: |
           VER=$(sed -n 's/^version: *\([0-9.]*\)+.*/\1/p' pubspec.yaml | head -1)
+          # 一律带提交短哈希：PR 包以前只写 pr4，多次提交后分不清装的是哪一版
+          # （实测踩过：手机上是旧包，拿着新代码的结论去解释旧包的行为）
+          SHA7=$(echo '${{ github.sha }}' | cut -c1-7)
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            SUF="pr${{ github.event.pull_request.number }}"
+            SUF="pr${{ github.event.pull_request.number }}-${SHA7}"
           else
-            SUF="$(echo '${{ github.ref_name }}' | tr '/' '-')-$(echo '${{ github.sha }}' | cut -c1-7)"
+            SUF="$(echo '${{ github.ref_name }}' | tr '/' '-')-${SHA7}"
           fi
           NAME="RootKit-v${VER}-${SUF}-test"
           mkdir -p out
@@ -88,6 +127,10 @@ jobs:
           VC=$(sed -n "s/^package: .* versionCode='\([^']*\)'.*/\1/p" /tmp/badging.txt | head -1)
           MD5=$(md5sum "out/${NAME}.apk" | cut -d' ' -f1)
           echo "${MD5}  ${NAME}.apk" > "out/${NAME}.apk.md5"
+          # 签名证书指纹：跨次构建应完全一致（debug key 固定后）
+          CERT=$("$BT/apksigner" verify --print-certs "out/${NAME}.apk" 2>/dev/null \
+                   | sed -n "s/^Signer #1 certificate SHA-256 digest: //p" | head -1)
+          echo "CERT=$CERT" >> "$GITHUB_ENV"
           SIZE=$(du -h "out/${NAME}.apk" | cut -f1)
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
           echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
@@ -102,6 +145,7 @@ jobs:
             echo "| 大小 | ${SIZE} |"
             echo "| 签名 | debug key（**不能**覆盖正式版，可与正式版共存） |"
             echo "| 构建 | release / AOT（与正式版同构，非 JIT debug 包） |"
+            echo "| 签名证书 SHA-256 | \`${CERT:-未知}\` |"
             echo "| md5 | \`${MD5}\` |"
             echo ""
             echo "下载：本页底部 **Artifacts → ${NAME}**（GitHub 强制打包成 zip，解压即为 apk）。"

