@@ -227,7 +227,7 @@ KSYMS_NEED=<KSU LKM 的 UND 名单> python3 scripts/mk_symtab.py kallsyms_<ver>.
   `/proc/kallsyms`（WSL/x86 开发机上就是宿主内核），静默把宿主符号当成目标内核的。
   自检：恢复的 `__start_BTF` 相对 `_text` 偏移必须等于镜像内 BTF 段的真实文件偏移。
 
-**仓库与打包的分工**（v1.0.18 起）
+**仓库与打包的分工**（v1.1.0 起）
 
 | 位置 | 内容 | 谁生成 |
 |---|---|---|
