@@ -1,7 +1,7 @@
 name: build-debug
 
 # 列表里一眼看出这是哪个 PR / 哪个分支（旧版直接显示 '2/merge'，看不出是什么）
-run-name: debug ${{ github.head_ref || github.ref_name }}
+run-name: debug ${{ github.head_ref || github.ref_name }} @ ${{ github.sha }}
 
 # PR / main（合并结果）/ 手动。只在 PR 和 main 上跑：
 # 以前对 push 用了 branches: ['**']，导致「推分支」+「开/更新 PR」同一提交触发两份一样的构建。
@@ -107,10 +107,13 @@ jobs:
         id: pack
         run: |
           VER=$(sed -n 's/^version: *\([0-9.]*\)+.*/\1/p' pubspec.yaml | head -1)
+          # 一律带提交短哈希：PR 包以前只写 pr4，多次提交后分不清装的是哪一版
+          # （实测踩过：手机上是旧包，拿着新代码的结论去解释旧包的行为）
+          SHA7=$(echo '${{ github.sha }}' | cut -c1-7)
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            SUF="pr${{ github.event.pull_request.number }}"
+            SUF="pr${{ github.event.pull_request.number }}-${SHA7}"
           else
-            SUF="$(echo '${{ github.ref_name }}' | tr '/' '-')-$(echo '${{ github.sha }}' | cut -c1-7)"
+            SUF="$(echo '${{ github.ref_name }}' | tr '/' '-')-${SHA7}"
           fi
           NAME="RootKit-v${VER}-${SUF}-test"
           mkdir -p out

@@ -309,6 +309,10 @@ class RootChain extends ChangeNotifier {
     final m = _orig['M'];
     if (m != null && m != 'null') {
       b.write('settings put system screen_brightness_mode $m; ');
+    } else if (optDim) {
+      // 快照缺失（首次运行就 panic / 读取失败）时也必须把**自动亮度**恢复回来：
+      // 压暗时我们写了 mode=0（关掉自动亮度），不恢复就等于永久改成手动。
+      b.write('settings put system screen_brightness_mode 1; ');
     }
     if (l != null && l != 'null') {
       b.write('settings put system screen_brightness $l; ');
