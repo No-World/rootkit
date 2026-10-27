@@ -192,14 +192,49 @@ cd /data/local/tmp/rk && env \
   ./x645
 ```
 
-判定（读日志尾部）：
+判定（**只认原生日志的尾部**，见下节为什么不能靠 `sys.resettype`）：
 
 | 日志尾部 | 归类 |
 |---|---|
-| `stage_all_done` + `leak=0x…` | 落位成功 |
-| `stage_all_done` + `leak=0` / `stage0_failed_no_leak` | 未命中 |
-| `v8_reaping victim=…` 之后无输出 | panic（kill 相位） |
-| `concurrent spray start …` 之后无输出 | panic（喷页相位） |
+| `stage_all_done` / `stage_done … leak=0x…` | 落位成功 |
+| `stage_done … leak=0` / `stage0_failed_no_leak` | 未命中（shot 正常结束）|
+| `v8_reaping victim=…` 之后无输出 | **panic**（kill 相位）|
+| `concurrent spray start …` 之后无输出 | **panic**（喷页相位）|
+
+### 6.1 判 panic 别用 `sys.resettype`（实测推翻）
+
+有一段时间我用 `getprop sys.resettype` 做权威判据：
+
+```
+abnormal:AP_S_PANIC  → panic
+others:UNKNOWN       → 干净重启
+```
+
+2026-10-27 的实测把这个假设推翻了：一轮 P2 第二次 shot 的日志明确停在
+`v8_reaping victim=29766`（典型的 UAF panic 现场），设备也确实重启了，
+但重启后读到的却是 **`resettype=others:UNKNOWN` / `bootreason=reboot,shell`**。
+
+⇒ 这台设备（Honor MagicOS 11）对某些内核崩溃**不写 `AP_S_PANIC`**。
+`resettype` 只能用来判断“有没有重启”，**不能**用来判断“是不是 panic”。
+
+**正确判据**：设备重启后，把该轮的原生日志拉下来看尾部——
+只要最后一行是 `v8_reaping` / `concurrent spray start` 且后面没有
+`bootid_after_reap` / `stage_all_done`，就是 panic。
+
+### 6.2 shot 级 panic 率（26 份原生日志全量）
+
+| 结局 | 数量 |
+|---|---|
+| 正常结束（有/无落位） | 21 |
+| `PANIC_reap` | 4 |
+| `PANIC_spray` | 1 |
+
+**单发 shot 的 panic 率 ≈ 19%（5/26）**。因为一轮要打好几发
+（permissive 1–3 + P1 1–3 + P2 1–3），所以“整轮 panic 概率”会被放大：
+一轮 3 发时约 47%，5 发时约 65%（按每发独立估算）。
+
+这解释了为什么“有的轮全绿、有的轮崩”——**不是某一组/某个参数的锅，
+而是一轮里 shot 数量的函数**。
 
 跑完脚本会 `setenforce 1` 复位 SELinux，保持两臂条件一致。
 每轮记录温度、`F_SETPIPE_SZ` 返回值、充电状态与 CPU 频率。
