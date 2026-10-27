@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """mk_symtab.py — 从 kallsyms 转储生成离线符号表（相对 _text 链接地址的偏移）
 
-用法: python3 mk_symtab.py <kallsyms.txt> <out.bin.gz>
+用法: python3 mk_symtab.py <kallsyms.txt> <out.bin.gz> [--need FILE] [--need-only]
 
 输入格式（两种都支持）:
   1) /proc/kallsyms 运行时转储:  "地址 类型 名字"，行尾可能带 "\\[modname\\]"
@@ -10,13 +10,14 @@
 锚点:  偏移 = addr − _text（从转储自身解析 _text，无任何硬编码链接基址；
        KASLR slide 在减法中自然消去）。ksupatch 侧用 --link <该内核链接 _text>
        --slide <泄漏 slide> 还原绝对地址。
-过滤:  运行时转储保留全局 T/D/B/R 类型 + --need 列表；镜像恢复转储没有类型
-       列，自动从转储自身的 __ksymtab_* 符号推导导出集，再并入 KSYMS_NEED
-       （KSU LKM 实际 UND 名单，含故意绑定的未导出符号）。
-       原理：模块只能合法导入导出符号；KSU 模板额外绑定的未导出符号由 need
-       名单先期兑底 —— 不用 BTF linkage（荣耀管线会丢）。同名 static 遮蔽
-       全局导出的风险因此被限定在 need 名单内（导出符号全局唯一；实测仅
-       5 个导出存在同名双地址且均不在 KSU 依赖里，首见取低地址=代码区本体）。
+过滤:
+  * 运行时转储(带类型列)：保留全局 T/D/B/R 类型 + --need 名单
+  * 镜像恢复转储(无类型列)：导出符号（自转储自身的 __ksymtab_* 推导）∪ --need
+    原理：模块只能合法导入导出符号；KSU 模板额外绑定的未导出符号由 need
+    名单先期兜底 —— 不用 BTF linkage（厂商管线可能丢）。同名 static 遮蔽
+    全局导出的风险因此被限定在 need 名单内。
+  * --need-only：只保留 --need 名单里的名字。用于构建时按当前 KSU LKM 的
+    UND 清单裁剪出最小表（几 KB）；全量源仍存档在 assets/symtab_src/。
 """
 import re, sys, gzip, os
 
@@ -44,9 +45,16 @@ def load(path):
     return syms, text
 
 def main():
-    if len(sys.argv) < 3:
-        sys.exit('用法: mk_symtab.py <kallsyms.txt> <out.bin.gz>')
-    src, out = sys.argv[1], sys.argv[2]
+    argv = sys.argv[1:]
+    need_only = '--need-only' in argv
+    argv = [a for a in argv if a != '--need-only']
+    if '--need' in argv:
+        i = argv.index('--need')
+        os.environ['KSYMS_NEED'] = argv[i + 1]
+        del argv[i:i + 2]
+    if len(argv) < 2:
+        sys.exit('用法: mk_symtab.py <kallsyms.txt> <out.bin.gz> [--need FILE] [--need-only]')
+    src, out = argv[0], argv[1]
     syms, text = load(src)
     if not text:
         sys.exit('未找到 _text，dump 可能不完整（需要包含 _text 符号）')
@@ -66,7 +74,11 @@ def main():
         off = a - text
         if not (0 <= off < 2**32):
             continue
-        if typed:
+        if need_only:
+            # 构建时裁剪：只保留当前模块实际导入的名字
+            if n in need:
+                rows.append((n, off))
+        elif typed:
             # 运行时转储: 只保留全局 TDBR + need（模块常用导出）
             if t.upper() in keep and (t.isupper() or n in need):
                 rows.append((n, off))
@@ -78,9 +90,9 @@ def main():
     blob = ('\n'.join(f'{n}\t{o:x}' for n, o in rows) + '\n').encode()
     gz = gzip.compress(blob, 9)
     open(out, 'wb').write(gz)
-    print(f'typed={typed} symbols={len(rows)} raw={len(blob)/1048576:.2f}MB '
-          f'gz={len(gz)/1024:.0f}KB anchor=_text@{text:#x} '
-          f'exports={len(exports)} -> {out}')
+    print(f'typed={typed} need_only={need_only} symbols={len(rows)} '
+          f'raw={len(blob)/1048576:.2f}MB gz={len(gz)/1024:.0f}KB '
+          f'anchor=_text@{text:#x} exports={len(exports)} need={len(need)} -> {out}')
     d = dict(rows)
     print('self-check: _stext=%s selinux_state=%s memstart_addr=%s' % (
         hex(d.get('_stext', -1)), hex(d.get('selinux_state', -1)),

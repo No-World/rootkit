@@ -202,7 +202,9 @@
   - 自制模块常量：task_struct.cred@0x820 / real_cred@0x818、struct module 大小 1536
     （init@392/name@24 与 6.12 相同）—— pwn_mod.c 参数化后同一源编译两套；
   - KSU 模板换官方 android15-6.6 LKM（v3.3.1），符号绑定继续走 ksupatch；
-  - 离线符号表 87KB（9,170 符号 = 导出集 ∪ KSU UND），**KSU 6.6 的 225 个 UND 全覆盖**。
+  - 离线符号表：**全量源入库存档**（`assets/symtab_src/*.txt.xz`，697KB / 110,146 符号），
+    **APK 只打包按当前 KSU LKM 的 UND 清单裁剪出的最小表**（2KB / 225 符号，覆盖率 225/225）
+    —— 由 `scripts/build_symtabs.sh` 在构建前生成，CI 已接入；KSU 换版本自动跟随。
 - **标定纪律（血泪教训，务必遵守）**：用 ghostlock-extract 分析镜像时必须设
   `GHOSTLOCK_NO_PROC_KALLSYMS=1`。否则工具会优先读宿主机的 `/proc/kallsyms`
   （WSL/x86 开发机上就是**宿主内核**），静默把宿主的符号表当成目标内核的 ——

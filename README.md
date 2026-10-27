@@ -223,8 +223,19 @@ KSYMS_NEED=<KSU LKM 的 UND 名单> python3 scripts/mk_symtab.py kallsyms_<ver>.
 - 表里有 69 个**未导出**符号（`ksupatch` 用绝对地址绑定），所以符号表是必需的，不能靠 `kallsyms_lookup_name`。
 - 锚点：偏移一律相对 `_text`（从转储自身解析，无硬编码链接基址；旧 6.12 表同锚定，实测兼容）；
   镜像恢复路径的过滤集 = 导出符号（自 `__ksymtab_*` 推导）∪ `KSYMS_NEED`。
-- 已知局限（镜像路径）：恢复器拿不到极少数符号（C901 实测 12/225 UND 缺失，如
-  `__arch_copy_from_user`）—— 离线兑底表不完整；⑥ 主路径读真机 `/proc/kallsyms` 不受影响。
+- ⚠️ **分析镜像时必须设 `GHOSTLOCK_NO_PROC_KALLSYMS=1`**：否则工具会优先读宿主机
+  `/proc/kallsyms`（WSL/x86 开发机上就是宿主内核），静默把宿主符号当成目标内核的。
+  自检：恢复的 `__start_BTF` 相对 `_text` 偏移必须等于镜像内 BTF 段的真实文件偏移。
+
+**仓库与打包的分工**（v1.0.18 起）
+
+| 位置 | 内容 | 谁生成 |
+|---|---|---|
+| `assets/symtab_src/<ver>.txt.xz` | **全量** kallsyms 转储（存档，可追溯） | 人工（真机 dump 或镜像恢复） |
+| `assets/kallsyms_<ver>.bin.gz` | **按当前 KSU LKM 的 UND 清单裁剪**的最小表（几 KB） | `scripts/build_symtabs.sh`（CI 构建前自动跑） |
+
+KSU 升级/换模板后，`build_symtabs.sh` 会自动从新的 `assets/ksu_template*.ko.gz` 读 UND 重新裁剪，
+不需要手工维护符号清单；需要更大覆盖面时去掉 `--need-only` 即可退回“导出集 ∪ UND”（约 90KB）。
 
 **③ 校准 cred 布局 / tracepoint id**（App 自动，可在日志核对）
 

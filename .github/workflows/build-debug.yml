@@ -95,6 +95,10 @@ jobs:
       #   实测体积 app-debug.apk 157MB（artifact 71MB） vs app-release.apk 19MB ⇒ 省 3.7 倍
       # PR_TEST_BUILD=1 让 gradle 给 release 版本追加 applicationIdSuffix ".debug"；
       # CI 上没有 key.properties ⇒ 签名落到 debug keystore，可与正式版共存。
+      # 离线符号表按当前 KSU LKM 的 UND 清单裁剪（全量源存档在 assets/symtab_src/）
+      - name: Build offline symbol tables
+        run: bash scripts/build_symtabs.sh
+
       - name: Build test APK (arm64)
         env:
           PR_TEST_BUILD: '1'

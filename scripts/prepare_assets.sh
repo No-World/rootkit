@@ -51,8 +51,12 @@ for f in x645 pc ml2 ksupatch koquery ksu_template.ko ksu_template_6.6.ko; do
   gzip -9 -kf "$A/$f"
 done
 
-echo "完成。缺离线符号表时："
+echo "[5/5] 离线符号表（按当前 KSU LKM 的 UND 清单裁剪）"
+bash scripts/build_symtabs.sh
+
+echo "完成。"
+echo "符号表全量源：assets/symtab_src/<ver>.txt.xz（重新生成见 README §6.1 ②）："
 echo "  运行时 dump:  python3 scripts/mk_symtab.py kallsyms_<ver>.txt \$A/kallsyms_<ver>.bin.gz"
-echo "  镜像恢复 dump(ghostlock-extract --dump-kallsyms，无类型列)："
-echo "                KSYMS_NEED=<KSU UND 名单> python3 scripts/mk_symtab.py <dump> \$A/kallsyms_<ver>.bin.gz"
+echo "  镜像恢复 dump: GHOSTLOCK_NO_PROC_KALLSYMS=1 ghostlock-extract <img> --dump-kallsyms k.txt"
+echo "                （必须设该变量：否则会读到宿主 /proc/kallsyms，静默用错内核的符号）"
 ls -la "$A" | tail -20
