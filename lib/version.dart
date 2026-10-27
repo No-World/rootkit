@@ -2,7 +2,7 @@
 ///
 /// 同时被三处使用：标题栏显示、日志 `[diag:*] ver=` 行、与 pubspec.yaml 的 version 保持一致。
 /// 改版本时这里和 pubspec.yaml 必须同步（CHANGELOG 也一起改）。
-const String kAppVersion = '1.0.17';
+const String kAppVersion = '1.0.18';
 
 /// 与本仓库 `assets/ksu_template.ko.gz` 同源的 KernelSU 管理器版本。
 ///

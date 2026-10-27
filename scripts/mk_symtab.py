@@ -1,58 +1,90 @@
 #!/usr/bin/env python3
-"""mk_symtab.py — 从 /proc/kallsyms 转储生成离线符号表（相对 _text 链接地址的偏移）
+"""mk_symtab.py — 从 kallsyms 转储生成离线符号表（相对 _text 链接地址的偏移）
 
 用法: python3 mk_symtab.py <kallsyms.txt> <out.bin.gz>
 
-原理：dump 里的地址 = 链接地址 + KASLR slide，用 _stext 反推 slide
-      （_stext 链接地址固定 0xffffffc080010000），再换算成相对 _text(0xffffffc080000000) 的偏移。
-保留类型 T/D/B/R（模块常用导出）以及 --need 指定的额外符号（例如 KSU 用到的）。
+输入格式（两种都支持）:
+  1) /proc/kallsyms 运行时转储:  "地址 类型 名字"，行尾可能带 "\\[modname\\]"
+  2) 镜像恢复转储(ghostlock-extract --dump-kallsyms):  "地址 名字"（无类型列）
+
+锚点:  偏移 = addr − _text（从转储自身解析 _text，无任何硬编码链接基址；
+       KASLR slide 在减法中自然消去）。ksupatch 侧用 --link <该内核链接 _text>
+       --slide <泄漏 slide> 还原绝对地址。
+过滤:  运行时转储保留全局 T/D/B/R 类型 + --need 列表；镜像恢复转储没有类型
+       列，自动从转储自身的 __ksymtab_* 符号推导导出集，再并入 KSYMS_NEED
+       （KSU LKM 实际 UND 名单，含故意绑定的未导出符号）。
+       原理：模块只能合法导入导出符号；KSU 模板额外绑定的未导出符号由 need
+       名单先期兑底 —— 不用 BTF linkage（荣耀管线会丢）。同名 static 遮蔽
+       全局导出的风险因此被限定在 need 名单内（导出符号全局唯一；实测仅
+       5 个导出存在同名双地址且均不在 KSU 依赖里，首见取低地址=代码区本体）。
 """
-import re, sys, gzip, struct, os
-
-LINK_TEXT = 0xffffffc080000000
-LINK_STEXT = 0xffffffc080010000
-
+import re, sys, gzip, os
 
 def load(path):
-    syms, stext = {}, None
+    """返回 (name -> addr 首见, _text_addr or None)"""
+    syms, text = {}, None
     for line in open(path, errors='ignore'):
-        m = re.match(r'^([0-9a-f]{16})\s+(\S)\s+(\S+)$', line.strip())
+        s = line.strip()
+        if not s or s.startswith('#'):
+            continue
+        # 跳过模块符号: "addr t name [modname]"（镜像恢复转储不会有，但无害）
+        if '[' in s:
+            continue
+        m = re.match(r'^([0-9a-fA-F]{8,16})\s+(?:([A-Za-z?])\s+)?(\S+)$', s)
         if not m:
             continue
-        a, t, n = int(m.group(1), 16), m.group(2), m.group(3)
+        a = int(m.group(1), 16)
+        t = m.group(2) or ''   # 无类型列 = 镜像恢复转储
+        n = m.group(3)
         if a == 0:
             continue
-        if n == '_stext' and stext is None:
-            stext = a
-        syms.setdefault(n, (a, t))
-    return syms, stext
-
+        if n == '_text' and text is None:
+            text = a
+        syms.setdefault(n, (a, t))   # 首见优先（与 /proc/kallsyms 顺序一致）
+    return syms, text
 
 def main():
+    if len(sys.argv) < 3:
+        sys.exit('用法: mk_symtab.py <kallsyms.txt> <out.bin.gz>')
     src, out = sys.argv[1], sys.argv[2]
-    syms, stext = load(src)
-    if not stext:
-        sys.exit('未找到 _stext，dump 可能不完整')
-    slide = stext - LINK_STEXT
+    syms, text = load(src)
+    if not text:
+        sys.exit('未找到 _text，dump 可能不完整（需要包含 _text 符号）')
+
+    typed = any(v[1] for v in syms.values())
     keep = set('TDBR')
     need = set()
     need_file = os.environ.get('KSYMS_NEED')
     if need_file and os.path.exists(need_file):
         need = {l.strip() for l in open(need_file) if l.strip()}
+
+    # 镜像恢复转储：导出集从转储自身的 __ksymtab_* 自推导
+    exports = {n[len('__ksymtab_'):] for n in syms if n.startswith('__ksymtab_')}
+
     rows = []
     for n, (a, t) in syms.items():
-        off = a - slide - LINK_TEXT
-        if 0 <= off < 2**32 and (t in keep or n in need):
-            rows.append((n, off))
+        off = a - text
+        if not (0 <= off < 2**32):
+            continue
+        if typed:
+            # 运行时转储: 只保留全局 TDBR + need（模块常用导出）
+            if t.upper() in keep and (t.isupper() or n in need):
+                rows.append((n, off))
+        else:
+            # 镜像恢复转储: 导出符号（全局唯一，无遮蔽风险）∪ need 名单
+            if n in exports or n in need:
+                rows.append((n, off))
     rows.sort()
     blob = ('\n'.join(f'{n}\t{o:x}' for n, o in rows) + '\n').encode()
     gz = gzip.compress(blob, 9)
     open(out, 'wb').write(gz)
-    print(f'symbols={len(rows)} raw={len(blob)/1048576:.2f}MB gz={len(gz)/1024:.0f}KB slide={hex(slide)} -> {out}')
+    print(f'typed={typed} symbols={len(rows)} raw={len(blob)/1048576:.2f}MB '
+          f'gz={len(gz)/1024:.0f}KB anchor=_text@{text:#x} '
+          f'exports={len(exports)} -> {out}')
     d = dict(rows)
-    print('self-check: _stext=%s selinux_state=%s' % (
-        hex(d.get('_stext', -1)), hex(d.get('selinux_state', -1))))
-
+    print('self-check: _stext=%s selinux_state=%s memstart_addr=%s' % (
+        hex(d.get('_stext', -1)), hex(d.get('selinux_state', -1)),
+        hex(d.get('memstart_addr', -1))))
 
 if __name__ == '__main__':
     main()
