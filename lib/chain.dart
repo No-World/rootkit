@@ -13,8 +13,11 @@ import 'version.dart';
 import 'calib.dart';
 import 'shizuku.dart';
 
-/// 参数集：tuned=新版（推荐，PRE_PIPES=512）；classic=v1.0.16 原参数（PRE_PIPES=20000）
-enum ParamSet { tuned, classic }
+/// 参数集（对应 PRE_PIPES）
+///   modern  = 新版，PRE_PIPES=512   —— 512KB 管道载体能建起来，落位约 80%
+///   classic = v1.0.16 原参数，PRE_PIPES=20000 —— 预算被占满、载体必然 EPERM，落位约 62%
+/// 默认 modern；classic 只用于回退对比与排障。
+enum ParamSet { modern, classic }
 
 /// 温度闸档位（真机实测：冷机 25–32°C 落位 80%/panic 7%；≥50°C 落位 42%/频繁重启）
 enum TempGate {
@@ -149,7 +152,7 @@ class RootChain extends ChangeNotifier {
   TempGate optTempGate = TempGate.normal;
 
   /// 参数集，默认新版；classic 用于回退到 v1.0.16 的参数
-  ParamSet optParamSet = ParamSet.tuned;
+  ParamSet optParamSet = ParamSet.modern;
 
   /// 运行时把屏幕亮度压到最低。屏幕是 SoC 之外最大的热源，
   /// 真机上 1 档与中高亮差 2–3°C；跑链时屏幕内容没人看，压暗只赚不亏。
@@ -171,7 +174,7 @@ class RootChain extends ChangeNotifier {
     if (f2 != null) optTempGate = TempGate.fromIdx(int.tryParse(f2) ?? 1);
     final h2 = await ShizukuShell.getPref('opt.paramSet');
     if (h2 != null) {
-      optParamSet = (int.tryParse(h2) ?? 0) == 1 ? ParamSet.classic : ParamSet.tuned;
+      optParamSet = (int.tryParse(h2) ?? 0) == 1 ? ParamSet.classic : ParamSet.modern;
     }
     final g2 = await ShizukuShell.getPref('opt.dim');
     if (g2 != null) optDim = g2 == '1';
@@ -2056,7 +2059,7 @@ class RootChain extends ChangeNotifier {
   ///   PRE_PIPES=2048  → 又变 -1（2048×8页 = 16384，正好撞上限）
   /// 所以只能取 ≤512。
   /// **新版（默认）**：512 —— 让 512KB 管道载体能建起来（真机 A/B：落位 62% → 80%）
-  static const int kPrePipesTuned = 512;
+  static const int kPrePipesModern = 512;
 
   /// **classic（v1.0.16 的行为）**：20000 —— 预建管道把 uid 2000 的 64MB 预算占满，
   /// 512KB 载体必然 EPERM。保留它只为"回退对比/排障"，默认不用。
@@ -2064,7 +2067,7 @@ class RootChain extends ChangeNotifier {
 
   /// 当前生效的预建管道数
   int get prePipes =>
-      optParamSet == ParamSet.classic ? kPrePipesClassic : kPrePipesTuned;
+      optParamSet == ParamSet.classic ? kPrePipesClassic : kPrePipesModern;
   static const int _tempBestMc = 40000;    // ≤40 最佳
   static const int _tempOkMc = 55000;      // ≤55 可用；>55 偏高
   static const int _tempGateTries = 30;    // 最多等 30×10s = 5 分钟

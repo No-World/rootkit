@@ -935,13 +935,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                   ListTile(
                     dense: true,
                     contentPadding: EdgeInsets.zero,
-                    title: const Text('参数集', style: TextStyle(fontSize: 14)),
+                    title: const Text('参数集（PRE_PIPES）', style: TextStyle(fontSize: 14)),
                     subtitle: Text(
                         chain.optParamSet == ParamSet.classic
-                            ? 'classic（v1.0.16 参数）：预建管道 20000 个，512KB 管道载体建不起来，'
-                                '落位率约 62%。仅在排障/对比时用'
-                            : '新版（推荐）：预建管道 512 个，让 512KB 管道载体生效，'
-                                '落位率约 80%（真机 A/B 各 26 发）',
+                            ? 'classic = v1.0.16 参数：PRE_PIPES=20000，预建管道占满 64MB 预算，'
+                                '512KB 载体必然 EPERM，落位约 62%'
+                            : 'modern = 新版参数：PRE_PIPES=512，512KB 管道载体生效，'
+                                '落位约 80%（真机 A/B 各 26 发）',
                         style: const TextStyle(fontSize: 11)),
                   ),
                   Padding(
@@ -952,7 +952,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                         tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                       ),
                       segments: const [
-                        ButtonSegment(value: ParamSet.tuned, label: Text('新版')),
+                        ButtonSegment(value: ParamSet.modern, label: Text('modern')),
                         ButtonSegment(value: ParamSet.classic, label: Text('classic')),
                       ],
                       selected: {chain.optParamSet},
