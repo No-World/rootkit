@@ -1055,8 +1055,8 @@ class RootChain extends ChangeNotifier {
     notifyListeners();
     // 注意：不能用 `pkill -f x645` —— 会匹配到承载它的 `sh -c` 自身，导致后续 pkill 不执行，
     // pc/pc_run 存活并继续占用 perf fd、污染下一轮。用 -x 精确匹配进程名，并拆成多条独立命令。
-    await ShizukuShell.run('pkill -x x645');
-    await ShizukuShell.run('pkill -x pc');
+    await ShizukuShell.run('pkill -9 -x x645 2>/dev/null');
+    await ShizukuShell.run('pkill -9 -x pc 2>/dev/null');
     await ShizukuShell.run('pkill -f "[p]c_run"');
     await ShizukuShell.run('rm -f $workDir/probe.log');
     _log('[stop] 已清理 x645 / pc');
@@ -1366,6 +1366,7 @@ class RootChain extends ChangeNotifier {
     final s = _byId[StageId.permissive]!;
     _stage(StageId.permissive, StageStatus.running);
     phase = 'permissive';
+    await _killStrays();
     for (var run = 0; run < 4 && !_stop; run++) {
       s.runs++;
       await ShizukuShell.run(_prepCmd());
@@ -1427,8 +1428,8 @@ class RootChain extends ChangeNotifier {
     }
     _log('[clean] 清理残留：停 root shell / 删原生件与临时文件…');
     // ① 停掉 5556 root shell 服务（候选进程会 fork 一个常驻服务）
-    await ShizukuShell.run('pkill -x pc');
-    await ShizukuShell.run('pkill -x x645');
+    await ShizukuShell.run('pkill -9 -x pc 2>/dev/null');
+    await ShizukuShell.run('pkill -9 -x x645 2>/dev/null');
     // ② 删临时产物（保留 workDir 下的日志到清理前先不删，便于排查）
     final r = await ShizukuShell.run(
       'rm -f /tmp/ksyms.txt /tmp/kt*.ko /data/local/tmp/kt*.ko '
@@ -1607,7 +1608,7 @@ class RootChain extends ChangeNotifier {
     for (var run = 0; run < 3 && !_stop; run++) {
       final r = await ShizukuShell.run(
           'cd $workDir && rm -f probe.log && chmod 755 pc module.ko && '
-          'pkill -x pc 2>/dev/null; '
+          'pkill -9 -x pc 2>/dev/null; '
           'nohup setsid ./pc ${calib.tracepointId} 14 $workDir/module.ko > $workDir/probe.log 2>&1 < /dev/null & echo started');
       _log('[probe] ${r.all}');
       await _sleep(6000);
@@ -1665,7 +1666,7 @@ class RootChain extends ChangeNotifier {
       env += " P645_TRY_LIST='$tryList'";
     }
     await ShizukuShell.run(_prepCmd());
-    await ShizukuShell.run('pkill -x x645'); // 清掉上一发可能残留的孤儿，避免两份并发污染判据
+    await ShizukuShell.run('pkill -9 -x x645 2>/dev/null'); // 清掉上一发可能残留的孤儿，避免两份并发污染判据
     await _shotMeta(stage.name);
     _log('[${stage.name}] 开打 tries=$tries');
     final r = await ShizukuShell.run(
@@ -1673,10 +1674,11 @@ class RootChain extends ChangeNotifier {
       timeoutMs: timeoutMs,
     );
     if (r.all.isNotEmpty) _log(r.all);
-    if (r.code == -9) {
-      _log('[${stage.name}] 超时，清理残留 x645');
-      await ShizukuShell.run('pkill -x x645');
-    }
+    // ★ 每发打完都用 -9 清一遍：载荷的 exec 竞速会留下大量同名子进程，
+    // 原来的 `pkill -x x645`（SIGTERM）杀不掉它们，实测会累积到 300 个，
+    // 把整机 load 顶到 300+、空闲温度从 32°C 抬到 51°C、管道页预算占满，
+    // 之后每一发都在"热机 + 预算耗尽"的条件下开打，命中率断崖下跌。
+    await _killStrays();
     final lg = await ShizukuShell.run('cat $logPath 2>/dev/null');
     return lg.out;
   }
@@ -1871,6 +1873,27 @@ class RootChain extends ChangeNotifier {
       return t.isEmpty ? 'zone0' : t;
     } catch (_) {
       return 'zone0';
+    }
+  }
+
+  /// 清理上一轮残留的原生进程。
+  ///
+  /// **必须做**：载荷的 exec 竞速会 fork 出大量同名进程（实测量到过 300 个 x645 常驻），
+  /// 父进程被结束/超时杀掉后这些子进程仍然活着——每个都握着 54000 个定时器和一堆管道页。
+  /// 后果：整机 load 飙到 300+、空闲温度从 32°C 升到 51°C、管道预算被占满，
+  /// 于是后面每一发都在"热机 + 预算耗尽"的条件下开打，命中率断崖式下跌。
+  Future<void> _killStrays() async {
+    final r = await ShizukuShell.run(
+        'N1=\$(pgrep -x x645 | wc -l); N2=\$(pgrep -x pc | wc -l); '
+        'pkill -9 -x x645 2>/dev/null; pkill -9 -x pc 2>/dev/null; '
+        'sleep 1; echo "\$N1 \$N2 \$(pgrep -x x645 | wc -l)"');
+    final t = r.out.trim().split(RegExp(r'\s+'));
+    if (t.length >= 3) {
+      final before = int.tryParse(t[0]) ?? 0;
+      final pcN = int.tryParse(t[1]) ?? 0;
+      if (before > 0 || pcN > 0) {
+        _log('[clean] 清掉残留进程：x645=$before pc=$pcN ⇒ 现在剩 ${t[2]} 个');
+      }
     }
   }
 
