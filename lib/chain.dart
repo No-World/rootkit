@@ -1366,7 +1366,7 @@ class RootChain extends ChangeNotifier {
     final s = _byId[StageId.permissive]!;
     _stage(StageId.permissive, StageStatus.running);
     phase = 'permissive';
-    await _killStrays();
+    await _killStrays(withPc: true);
     for (var run = 0; run < 4 && !_stop; run++) {
       s.runs++;
       await ShizukuShell.run(_prepCmd());
@@ -1882,10 +1882,15 @@ class RootChain extends ChangeNotifier {
   /// 父进程被结束/超时杀掉后这些子进程仍然活着——每个都握着 54000 个定时器和一堆管道页。
   /// 后果：整机 load 飙到 300+、空闲温度从 32°C 升到 51°C、管道预算被占满，
   /// 于是后面每一发都在"热机 + 预算耗尽"的条件下开打，命中率断崖式下跌。
-  Future<void> _killStrays() async {
+  /// [withPc] 只有「链开始前 / 链结束后」才能连 `pc` 一起清。
+  /// **每发结束后绝对不能杀 pc**：它是判据生产者（CAPBND_ZERO / CAPEFF_OK / ROOT_OK 都由它打印）
+  /// 兼模块加载者，杀了它 ⇒ 即使写成功也拿不到 verdict（真机实测：P1 明明
+  /// `stage_done st=1 leak=0x… tgt=…` 命中候选，probe.log 却只剩一行 `Killed` ⇒ 全被记成 miss）。
+  Future<void> _killStrays({bool withPc = false}) async {
     final r = await ShizukuShell.run(
         'N1=\$(pgrep -x x645 | wc -l); N2=\$(pgrep -x pc | wc -l); '
-        'pkill -9 -x x645 2>/dev/null; pkill -9 -x pc 2>/dev/null; '
+        'pkill -9 -x x645 2>/dev/null; '
+        '${withPc ? 'pkill -9 -x pc 2>/dev/null; ' : ''}'
         'sleep 1; echo "\$N1 \$N2 \$(pgrep -x x645 | wc -l)"');
     final t = r.out.trim().split(RegExp(r'\s+'));
     if (t.length >= 3) {
