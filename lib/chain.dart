@@ -13,6 +13,26 @@ import 'version.dart';
 import 'calib.dart';
 import 'shizuku.dart';
 
+/// 温度闸档位（真机实测：冷机 25–32°C 落位 80%/panic 7%；≥50°C 落位 42%/频繁重启）
+enum TempGate {
+  light('轻度', 48000, 6, 58000,
+      '≥48°C 才等，最多 60s；仍 >58°C 才放弃（跑得快，热机开打风险高）'),
+  normal('中等', 44000, 18, 55000,
+      '≥44°C 就开始等，最多 3 分钟；仍 >55°C 放弃（推荐）'),
+  strict('重度', 40000, 36, 50000,
+      '≥40°C 就等，最多 6 分钟；仍 >50°C 放弃（最稳，但很慢）');
+
+  const TempGate(this.title, this.limitMc, this.tries, this.abortMc, this.desc);
+  final String title;
+  final int limitMc;   // 等到低于这个温度才开打
+  final int tries;     // 最多等多少轮 × 10s
+  final int abortMc;   // 等满后仍高于此值 ⇒ 放弃本轮
+  final String desc;
+
+  static TempGate fromIdx(int i) =>
+      i >= 0 && i < TempGate.values.length ? TempGate.values[i] : TempGate.normal;
+}
+
 enum StageId { env, permissive, probe, phase1, phase2, root, ksu, verify }
 
 const Map<StageId, String> stageTitles = {
@@ -122,8 +142,8 @@ class RootChain extends ChangeNotifier {
   // 开打前清理后台（默认关闭）。动机：后台 App 多时 pipe 页预算被占（F_SETPIPE_SZ=EPERM）、
   // 页回收竞争变强 ⇒ 落位失败 ⇒ panic。恢复：软重启/正常重启即可，进程本来就会重建。
   bool optKillBg = false;
-  /// 严格温度闸：>44°C 先等降温（panic 代价远大于等待代价）
-  bool optStrictTemp = true;
+  /// 温度闸档位：等降温到多少度才开打 / 最多等多久 / 等满仍高于多少度就放弃本轮
+  TempGate optTempGate = TempGate.normal;
 
   /// 运行时把屏幕亮度压到最低。屏幕是 SoC 之外最大的热源，
   /// 真机上 1 档与中高亮差 2–3°C；跑链时屏幕内容没人看，压暗只赚不亏。
@@ -141,15 +161,15 @@ class RootChain extends ChangeNotifier {
     if (d != null) optCleanup = d == '1';
     final e2 = await ShizukuShell.getPref('opt.killBg');
     if (e2 != null) optKillBg = e2 == '1';
-    final f2 = await ShizukuShell.getPref('opt.strictTemp');
-    if (f2 != null) optStrictTemp = f2 == '1';
+    final f2 = await ShizukuShell.getPref('opt.tempGate');
+    if (f2 != null) optTempGate = TempGate.fromIdx(int.tryParse(f2) ?? 1);
     final g2 = await ShizukuShell.getPref('opt.dim');
     if (g2 != null) optDim = g2 == '1';
     notifyListeners();
   }
 
   Future<void> setOptions({bool? wifiOff, bool? tap, bool? stayOn, bool? cleanup,
-      bool? killBg, bool? strictTemp, bool? dim}) async {
+      bool? killBg, TempGate? tempGate, bool? dim}) async {
     if (wifiOff != null) {
       optWifiOff = wifiOff;
       await ShizukuShell.setPref('opt.wifiOff', wifiOff ? '1' : '0');
@@ -170,9 +190,9 @@ class RootChain extends ChangeNotifier {
       optCleanup = cleanup;
       await ShizukuShell.setPref('opt.cleanup', cleanup ? '1' : '0');
     }
-    if (strictTemp != null) {
-      optStrictTemp = strictTemp;
-      await ShizukuShell.setPref('opt.strictTemp', strictTemp ? '1' : '0');
+    if (tempGate != null) {
+      optTempGate = tempGate;
+      await ShizukuShell.setPref('opt.tempGate', '${tempGate.index}');
     }
     if (dim != null) {
       optDim = dim;
@@ -1996,12 +2016,15 @@ class RootChain extends ChangeNotifier {
   /// 温度分档（UI 与日志共用）：0=最佳 1=可用 2=偏高
   static int tempTier(int mC) => mC <= _tempBestMc ? 0 : (mC <= _tempOkMc ? 1 : 2);
 
-  static const int _strictMc = 44000;   // 严格档上限
-  static const int _strictTries = 18;   // 3 分钟
+  /// 三档温度闸。数值来自真机实测：
+  /// 冷机 25–32°C 落位 80% / panic 7%；≥50°C 落位 42% / 频繁重启；
+  /// 84–88°C 仍能命中但整发崩掉的比例明显上升 ⇒ 温度是概率打击。
+
 
   Future<void> _cooldownGate() async {
-    final limitMc = optStrictTemp ? _strictMc : _tempOkMc;
-    final tries = optStrictTemp ? _strictTries : _tempGateTries;
+    final limitMc = optTempGate.limitMc;
+    final tries = optTempGate.tries;
+    final abortMc = optTempGate.abortMc;
     for (var i = 0; i < tries; i++) {
       final zoneName = readTempZoneName();
       final raw = readTempMc();      // 直读文件，不 spawn shell
@@ -2013,7 +2036,7 @@ class RootChain extends ChangeNotifier {
       notifyListeners();
       final c = (raw / 1000).toStringAsFixed(1);
       if (raw > limitMc) {
-        _log('[temp] 机身 ${c}°C（$zoneName）偏高（>${limitMc ~/ 1000}°C），等 10s 降温'
+        _log('[temp]（${optTempGate.title}档）机身 ${c}°C（$zoneName）偏高（>${limitMc ~/ 1000}°C），等 10s 降温'
             '（第 ${i + 1}/$tries 次）');
         await ShizukuShell.run('input keyevent 224 2>/dev/null');
         await _sleep(10000);
@@ -2026,25 +2049,18 @@ class RootChain extends ChangeNotifier {
       }
       return;
     }
-    if (optStrictTemp) {
-      final raw2 = readTempMc();
-      final c2 = (raw2 / 1000).toStringAsFixed(1);
-      // >55°C 等满还降不下来 = 散热条件根本不够（散热器撤掉/边充边打），照打基本必崩，
-      // 直接放弃本轮比打崩重启划算（重启代价 > 2 分钟，还要重装 APK）
-      if (raw2 > _tempOkMc) {
-        _log('[temp] ✗ 等满 ${tries * 10 ~/ 60} 分钟仍有 ${c2}°C（>55°C）⇒ 放弃本轮');
-        lastError = '机身 ${c2}°C 持续降不下来：先关屏静置 10–15 分钟，'
-            '或拔掉充电线/加散热再跑；这个温度打下去几乎必定 panic';
-        _stop = true;
-        return;
-      }
-      _log('[temp] 等满 ${tries * 10 ~/ 60} 分钟仍在 ${c2}°C：照打，但 panic 概率会升高');
+    final raw2 = readTempMc();
+    final c2 = (raw2 / 1000).toStringAsFixed(1);
+    if (raw2 > abortMc) {
+      _log('[temp] ✗（${optTempGate.title}档）等满 ${tries * 10 ~/ 60} 分钟仍有 ${c2}°C'
+          '（>${abortMc ~/ 1000}°C）⇒ 放弃本轮');
+      lastError = '机身 ${c2}°C 持续降不下来（${optTempGate.title}档上限 ${abortMc ~/ 1000}°C）：'
+          '先关屏静置 10–15 分钟，或拔掉充电线/加散热再跑；这个温度打下去几乎必定 panic';
+      _stop = true;
       return;
     }
-    _log('[temp] ✗ 等满 ${_tempGateTries * 10 ~/ 60} 分钟仍 >55°C，放弃本轮（过热时打必崩）');
-    lastError = '机身温度过高（>55°C 持续 ${_tempGateTries * 10 ~/ 60} 分钟未降）：'
-        '先关屏静置 10–15 分钟再跑；过热时命中率≈0 且极易 panic';
-    _stop = true;
+    _log('[temp]（${optTempGate.title}档）等满 ${tries * 10 ~/ 60} 分钟仍在 ${c2}°C：'
+        '照打，但 panic 概率会升高');
   }
 
   /// 每发打之前落一行元数据，方便事后把 panic 与温度/内存关联起来

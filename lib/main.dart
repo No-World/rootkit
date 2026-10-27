@@ -932,19 +932,31 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                       if (ctx2.mounted) setSt(() {});
                     },
                   ),
-                  SwitchListTile(
+                  ListTile(
                     dense: true,
                     contentPadding: EdgeInsets.zero,
-                    value: chain.optStrictTemp,
-                    title: const Text('严格温度（>44°C 先等降温）',
-                        style: TextStyle(fontSize: 14)),
-                    subtitle: const Text('实测每发的 panic 概率约 38%，'
-                        '降温能明显降低；等满 3 分钟仍降不下来就照打',
-                        style: TextStyle(fontSize: 11)),
-                    onChanged: (v) async {
-                      await chain.setOptions(strictTemp: v);
-                      if (ctx2.mounted) setSt(() {});
-                    },
+                    title: const Text('温度闸强度', style: TextStyle(fontSize: 14)),
+                    subtitle: Text(chain.optTempGate.desc,
+                        style: const TextStyle(fontSize: 11)),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 6),
+                    child: SegmentedButton<TempGate>(
+                      style: const ButtonStyle(
+                        visualDensity: VisualDensity.compact,
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                      segments: const [
+                        ButtonSegment(value: TempGate.light, label: Text('轻度')),
+                        ButtonSegment(value: TempGate.normal, label: Text('中等')),
+                        ButtonSegment(value: TempGate.strict, label: Text('重度')),
+                      ],
+                      selected: {chain.optTempGate},
+                      onSelectionChanged: (sel) async {
+                        await chain.setOptions(tempGate: sel.first);
+                        if (ctx2.mounted) setSt(() {});
+                      },
+                    ),
                   ),
                   SwitchListTile(
                     dense: true,
