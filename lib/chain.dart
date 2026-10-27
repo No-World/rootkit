@@ -1718,11 +1718,13 @@ class RootChain extends ChangeNotifier {
         _stage(StageId.phase1, StageStatus.failed, detail: '候选消失');
         return;
       }
-      final targets =
-        creds
-            .take(8)
-            .map((c) => _hex(c + BigInt.from(calib.offCapBset)))
-            .join(',');
+      // 只取前 8 个候选、内层 8 次（= v1.0.16 行为）。
+      // 实测（2026-10-27）：扩大到 14 个候选 + tries=14 无收益（3 发全 miss），
+      // 反而把单发从 3.5 分钟拉长到 6 分钟 ⇒ 保持 8/8。
+      final targets = creds
+          .take(8)
+          .map((c) => _hex(c + BigInt.from(calib.offCapBset)))
+          .join(',');
       // P1/P2 用宽松闸：实测（2026-10-27 真机 5 轮）P1/P2 在 37–42°C 都是 try=1，
       // 没有必要按用户档位长等；只挡 >48°C 的真正过热。
       await _cooldownGate(relaxed: true);
@@ -1782,6 +1784,9 @@ class RootChain extends ChangeNotifier {
         cred = _hex(creds.first);
       }
       final c = _fromHex(cred);
+      // 与 v1.0.16 相同：同一个 cred 的 (cap_permitted → cap_effective) 重复三次。
+      // 实测（2026-10-27）：换成多个不同 cred、或把写入值改成 0x10000，均未证明更好
+      // （见 issue #5 的未验证清单）⇒ 这里保持原样，改动一律先验证再上。
       final p = _hex(c + BigInt.from(calib.offCapPermitted));
       final ch = _hex(c + BigInt.from(calib.offCapEffective));
       final list = '3:$p:$ch,3:$p:$ch,3:$p:$ch';
