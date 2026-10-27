@@ -88,7 +88,8 @@ def main():
                 rows.append((n, off))
     rows.sort()
     blob = ('\n'.join(f'{n}\t{o:x}' for n, o in rows) + '\n').encode()
-    gz = gzip.compress(blob, 9)
+    # mtime=0 ⇒ 同样输入必得同样字节（CI 重生成不会把工作树弄脏）
+    gz = gzip.compress(blob, 9, mtime=0)
     open(out, 'wb').write(gz)
     print(f'typed={typed} need_only={need_only} symbols={len(rows)} '
           f'raw={len(blob)/1048576:.2f}MB gz={len(gz)/1024:.0f}KB '
