@@ -935,6 +935,36 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                   ListTile(
                     dense: true,
                     contentPadding: EdgeInsets.zero,
+                    title: const Text('参数集', style: TextStyle(fontSize: 14)),
+                    subtitle: Text(
+                        chain.optParamSet == ParamSet.classic
+                            ? 'classic（v1.0.16 参数）：预建管道 20000 个，512KB 管道载体建不起来，'
+                                '落位率约 62%。仅在排障/对比时用'
+                            : '新版（推荐）：预建管道 512 个，让 512KB 管道载体生效，'
+                                '落位率约 80%（真机 A/B 各 26 发）',
+                        style: const TextStyle(fontSize: 11)),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 6),
+                    child: SegmentedButton<ParamSet>(
+                      style: const ButtonStyle(
+                        visualDensity: VisualDensity.compact,
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                      segments: const [
+                        ButtonSegment(value: ParamSet.tuned, label: Text('新版')),
+                        ButtonSegment(value: ParamSet.classic, label: Text('classic')),
+                      ],
+                      selected: {chain.optParamSet},
+                      onSelectionChanged: (sel) async {
+                        await chain.setOptions(paramSet: sel.first);
+                        if (ctx2.mounted) setSt(() {});
+                      },
+                    ),
+                  ),
+                  ListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
                     title: const Text('温度闸强度', style: TextStyle(fontSize: 14)),
                     subtitle: Text(chain.optTempGate.desc,
                         style: const TextStyle(fontSize: 11)),

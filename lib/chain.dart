@@ -13,6 +13,9 @@ import 'version.dart';
 import 'calib.dart';
 import 'shizuku.dart';
 
+/// 参数集：tuned=新版（推荐，PRE_PIPES=512）；classic=v1.0.16 原参数（PRE_PIPES=20000）
+enum ParamSet { tuned, classic }
+
 /// 温度闸档位（真机实测：冷机 25–32°C 落位 80%/panic 7%；≥50°C 落位 42%/频繁重启）
 enum TempGate {
   light('轻度', 48000, 6, 58000,
@@ -145,6 +148,9 @@ class RootChain extends ChangeNotifier {
   /// 温度闸档位：等降温到多少度才开打 / 最多等多久 / 等满仍高于多少度就放弃本轮
   TempGate optTempGate = TempGate.normal;
 
+  /// 参数集，默认新版；classic 用于回退到 v1.0.16 的参数
+  ParamSet optParamSet = ParamSet.tuned;
+
   /// 运行时把屏幕亮度压到最低。屏幕是 SoC 之外最大的热源，
   /// 真机上 1 档与中高亮差 2–3°C；跑链时屏幕内容没人看，压暗只赚不亏。
   bool optDim = true;
@@ -163,13 +169,17 @@ class RootChain extends ChangeNotifier {
     if (e2 != null) optKillBg = e2 == '1';
     final f2 = await ShizukuShell.getPref('opt.tempGate');
     if (f2 != null) optTempGate = TempGate.fromIdx(int.tryParse(f2) ?? 1);
+    final h2 = await ShizukuShell.getPref('opt.paramSet');
+    if (h2 != null) {
+      optParamSet = (int.tryParse(h2) ?? 0) == 1 ? ParamSet.classic : ParamSet.tuned;
+    }
     final g2 = await ShizukuShell.getPref('opt.dim');
     if (g2 != null) optDim = g2 == '1';
     notifyListeners();
   }
 
   Future<void> setOptions({bool? wifiOff, bool? tap, bool? stayOn, bool? cleanup,
-      bool? killBg, TempGate? tempGate, bool? dim}) async {
+      bool? killBg, TempGate? tempGate, bool? dim, ParamSet? paramSet}) async {
     if (wifiOff != null) {
       optWifiOff = wifiOff;
       await ShizukuShell.setPref('opt.wifiOff', wifiOff ? '1' : '0');
@@ -193,6 +203,11 @@ class RootChain extends ChangeNotifier {
     if (tempGate != null) {
       optTempGate = tempGate;
       await ShizukuShell.setPref('opt.tempGate', '${tempGate.index}');
+    }
+    if (paramSet != null) {
+      optParamSet = paramSet;
+      await ShizukuShell.setPref('opt.paramSet',
+          paramSet == ParamSet.classic ? '1' : '0');
     }
     if (dim != null) {
       optDim = dim;
@@ -1384,7 +1399,7 @@ class RootChain extends ChangeNotifier {
           'P645_THRESH=32 P645_RING_GO=0 P645_FORCE_LEFT=${calib.selinuxZeroTargetHex} '
           // PRE_PIPES 决定 uid 2000 的 64MB 管道预算用得早不早：
           // 20000 会把预算占满 ⇒ 后面 PIPE512=64 的 512KB 管道必然 EPERM（实测 errno=1）。
-          'P645_PRE_PIPES=$kPrePipes P645_LOG=$logPath';
+          'P645_PRE_PIPES=$prePipes P645_LOG=$logPath';
       // 温度闸 + 环境探针
       await _cooldownGate();
       if (!await _ensureAwake()) {
@@ -1665,7 +1680,7 @@ class RootChain extends ChangeNotifier {
         'P645_REPEATS=520 P645_NDEL=7 P645_DEL_RUN_MS=2500 P645_CONC=1 P645_ANON_MB=8 P645_FREEZE=1 '
         'P645_V8=1 P645_DRAIN_WAIT_MS=25000 P645_PIPE512=64 P645_SOCKS=64 P645_SOCK_MB=8 P645_UHID=0 '
         'P645_MODE=4 P645_ANON2_MB=1024 P645_PIPE_DRAIN=1 P645_PIPE_K=4 P645_SCAN_STOP=1 '
-        'P645_THRESH=32 P645_RING_GO=0 P645_PRE_PIPES=$kPrePipes P645_LOG=$logPath';
+        'P645_THRESH=32 P645_RING_GO=0 P645_PRE_PIPES=$prePipes P645_LOG=$logPath';
     if (tryList != null && tryList.isNotEmpty) {
       env += " P645_TRY_LIST='$tryList'";
     }
@@ -2040,7 +2055,16 @@ class RootChain extends ChangeNotifier {
   ///   PRE_PIPES=0     → 也成功，但只有 13/20 = 65%（预建的那批 pipe 本身也在帮忙）
   ///   PRE_PIPES=2048  → 又变 -1（2048×8页 = 16384，正好撞上限）
   /// 所以只能取 ≤512。
-  static const int kPrePipes = 512;
+  /// **新版（默认）**：512 —— 让 512KB 管道载体能建起来（真机 A/B：落位 62% → 80%）
+  static const int kPrePipesTuned = 512;
+
+  /// **classic（v1.0.16 的行为）**：20000 —— 预建管道把 uid 2000 的 64MB 预算占满，
+  /// 512KB 载体必然 EPERM。保留它只为"回退对比/排障"，默认不用。
+  static const int kPrePipesClassic = 20000;
+
+  /// 当前生效的预建管道数
+  int get prePipes =>
+      optParamSet == ParamSet.classic ? kPrePipesClassic : kPrePipesTuned;
   static const int _tempBestMc = 40000;    // ≤40 最佳
   static const int _tempOkMc = 55000;      // ≤55 可用；>55 偏高
   static const int _tempGateTries = 30;    // 最多等 30×10s = 5 分钟
