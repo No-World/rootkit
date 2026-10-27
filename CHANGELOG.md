@@ -195,24 +195,30 @@
   内核 `6.6.118-android15-8-gc901ea41aa32-ab15981388-4k`，全部标定项来自 issue 提供的
   全量固件（update_full_base.zip v923615），未上真机 —— 首个待真机复核的记录：
   - `physBase=0xA8000000`：xbl_config FDT（ghostlock-extract）；
-  - `textLinkBase=0xffffffffb0000000`：镜像 kallsyms 恢复 —— **荣耀内核按构建随机化链接基址**，
-    6.12 系是 0xffffffc080000000，两者不同 ⇒ 相关硬编码全部改为按内核记录；
-  - `selinux_state=0x2BF9A60`（_text 相对）：镜像 kallsyms + BTF 交叉验证；
+  - `textLinkBase=0xffffffc080000000`（镜像 kallsyms 的 relative_base，与 MLY 同）、
+    `_stext` = `_text + 0x10000`；
+  - `selinux_state=0x236A2E0`（_text 相对）：镜像 kallsyms；
   - `module_layout CRC=0x4e276f37`：vendor_boot 里 504 个 vendor .ko 众数（全部一致）；
   - 自制模块常量：task_struct.cred@0x820 / real_cred@0x818、struct module 大小 1536
     （init@392/name@24 与 6.12 相同）—— pwn_mod.c 参数化后同一源编译两套；
   - KSU 模板换官方 android15-6.6 LKM（v3.3.1），符号绑定继续走 ksupatch；
-  - 离线符号表 113KB（导出集自 __ksymtab_* 推导 + KSU UND 名单）；已知局限：镜像
-    恢复器拿不到 12 个 UND 符号，离线兜底表不完整（真机 /proc/kallsyms 主路径不受影响）。
+  - 离线符号表 87KB（9,170 符号 = 导出集 ∪ KSU UND），**KSU 6.6 的 225 个 UND 全覆盖**。
+- **标定纪律（血泪教训，务必遵守）**：用 ghostlock-extract 分析镜像时必须设
+  `GHOSTLOCK_NO_PROC_KALLSYMS=1`。否则工具会优先读宿主机的 `/proc/kallsyms`
+  （WSL/x86 开发机上就是**宿主内核**），静默把宿主的符号表当成目标内核的 ——
+  本次初版标定即因此把 WSL 6.6.87 的 `selinux_state`/符号表当成了 C901 的，
+  并据此得出"荣耀随机化链接基址 / 隐藏符号"的错误结论（已全部更正）。
+  自检：镜像恢复得到的 `__start_BTF` 相对 `_text` 偏移应等于镜像内 BTF 段的真实
+  文件偏移（不等即说明符号表来源错了）。
 - **去硬编码（多内核基建）**：
-  - `KnownKernel` 新增 `textLinkBase`（KASLR slide 计算锚）与 `textStextGap`（iomem 兑底），
+  - `KnownKernel` 新增 `textLinkBase`（KASLR slide 计算锚）与 `textStextGap`（iomem 兜底），
     selinuxStateOffset 统一为 **_text 相对**（旧 MLY 记录值 0x27D7A60 已换算 0x27E7A60，
     与旧符号表资产锚定一致，实测兼容）；
   - calib 泄漏锚从 `_stext` 改为 `_text`；ksupatch 离线表模式显式传 `--link/--slide`；
   - 符号表 / 自制模块 / KSU 模板三件 APK 资产按内核记录选择（chain 不再写死文件名），
     未登记内核回退 6.12 默认并告警；
   - `mk_symtab.py` 重写：锚点/导出集全部从转储自身推导（无硬编码链接基址），
-    支持镜像恢复格式（无类型列），镜像表 = 导出符号 ∪ KSU UND。
+    支持镜像恢复格式（无类型列），镜像表 = 导出符号（自 `__ksymtab_*`）∪ KSU UND。
 - pwn_mod.c（lab 侧）参数化：-DOFF_TASK_CRED/-DMODULE_SIZE/-DMOD_LAYOUT_CRC/-DVERMAGIC_STR，
   默认值不变，重编与旧 module.ko 字节一致（回归验证过）。
 

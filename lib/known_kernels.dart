@@ -2,9 +2,9 @@
 ///
 /// 设计（用户要求）：
 ///   * 物理基址/链接基址是**跟内核镜像绑定**的常量，不该每次运行都去探测；
-///   * 荣耀内核的链接基址**按构建随机化**（Magic9=0xffffffc080000000，
-///     Honor600=0xffffffffb0000000），所以 textLinkBase 必须逐内核记录，
-///     不能写死在 calib/ksupatch 里；
+///   * 链接基址与 `_stext-_text` 间距逐内核记录（已标定的两个内核恰好都是
+///     linkBase=0xffffffc080000000 / gap=0x10000，但不应把它当成定律写死在
+///     calib/ksupatch 里）；
 ///   * 已知内核直接命中记录（跳过 /proc/iomem 探测）；
 ///   * 未知内核在「环境检查」阶段**拦住**，要求手填 / 提供 boot.img 计算，
 ///     手填后会按内核版本存成"自定义记录"，下次同内核直接通过。
@@ -21,7 +21,7 @@ class KnownKernel {
 
   /// 链接期 _text 虚拟地址（KASLR slide 的计算锚点：
   /// slide = 泄漏的运行时 _text − textLinkBase）。
-  /// 荣耀按构建随机化，每个内核镜像一个值。
+  /// 已标定的荣耀内核均为 0xffffffc080000000（GKI 惯例），仍逐内核记录。
   final int textLinkBase;
 
   /// selinux_state 相对 _text 的偏移（镜像 kallsyms/BTF 提取）
@@ -75,15 +75,17 @@ const List<KnownKernel> kKnownKernels = [
   // —— Honor 600 (C901E4H) · MagicOS 11.0.0.121 —— 6.6.118 android15-8
   // 标定来源：issue #1 提供的全量固件（update_full_base.zip v923615）
   //   physBase        ← xbl_config FDT（ghostlock-extract）
-  //   textLinkBase    ← 镜像 kallsyms 恢复（_text = 0xffffffffb0000000，按构建随机化）
+  //   textLinkBase    ← 镜像 kallsyms 恢复（relative_base = 0xffffffc080000000，与 MLY 同）
   //   selinux/CRC/BTF ← 镜像 kallsyms + BTF + vendor_boot 504×.ko 众数
+  //   （注意：分析镜像时必须设 GHOSTLOCK_NO_PROC_KALLSYMS=1，否则工具会
+  //    读到宿主 Linux 的 /proc/kallsyms，把 WSL 内核的符号当成目标内核的）
   KnownKernel(
     version: '6.6.118-android15-8-gc901ea41aa32-ab15981388',
     physBase: 0xA8000000,
-    textLinkBase: 0xffffffffb0000000,
-    selinuxStateOffset: 0x2BF9A60,
+    textLinkBase: 0xffffffc080000000,
+    selinuxStateOffset: 0x236A2E0,
     moduleLayoutCrc: 0x4e276f37,
-    textStextGap: 0x0,
+    textStextGap: 0x10000,
     symtabAsset: 'assets/kallsyms_6.6.118_c901.bin.gz',
     moduleAsset: 'assets/module_6.6.ko',
     ksuAsset: 'assets/ksu_template_6.6.ko.gz',

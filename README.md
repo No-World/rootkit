@@ -169,7 +169,7 @@ App 里所有与内核强绑定的东西都集中在 5 个地方，换内核就�
 |---|---|---|---|---|
 | 1 | 内核版本 token | `/proc/version` | `lib/known_kernels.dart` | 与记录不匹配 → 环境检查阶段直接拦住 |
 | 2 | **物理加载基址** | 该机 `boot.img`（`init_boot.img` **不含内核**，别拿错） | `known_kernels.dart` 加记录，或 App 内「手填物理基址」 | 别名算错 → 零写到错误地址 → 命中即 panic |
-| 2b | **链接 _text 基址**（荣耀按构建随机化，不能写死） | 镜像 kallsyms 恢复 | `KnownKernel.textLinkBase` | KASLR slide 算错 → ⑥ 离线表绑定全错 |
+| 2b | **链接 _text 基址** + `_stext-_text` 间距 | 镜像 kallsyms 恢复（`relative_base` / `_stext`） | `KnownKernel.textLinkBase` / `textStextGap` | KASLR slide 算错 → ⑥ 离线表绑定全错 |
 | 3 | `selinux_state` 偏移（_text 相对） | BTF 或镜像 kallsyms | `KnownKernel.selinuxStateOffset` | 同 2 |
 | 4 | `module_layout` CRC | 任意 vendor `.ko` 的 `__versions`（vendor_boot 504×.ko 求众数） | `koquery`（App 校准项 ④）/ 内置值 | 模块装载被拒（`no symbol version`） |
 | 5 | 离线符号表 | 一次 `/proc/kallsyms` 转储，或镜像恢复（ghostlock-extract --dump-kallsyms） | `scripts/mk_symtab.py` | ⑥ KSU 绑定失败（写不到正确函数地址） |
@@ -195,10 +195,10 @@ adb shell cat /proc/version
 KnownKernel(
   version: '6.6.118-android15-8-gc901ea41aa32-ab15981388',
   physBase: 0xA8000000,
-  textLinkBase: 0xffffffffb0000000,   // 镜像 kallsyms 恢复（每构建随机化）
-  selinuxStateOffset: 0x2BF9A60,      // _text 相对
+  textLinkBase: 0xffffffc080000000,   // 镜像 kallsyms 的 relative_base
+  selinuxStateOffset: 0x236A2E0,      // _text 相对
   moduleLayoutCrc: 0x4e276f37,
-  textStextGap: 0x0,                  // 该内核 _stext == _text
+  textStextGap: 0x10000,              // _stext = _text + 0x10000
   symtabAsset: 'assets/kallsyms_6.6.118_c901.bin.gz',
   moduleAsset: 'assets/module_6.6.ko',
   ksuAsset: 'assets/ksu_template_6.6.ko.gz',

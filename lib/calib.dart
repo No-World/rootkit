@@ -53,7 +53,7 @@ class Calibration {
   // 5) 物理基址 & selinux 别名
   int physBase = 0xC7800000;          // 本机型已验证
   int selinuxStateOffset = 0x27E7A60; // selinux_state - _text（同镜像常量）
-  int textLinkBase = 0xffffffc080000000; // 链接期 _text（荣耀按构建随机化；未知内核用默认）
+  int textLinkBase = 0xffffffc080000000; // 链接期 _text（已标定内核均为 GKI 惯例值；未知内核用默认）
   int textStextGap = 0x10000;         // _stext - _text（iomem 兑底用）
   static const int pageOffset = 0xffffff8000000000;
   static const int memStart = 0x80000000;
@@ -392,7 +392,7 @@ class Calibration {
     }
 
     // 尝试取 KASLR slide（离线表模式需要；无 root 则保持 0）
-    // slide = 运行时 _text - 链接期 _text；链接基址来自内核记录（荣耀按构建随机化，不能写死）
+    // slide = 运行时 _text - 链接期 _text；链接基址来自内核记录（不写死在算式里）
     {
       final r = await ShizukuShell.run(
           'su -c "grep -m1 -w _text /proc/kallsyms" 2>/dev/null');

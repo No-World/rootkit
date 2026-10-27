@@ -2428,7 +2428,7 @@ class RootChain extends ChangeNotifier {
     // 注意：ksupatch 的退出码 3 只表示"有 __kcfi_typeid_* 没在 kallsyms 里"（这些是模块自带的
     // 类型哈希，必须保留原值，不是错误）。所以这里不用 && 短路，仍然尝试加载并回报各自 RC。
     final slideHex = calib.textSlide.toRadixString(16);
-    // 链接基址按内核记录传给 ksupatch（荣耀按构建随机化，不能依赖内置默认）
+    // 链接基址按内核记录传给 ksupatch（不依赖 ksupatch 内置默认值）
     final linkHex = BigInt.from(calib.textLinkBase)
         .toUnsigned(64)
         .toRadixString(16);
