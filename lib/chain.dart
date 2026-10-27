@@ -1698,9 +1698,9 @@ class RootChain extends ChangeNotifier {
             .take(8)
             .map((c) => _hex(c + BigInt.from(calib.offCapBset)))
             .join(',');
-      // ★ 温度闸：permissive 刚连打 1–3 发，机身正热；原来这里直接开打，
-      // 实测 P1/P2 的落位率只有 44–47%（冷机同参数是 80%），panic 率 32–44%。
-      await _cooldownGate();
+      // P1/P2 用宽松闸：实测（2026-10-27 真机 5 轮）P1/P2 在 37–42°C 都是 try=1，
+      // 没有必要按用户档位长等；只挡 >48°C 的真正过热。
+      await _cooldownGate(relaxed: true);
       if (_stop) return;
       if (!await _ensureAwake()) {
         _log('[wake] 屏幕唤不醒，放弃本轮（doze 状态下打必亏）');
@@ -1760,8 +1760,8 @@ class RootChain extends ChangeNotifier {
       final p = _hex(c + BigInt.from(calib.offCapPermitted));
       final ch = _hex(c + BigInt.from(calib.offCapEffective));
       final list = '3:$p:$ch,3:$p:$ch,3:$p:$ch';
-      // 同上：phase1 刚打完一发，机身更热
-      await _cooldownGate();
+      // 同上：P2 也用宽松闸
+      await _cooldownGate(relaxed: true);
       if (_stop) return;
       if (!await _ensureAwake()) {
         _log('[wake] 屏幕唤不醒，放弃本轮（doze 状态下打必亏）');
@@ -2044,10 +2044,12 @@ class RootChain extends ChangeNotifier {
   /// 84–88°C 仍能命中但整发崩掉的比例明显上升 ⇒ 温度是概率打击。
 
 
-  Future<void> _cooldownGate() async {
-    final limitMc = optTempGate.limitMc;
-    final tries = optTempGate.tries;
-    final abortMc = optTempGate.abortMc;
+  /// [relaxed] 用于 phase1/phase2：实测 P1/P2 在 37–42°C 也是一发命中，
+  /// 没必要按用户档位长等；这里只挡真正过热的（>48°C 才等、60s 封顶、>58°C 放弃）。
+  Future<void> _cooldownGate({bool relaxed = false}) async {
+    final limitMc = relaxed ? 48000 : optTempGate.limitMc;
+    final tries = relaxed ? 6 : optTempGate.tries;
+    final abortMc = relaxed ? 58000 : optTempGate.abortMc;
     for (var i = 0; i < tries; i++) {
       final zoneName = readTempZoneName();
       final raw = readTempMc();      // 直读文件，不 spawn shell
