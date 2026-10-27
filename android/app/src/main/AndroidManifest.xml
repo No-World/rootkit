@@ -1,4 +1,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 更新检查：直连 GitHub REST API（api.github.com）读最新 Release。
+         越狱主流程完全不联网，这个权限只服务于「检查更新」。 -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+
     <application
         android:label="越狱助手"
         android:name="${applicationName}"
