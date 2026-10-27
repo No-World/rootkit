@@ -1676,6 +1676,15 @@ class RootChain extends ChangeNotifier {
             .take(8)
             .map((c) => _hex(c + BigInt.from(calib.offCapBset)))
             .join(',');
+      // ★ 温度闸：permissive 刚连打 1–3 发，机身正热；原来这里直接开打，
+      // 实测 P1/P2 的落位率只有 44–47%（冷机同参数是 80%），panic 率 32–44%。
+      await _cooldownGate();
+      if (_stop) return;
+      if (!await _ensureAwake()) {
+        _log('[wake] 屏幕唤不醒，放弃本轮（doze 状态下打必亏）');
+        _stop = true;
+        return;
+      }
       await _killBackground('phase1');
       await _envProbe('phase1');
       final lg = await _runShot(
@@ -1729,6 +1738,14 @@ class RootChain extends ChangeNotifier {
       final p = _hex(c + BigInt.from(calib.offCapPermitted));
       final ch = _hex(c + BigInt.from(calib.offCapEffective));
       final list = '3:$p:$ch,3:$p:$ch,3:$p:$ch';
+      // 同上：phase1 刚打完一发，机身更热
+      await _cooldownGate();
+      if (_stop) return;
+      if (!await _ensureAwake()) {
+        _log('[wake] 屏幕唤不醒，放弃本轮（doze 状态下打必亏）');
+        _stop = true;
+        return;
+      }
       await _killBackground('phase2');
       await _envProbe('phase2');
       final lg = await _runShot(

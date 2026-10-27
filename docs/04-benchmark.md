@@ -249,3 +249,36 @@ stage=phase1 temp_mc=44100 uptime=812 memfree=7310452 procs=1017 cpu=2496000 chg
 ```
 
 配合原生载荷自己的日志（`stage_done st=0 try=N leak=0x…`），可以还原每次运行的时间线。
+
+## 9. phase1 / phase2 的落位率（52 份 App 运行日志）
+
+统计口径：`stage_done st=1 … leak=0x…` = 落位成功（st=1 表示在阶段 1→2 拿到页）。
+
+| 阶段 | n | 落位成功 | 无落位 | panic |
+|---|---|---|---|---|
+| phase1（写 cap_bset） | 34 | **16（47%）** | 7 | 11（32%） |
+| phase2（写 cap_effective） | 18 | **8（44%）** | 2 | 8（44%） |
+
+对照：同一套落位代码在 permissive（阶段 0→1）冷机下有 **80%**。
+
+### 根因：phase1/phase2 原来没有温度闸
+
+`_cooldownGate()` 只在 permissive 阶段调用。P1/P2 紧跟在 permissive 之后开打——
+而 permissive 本身通常已经连跑 1–3 发重负载，机身正是最热的时候。
+结合第 5 节的温度曲线（冷机 80% → ≥50°C 42%），P1/P2 的 44–47% 与"热机开打"高度吻合，
+**不需要假设 P1/P2 有额外的机制问题**。
+
+### 已修
+
+在 phase1、phase2 开打前都补上 `_cooldownGate()` + 唤醒检查：
+
+- >44°C 先等降温（最多 3 分钟）
+- 等满仍 >55°C ⇒ 放弃本轮（打下去几乎必 panic，重启+重装 > 2 分钟）
+
+### 还需要观察的
+
+温度闸补上后 P1/P2 的真实落位率是否回到 ~80%，需要用真机跑几轮确认。
+若补了温度闸仍明显低于 permissive，再考虑 P1/P2 专属的参数：
+
+- `P645_TRY_LIST` 的候选数（phase1 现在一次交给 8 个 cred 候选，phase2 是 3 个重复）
+- `STAGE_TRIES`（phase1=8、phase2=5）
