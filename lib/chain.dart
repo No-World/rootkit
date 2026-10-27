@@ -1195,7 +1195,8 @@ class RootChain extends ChangeNotifier {
     _stage(StageId.env, StageStatus.ok,
         detail: '资产已部署 · 内核 ${calib.kernelVersion}（${_kernelSourceText()}）');
     // 排障基线：版本 / 零写落点 / 设备指纹 / KSU 管理器与 su 现状
-    _log('[diag:env] ver=$kAppVersion zero=${calib.selinuxZeroTargetHex} '
+    _log('[diag:env] ver=$kAppVersion params=${optParamSet.name}(PRE_PIPES=$prePipes) '
+        'zero=${calib.selinuxZeroTargetHex} '
         'alias=${calib.selinuxAliasHex} phys=0x${calib.physBase.toRadixString(16)}');
     await _diag('env');
     _advice();
@@ -1413,7 +1414,8 @@ class RootChain extends ChangeNotifier {
       await _killBackground('permissive');
       await _envProbe('permissive');
       await _shotMeta('permissive');
-      _log('[permissive] run ${run + 1}: 开打（约 30–60s）');
+      _log('[permissive] run ${run + 1}: 开打（约 30–60s）'
+          ' 参数集=${optParamSet.name}（PRE_PIPES=$prePipes）');
       final r = await ShizukuShell.run(
         'cd $workDir && chmod 755 x645 && $env ./x645 2>&1; echo "RC=\$?"',
         timeoutMs: 300000,
@@ -1690,7 +1692,8 @@ class RootChain extends ChangeNotifier {
     await ShizukuShell.run(_prepCmd());
     await ShizukuShell.run('pkill -9 -x x645 2>/dev/null'); // 清掉上一发可能残留的孤儿，避免两份并发污染判据
     await _shotMeta(stage.name);
-    _log('[${stage.name}] 开打 tries=$tries');
+    _log('[${stage.name}] 开打 tries=$tries 参数集=${optParamSet.name}'
+        '（PRE_PIPES=$prePipes PIPE512=64 PIPE_K=4 THRESH=32）');
     final r = await ShizukuShell.run(
       'cd $workDir && $env ./x645 2>&1; echo "RC=\$?"',
       timeoutMs: timeoutMs,
@@ -2128,7 +2131,8 @@ class RootChain extends ChangeNotifier {
   Future<void> _shotMeta(String stage) async {
     final t = readTempMc();
     final r = await ShizukuShell.run(
-        'echo "stage=$stage temp_mc=$t uptime=\$(cut -d. -f1 /proc/uptime) '
+        'echo "stage=$stage param=${optParamSet.name} pre_pipes=$prePipes temp_mc=$t '
+        'uptime=\$(cut -d. -f1 /proc/uptime) '
         'memfree=\$(grep MemFree /proc/meminfo | tr -s " " | cut -d" " -f2) '
         'procs=\$(ls /proc | grep -cE "^[0-9]") '
         // 频率与充电状态：热降频会改变竞态窗口的时间尺度，事后统计必须能分开这两者
