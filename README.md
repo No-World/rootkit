@@ -294,3 +294,18 @@ CI `build-debug` 绿了才合并。发版 = 合并进 `main` → 打 tag → 发
 | [`docs/02-architecture.md`](docs/02-architecture.md) | App 架构：Shizuku 双接口、阶段机、资产流水线、5 项自动校准、体积与失败面 |
 | [`docs/03-roadmap.md`](docs/03-roadmap.md) | 适配其他内核的步骤、rootless 路径、稳定性与风险表、明确不做/不可达的项 |
 | [`docs/04-benchmark.md`](docs/04-benchmark.md) | **实测基准**：160+ 发参数 A/B（管道页预算、喷页量、delete 线程、阈值）、成功率/panic 统计、可复现命令与判定口径，以及「温度因素被数据推翻」的更正记录 |
+
+## 许可证
+
+本仓库的**原创代码**采用 [MIT License](LICENSE)，Copyright (c) 2026 No-World。
+
+第三方组件不在此许可范围内，遵循其各自许可证：
+
+| 组件 | 许可证 |
+|---|---|
+| KernelSU（`assets/ksu_template.ko*`） | GPL-2.0 |
+| Shizuku API / Provider | Apache-2.0 |
+| flutter_svg | MIT |
+| Simple Icons（`assets/github.svg`） | CC0-1.0 |
+
+分发本项目的 APK 或二进制时，请同时遵守上述第三方许可证；尤其是 KernelSU 的 GPL-2.0 义务。
