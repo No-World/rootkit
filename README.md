@@ -272,7 +272,7 @@ python3 scripts/mk_symtab.py kallsyms_<ver>.txt assets/kallsyms_<ver>.bin.gz
 |---|---|---|
 | `assets/github.svg` | 顶栏 GitHub 猫图标 | https://github.com/simple-icons/simple-icons（CC0） |
 | 漏洞编号 CVE-2026-64560 | 内核 `posix-cpu-timers` 在 exec 竞态下的 UAF | 本项目自研 PoC，见 [`docs/01-cve-2026-64560.md`](docs/01-cve-2026-64560.md) |
-| `assets/` 下的原生载荷 | exploit / 候选探针 / 内核模块 / 加载器 / 符号表 | 本项目自行编译，源码在 [`../cve-2026-64560`](../cve-2026-64560)（同仓库另一目录） |
+| `assets/` 下的原生载荷 | exploit / 候选探针 / 内核模块 / 加载器 / 符号表 | 本项目自行编译；原生源码在本地 `../cve-2026-64560`（未随本仓库发布） |
 
 ### 本项目
 
@@ -294,3 +294,20 @@ CI `build-debug` 绿了才合并。发版 = 合并进 `main` → 打 tag → 发
 | [`docs/02-architecture.md`](docs/02-architecture.md) | App 架构：Shizuku 双接口、阶段机、资产流水线、5 项自动校准、体积与失败面 |
 | [`docs/03-roadmap.md`](docs/03-roadmap.md) | 适配其他内核的步骤、rootless 路径、稳定性与风险表、明确不做/不可达的项 |
 | [`docs/04-benchmark.md`](docs/04-benchmark.md) | **实测基准**：160+ 发参数 A/B（管道页预算、喷页量、delete 线程、阈值）、成功率/panic 统计、可复现命令与判定口径，以及「温度因素被数据推翻」的更正记录 |
+
+## 许可证
+
+本仓库的**原创代码**采用 [MIT License](LICENSE)，Copyright (c) 2026 No-World。
+
+第三方组件不在此许可范围内，遵循其各自许可证：
+
+| 组件 | 许可证 |
+|---|---|
+| KernelSU（`assets/ksu_template.ko*`） | GPL-2.0；对应源码、修改工具与 NOTICE 见 [`third_party/kernelsu/`](third_party/kernelsu/) |
+| Shizuku API / Provider | Apache-2.0 |
+| flutter_svg | MIT |
+| Simple Icons（`assets/github.svg`） | CC0-1.0 |
+
+分发本项目的 APK 或二进制时，请同时遵守上述第三方许可证；尤其是 KernelSU 的 GPL-2.0 义务。
+
+`assets/ksu_template.ko` 是 KernelSU v3.3.1 的官方 LKM（SHA256 `7e25d68419d08535d35e3630d9f0ff1a08e97a7026d36e878991eecb13554d9f`），本仓库的 `third_party/kernelsu/source/kernel/` 是其完整对应源码；APK 内也随包携带 `assets/third_party/kernelsu/COPYING` 与 `NOTICE`。

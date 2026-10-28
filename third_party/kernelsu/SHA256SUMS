@@ -1,0 +1,5 @@
+# KernelSU v3.3.1 LKM distributed by this repository
+# Upstream source tarball SHA256:
+# c5fae490867afe789b15805b3839578db0e295ea59a75040b95829ec7e475c52
+7e25d68419d08535d35e3630d9f0ff1a08e97a7026d36e878991eecb13554d9f  assets/ksu_template.ko
+d49ab5e61cee71f3638e87510bfd110383c8804f3c57da4879fc805e07caee13  assets/ksu_template.ko.gz

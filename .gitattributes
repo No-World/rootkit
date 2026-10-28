@@ -1,0 +1,3 @@
+# KernelSU GPL source: keep LF so kernel build scripts work on Linux.
+third_party/kernelsu/** text eol=lf
+assets/third_party/kernelsu/** text eol=lf

@@ -896,6 +896,17 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
+  /// 打开 KernelSU GPL-2.0 合规材料（源码/NOTICE）
+  Future<void> _openThirdPartyKsu() async {
+    const url = '$kRepoUrl/tree/main/third_party/kernelsu';
+    final ok = await ShizukuShell.openUrl(url);
+    if (!ok && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('没有可用的浏览器，请手动访问 $url')),
+      );
+    }
+  }
+
   // ===================== 更新检查（GitHub Release） =====================
   // 约定（见 chain.busy 注释）：跑链期间一律不检查、不弹窗 ——
   // 网络请求 / shell spawn 都可能干扰竞态窗口。
@@ -1334,6 +1345,20 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     onTap: () {
                       Navigator.of(ctx).pop();
                       _openRepo();
+                    },
+                  ),
+                  ListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    leading: const Icon(Icons.description_outlined, size: 20),
+                    title: const Text('第三方许可证 / KernelSU (GPL-2.0)',
+                        style: TextStyle(fontSize: 14)),
+                    subtitle: const Text('对应源码与 NOTICE',
+                        style: TextStyle(fontSize: 11)),
+                    trailing: const Icon(Icons.open_in_new_rounded, size: 16),
+                    onTap: () {
+                      Navigator.of(ctx).pop();
+                      _openThirdPartyKsu();
                     },
                   ),
                 ],

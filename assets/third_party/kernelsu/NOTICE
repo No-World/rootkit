@@ -1,0 +1,58 @@
+KernelSU
+========
+
+Copyright (C) KernelSU contributors
+Author: weishu
+Upstream: https://github.com/tiann/KernelSU
+License: GNU General Public License v2.0 (see COPYING)
+
+Distributed binary
+------------------
+
+File:    assets/ksu_template.ko
+Origin:  KernelSU v3.3.1 release asset
+URL:     https://github.com/tiann/KernelSU/releases/download/v3.3.1/lkm-aarch64-android16-6.12_kernelsu.ko
+SHA256:  7e25d68419d08535d35e3630d9f0ff1a08e97a7026d36e878991eecb13554d9f
+
+The file in this repository is byte-identical to the official v3.3.1 asset.
+The gzip copy `assets/ksu_template.ko.gz` has SHA256
+d49ab5e61cee71f3638e87510bfd110383c8804f3c57da4879fc805e07caee13.
+
+Corresponding source
+--------------------
+
+Tag:             v3.3.1
+Commit:          0c0fdb960178fa12d80d6cbcfdcb6ad8be6a865d
+Tarball:         https://github.com/tiann/KernelSU/archive/refs/tags/v3.3.1.tar.gz
+Tarball SHA256:  c5fae490867afe789b15805b3839578db0e295ea59a75040b95829ec7e475c52
+Included source: third_party/kernelsu/source/kernel/ (in the project repository,
+                 not inside the APK)
+License:         third_party/kernelsu/COPYING (GPL-2.0)
+
+Modifications
+-------------
+
+The shipped `.ko` is byte-identical to the official v3.3.1 asset. No changes
+were made to the KernelSU source in this repository.
+
+At runtime, RootKit's MIT-licensed tools modify the loaded image:
+
+- `tools/ksupatch.c` rewrites undefined symbol entries to `SHN_ABS` addresses
+  from the target kernel's symbol table.
+- `tools/modload.c` calls `finit_module`.
+
+These tools are not part of KernelSU and are not required to build the LKM.
+
+Target kernel symbol data
+-------------------------
+
+`assets/kallsyms_6.12.58.bin.gz` is generated from the target device's
+`/proc/kallsyms` and is used only for symbol resolution. It is not part of
+KernelSU. The corresponding kernel source is available from the device
+vendor's GPL source release.
+
+Project repository
+------------------
+
+https://github.com/No-World/rootkit
+Compliance materials: https://github.com/No-World/rootkit/tree/main/third_party/kernelsu

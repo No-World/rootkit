@@ -71,6 +71,8 @@ flutter:
     - assets/qr_wechat.png
     - assets/qr_alipay.png
     - assets/github.svg
+    - assets/third_party/kernelsu/COPYING
+    - assets/third_party/kernelsu/NOTICE
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images

@@ -1,5 +1,8 @@
 #!/bin/bash
-# prepare_assets.sh — 本地生成 APK 需要的原生载荷（这些文件不入公开仓库）
+# prepare_assets.sh — 本地生成 APK 需要的原生载荷
+#
+# 原生源码在 ../cve-2026-64560/（未随本仓库发布）；仓库内保留预编译产物，
+# 便于 CI/直接构建。第三方许可见 third_party/kernelsu/。
 #
 # 依赖（相对本仓库）：../cve-2026-64560/ 下的源码与二进制
 #   exploit_64560_arw.c → x645        （CVE-2026-64560 利用器）
