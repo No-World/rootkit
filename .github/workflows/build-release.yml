@@ -63,6 +63,10 @@ jobs:
 
       - run: flutter pub get
 
+      # 离线符号表按当前 KSU LKM 的 UND 清单裁剪（全量源存档在 assets/symtab_src/）
+      - name: Build offline symbol tables
+        run: bash scripts/build_symtabs.sh
+
       - name: Build release APK (arm64)
         env:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}

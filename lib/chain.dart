@@ -11,6 +11,7 @@ import 'package:flutter/services.dart' show rootBundle;
 import 'version.dart';
 
 import 'calib.dart';
+import 'known_kernels.dart';
 import 'shizuku.dart';
 
 /// 参数集（对应 PRE_PIPES）
@@ -1137,6 +1138,16 @@ class RootChain extends ChangeNotifier {
 
     _stage(StageId.env, StageStatus.running, detail: '部署资产…');
 
+    // 首跑时 calib.kernelVersion 可能还没探过 —— 资产选择需要它，先补读一次 /proc/version
+    if (calib.kernelVersion.isEmpty) {
+      final v = await ShizukuShell.run('cat /proc/version');
+      final tok = parseKernelVersion(v.all);
+      if (tok.isNotEmpty) {
+        calib.kernelVersion = tok;
+        _log('[env] 内核版本（预读）：$tok');
+      }
+    }
+
     // 755：属主是 shell（可写），其他 App 不可替换（否则任何 App 都能替换 ksupatch/ksu_template 实现提权）
     final r = await ShizukuShell.run(
         'mkdir -p $workDir && chmod 755 $workDir && echo MKDIR_OK');
@@ -1145,16 +1156,25 @@ class RootChain extends ChangeNotifier {
       _stage(StageId.env, StageStatus.failed, detail: '目录不可写');
       return;
     }
-    // 原生件在 APK 里以 gzip 存放（省 ~2MB 体积），部署时解压
-    const assets = {
+    // 原生件在 APK 里以 gzip 存放（省 ~2MB 体积），部署时解压。
+    // 与内核强绑定的三件（符号表 / 自制模块 / KSU LKM 模板）按内核记录选择；
+    // 未登记内核回退到 6.12 默认资产（大概率在模块装载处被拒，klog 会给出明确原因）。
+    final knownK = lookupKernel(calib.kernelVersion);
+    final moduleAsset = knownK?.moduleAsset ?? 'assets/module.ko';
+    final ksuAsset = knownK?.ksuAsset ?? 'assets/ksu_template.ko.gz';
+    final symtabAsset = knownK?.symtabAsset ?? 'assets/kallsyms_6.12.58.bin.gz';
+    if (knownK == null && calib.kernelVersion.isNotEmpty) {
+      _log('[env] 未登记内核 ${calib.kernelVersion}：使用默认 6.12 资产（自制模块/KSU 模板可能不匹配）');
+    }
+    final assets = {
       'assets/x645.gz': 'x645',
       'assets/pc.gz': 'pc',
-      'assets/module.ko': 'module.ko',
+      moduleAsset: 'module.ko',
       'assets/ml2.gz': 'ml2',
       'assets/ksupatch.gz': 'ksupatch',
-      'assets/ksu_template.ko.gz': 'ksu_template.ko',
+      ksuAsset: 'ksu_template.ko',
       'assets/koquery.gz': 'koquery',
-      'assets/kallsyms_6.12.58.bin.gz': 'ksyms.bin.gz',
+      symtabAsset: 'ksyms.bin.gz',
     };
     for (final e in assets.entries) {
       if (_stop) return;
@@ -2408,13 +2428,17 @@ class RootChain extends ChangeNotifier {
     // 注意：ksupatch 的退出码 3 只表示"有 __kcfi_typeid_* 没在 kallsyms 里"（这些是模块自带的
     // 类型哈希，必须保留原值，不是错误）。所以这里不用 && 短路，仍然尝试加载并回报各自 RC。
     final slideHex = calib.textSlide.toRadixString(16);
+    // 链接基址按内核记录传给 ksupatch（不依赖 ksupatch 内置默认值）
+    final linkHex = BigInt.from(calib.textLinkBase)
+        .toUnsigned(64)
+        .toRadixString(16);
     final cmd = 'cd $workDir; chmod 755 ksupatch ml2 ksu_template.ko; '
         // ① 常规：读 /proc/kallsyms 真地址（需要能读，通常 root）
         'echo 0 > /proc/sys/kernel/kptr_restrict 2>/dev/null; '
         'rm -f ksu_run.ko; ./ksupatch ksu_template.ko ksu_run.ko; echo PATCH_RC=\$?; '
-        // ② 兜底：离线符号表 + KASLR slide（不需要 root / 不需要 kptr_restrict）
+        // ② 兜底：离线符号表（_text 锚定）+ KASLR slide（不需要 root / 不需要 kptr_restrict）
         'if [ ! -s ksu_run.ko ]; then gzip -dc ksyms.bin.gz > /tmp/ksyms.txt; '
-        './ksupatch ksu_template.ko ksu_run.ko --table /tmp/ksyms.txt --slide $slideHex; fi; '
+        './ksupatch ksu_template.ko ksu_run.ko --table /tmp/ksyms.txt --link 0x$linkHex --slide 0x$slideHex; fi; '
         'echo PATCH_RC2=\$?; '
         './ml2 ksu_run.ko allow_shell=1; echo LOAD_RC=\$?; '
         'grep -c kernelsu /proc/modules; dmesg | grep -i kernelsu | tail -6';

@@ -54,8 +54,11 @@ KSU 加载成功后自动跳转 KernelSU。
 
 ## 2. 环境要求
 
-- 设备：**仅本机内核镜像** —— 荣耀 Magic9（MLY-AN00），
-  `6.12.58-android16-6-g3a7ac1674240-abogki541502914`（MagicOS 11.0.0.110 / ASB-2026-09）。
+- 设备：**已标定两套内核镜像**（资产与常量按内核自动选择）：
+  - 荣耀 Magic9（MLY-AN00），`6.12.58-android16-6-g3a7ac1674240-abogki541502914`
+    （MagicOS 11.0.0.110 / ASB-2026-09）—— 真机验证过；
+  - **荣耀 Honor 600（C901E4H），`6.6.118-android15-8-gc901ea41aa32-ab15981388`**
+    （MagicOS 11.0.0.121，issue #1）—— 离线标定，**待真机复核**。
   - 判据是**完整 vermagic 字符串**，不是"6.12.58"这个大版本：
     同型号 OTA 换了内核构建号、或其它荣耀机型的 6.12.58，都会因为
     `physBase` / `selinux_state` 偏移 / 模块 vermagic / 离线符号表 不同而**在「环境检查」被拦住**；
@@ -166,9 +169,14 @@ App 里所有与内核强绑定的东西都集中在 5 个地方，换内核就�
 |---|---|---|---|---|
 | 1 | 内核版本 token | `/proc/version` | `lib/known_kernels.dart` | 与记录不匹配 → 环境检查阶段直接拦住 |
 | 2 | **物理加载基址** | 该机 `boot.img`（`init_boot.img` **不含内核**，别拿错） | `known_kernels.dart` 加记录，或 App 内「手填物理基址」 | 别名算错 → 零写到错误地址 → 命中即 panic |
-| 3 | `selinux_state` 偏移 | BTF 或镜像反汇编 | `KnownKernel.selinuxStateOffset` | 同上 |
-| 4 | `module_layout` CRC | 任意 vendor `.ko` 的 `__versions` | `koquery`（App 校准项 ④）/ 内置值 | 模块装载被拒（`no symbol version`） |
-| 5 | 离线符号表 | 一次 `/proc/kallsyms` 转储 | `scripts/mk_symtab.py` | ⑥ KSU 绑定失败（写不到正确函数地址） |
+| 2b | **链接 _text 基址** + `_stext-_text` 间距 | 镜像 kallsyms 恢复（`relative_base` / `_stext`） | `KnownKernel.textLinkBase` / `textStextGap` | KASLR slide 算错 → ⑥ 离线表绑定全错 |
+| 3 | `selinux_state` 偏移（_text 相对） | BTF 或镜像 kallsyms | `KnownKernel.selinuxStateOffset` | 同 2 |
+| 4 | `module_layout` CRC | 任意 vendor `.ko` 的 `__versions`（vendor_boot 504×.ko 求众数） | `koquery`（App 校准项 ④）/ 内置值 | 模块装载被拒（`no symbol version`） |
+| 5 | 离线符号表 | 一次 `/proc/kallsyms` 转储，或镜像恢复（ghostlock-extract --dump-kallsyms） | `scripts/mk_symtab.py` | ⑥ KSU 绑定失败（写不到正确函数地址） |
+| 6 | 自制模块常量（cred 偏移 / struct module 布局 / vermagic） | 镜像 BTF + banner | `pwn_mod.c` 编译期 -D（见 prepare_assets.sh） | 模块装载被拒 / uid=0 改错位置 |
+
+> 资产三件套（符号表 / 自制模块 / KSU LKM 模板）按内核记录自动选择
+> （`KnownKernel.symtabAsset/moduleAsset/ksuAsset`）；未登记内核回退 6.12 默认并告警。
 
 ### 6.1 步骤
 
@@ -185,11 +193,16 @@ adb shell cat /proc/version
 ```dart
 // lib/known_kernels.dart
 KnownKernel(
-  version: '6.12.58-android16-6-g3a7ac1674240-abogki541502914',
-  physBase: 0xC7800000,
-  selinuxStateOffset: 0x27D7A60,
-  moduleLayoutCrc: 0x797f2b3e,
-  note: 'MagicOS 11.0.0.110 (MLY-AN00)',
+  version: '6.6.118-android15-8-gc901ea41aa32-ab15981388',
+  physBase: 0xA8000000,
+  textLinkBase: 0xffffffc080000000,   // 镜像 kallsyms 的 relative_base
+  selinuxStateOffset: 0x236A2E0,      // _text 相对
+  moduleLayoutCrc: 0x4e276f37,
+  textStextGap: 0x10000,              // _stext = _text + 0x10000
+  symtabAsset: 'assets/kallsyms_6.6.118_c901.bin.gz',
+  moduleAsset: 'assets/module_6.6.ko',
+  ksuAsset: 'assets/ksu_template_6.6.ko.gz',
+  note: 'Honor 600 (C901E4H) MagicOS 11.0.0.121',
 ),
 ```
 > 未登记的内核会在「环境检查」**被拦住**，不会盲写错误地址；手填后会按内核版本存成自定义记录。
@@ -197,12 +210,32 @@ KnownKernel(
 **② 生成离线符号表**（⑥ 用）
 
 ```bash
-adb shell su -c 'cat /proc/kallsyms' > kallsyms_<ver>.txt      # 需要一次 root，或用镜像提取
+# 路径 A：真机转储（带类型列；需一次 root）
+adb shell su -c 'cat /proc/kallsyms' > kallsyms_<ver>.txt
 python3 scripts/mk_symtab.py kallsyms_<ver>.txt assets/kallsyms_<ver>.bin.gz
+
+# 路径 B：镜像恢复（无类型列；ghostlock-extract 从 boot.img 恢复，不需要真机/root）
+ghostlock-extract boot.img --skip-vuln-check --dump-kallsyms kallsyms_<ver>.txt
+KSYMS_NEED=<KSU LKM 的 UND 名单> python3 scripts/mk_symtab.py kallsyms_<ver>.txt assets/kallsyms_<ver>.bin.gz
 ```
 - 解析时**必须跳过 `[modname]` 行**：模块里的同名 static 符号会 last-wins 覆盖核心导出，
   导致 ⑥ 写到模块自己的假地址。
 - 表里有 69 个**未导出**符号（`ksupatch` 用绝对地址绑定），所以符号表是必需的，不能靠 `kallsyms_lookup_name`。
+- 锚点：偏移一律相对 `_text`（从转储自身解析，无硬编码链接基址；旧 6.12 表同锚定，实测兼容）；
+  镜像恢复路径的过滤集 = 导出符号（自 `__ksymtab_*` 推导）∪ `KSYMS_NEED`。
+- ⚠️ **分析镜像时必须设 `GHOSTLOCK_NO_PROC_KALLSYMS=1`**：否则工具会优先读宿主机
+  `/proc/kallsyms`（WSL/x86 开发机上就是宿主内核），静默把宿主符号当成目标内核的。
+  自检：恢复的 `__start_BTF` 相对 `_text` 偏移必须等于镜像内 BTF 段的真实文件偏移。
+
+**仓库与打包的分工**（v1.1.0 起）
+
+| 位置 | 内容 | 谁生成 |
+|---|---|---|
+| `assets/symtab_src/<ver>.txt.xz` | **全量** kallsyms 转储（存档，可追溯） | 人工（真机 dump 或镜像恢复） |
+| `assets/kallsyms_<ver>.bin.gz` | **按当前 KSU LKM 的 UND 清单裁剪**的最小表（几 KB） | `scripts/build_symtabs.sh`（CI 构建前自动跑） |
+
+KSU 升级/换模板后，`build_symtabs.sh` 会自动从新的 `assets/ksu_template*.ko.gz` 读 UND 重新裁剪，
+不需要手工维护符号清单；需要更大覆盖面时去掉 `--need-only` 即可退回“导出集 ∪ UND”（约 90KB）。
 
 **③ 校准 cred 布局 / tracepoint id**（App 自动，可在日志核对）
 
