@@ -2,6 +2,11 @@
 
 > 状态：整链在本机（MLY-AN00 / 6.12.58）已跑通并**在 App 内自动完成**（permissive → cred 两阶段写 →
 > 自制模块 uid=0 → KSU 装载 → `su -c id` 返回 `uid=0 … context=u:r:ksu:s0` → 自动跳转 KernelSU）。
+>
+> **第二个已验证机型：HONOR BKQ-AN10（Magic8 Pro）**，同为 `6.12.58-android16-6-g3a7ac1674240-abogki541502914-4k`。
+> 内核构建号与 MLY-AN00 逐字符一致，故 `physBase`/`selinuxStateOffset` 直接复用；整链同样落地
+> （`ksupatch` 225/225 符号、`ml2` `finit ret=0`、`su` 返回 `u:r:ksu:s0`）。
+> 该机型暴露了 `P645_LEFT` 缺失导致的"判据通过但零写入"bug，已修复，见 CHANGELOG。
 
 ## 1. 已完成（可复现）
 
