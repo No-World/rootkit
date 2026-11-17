@@ -2,9 +2,13 @@
 
 ## 未发布 — BKQ-AN10 适配修复
 - **★ 修 `permissive` 阶段「判据通过但内核零写入」（关键 bug）**：
-  载荷在构造 `fake_node` 时读的是 `P645_LEFT`（`g_left`），而 `P645_FORCE_LEFT`（`g_force_left`）
-  只在后续 stage 生效。App 之前只传 `P645_FORCE_LEFT`，于是 `fake_node.left` 恒为 `0`，
-  `mode=4` 走 `rb_left == 0` 的 case1 分支 ⇒ **race 命中、判据成立，但 `rb_erase` 不产生任何写**。
+  载荷构造 `fake_node` 时读的是 `P645_LEFT`（符号 `g_left_arg`，配置结构 `+0xA8`），
+  而 `P645_FORCE_LEFT`（`g_force_left`）要更晚一步才回填进同一个字段 —— 但 `fake_node …`
+  打印与 `WARN mode4 left==0` 判断都发生在回填**之前**。App 之前只传 `P645_FORCE_LEFT`，
+  `fake_node.left` 就可能是 `0`，`mode=4` 走 `rb_left == 0` 的 case1 分支
+  ⇒ **race 命中、判据成立，但 `rb_erase` 不产生任何写**。
+  （回填只在 `g_is_stage_child != 0` 时走，且 `g_force_left` 为 0 时会兜底成
+  `0xffffff8049fe7a60` = `selinux_state` 别名本体、不是 −7 的落点 ⇒ 永远别省 `P645_FORCE_LEFT`。）
   现场特征（stderr，容易被误读成"命中率低"）：
   ```
   fake_node mode=4 parent=0 child=0 left=0 ...
@@ -26,7 +30,13 @@
     （`cap_permitted@0x38` / `cap_effective@0x40` / `cap_bset@0x48`）——差异在尾部，改 cred 偏移是错的方向
   · 本机型 `mm_struct` = `0x4c0`(1216)、`file_operations` = `ioctl@0x50 / open@0x68 / release@0x78`
   · permissive 生效后 `kmem_cache_alloc` tracepoint id 与 `/sys/kernel/btf/vmlinux` 才变为可读
-    （Enforcing 下均 `Permission denied`），校准应放在 permissive 之后再做
+    （Enforcing 下均 `Permission denied`）。手动适配时校准要放在 permissive 之后再做；
+    App 内的自动校准跑在 env 阶段（permissive 之前），这些项读不到会**回落默认值**（UI 标 `ok`，note 里写明）
+- **整理（无行为变化）**：`_runPermissive` 与 `_runShot` 的 x645 env 串抽成 `_x645StageEnv()` ——
+  这两处以前是手抄的两份，上面那个 `P645_LEFT` 的修复就只落在其中一份上；
+  `docs/04-benchmark.md` 的复现命令补 `P645_LEFT`（原文自述"与 App 同一套 env"却缺这一项，
+  照抄会复现旧 bug）；README 的已验证机型清单补 BKQ-AN10，并注明 `-4k` 等页大小后缀按同镜像归一化；
+  `known_kernels` 的 note 不再硬编码派生值 `selinuxZeroTargetHex`（`physBase`/偏移一改就漂）
 
 ## v1.0.17 — 2026-10-26
 - **★ 开打前预建管道数 20000 → 512（真机 A/B：落位率 63% → 88%）**：

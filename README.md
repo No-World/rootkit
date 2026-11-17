@@ -59,6 +59,8 @@ KSU 加载成功后自动跳转 KernelSU。
   - 判据是**完整 vermagic 字符串**，不是"6.12.58"这个大版本：
     同型号 OTA 换了内核构建号、或其它荣耀机型的 6.12.58，都会因为
     `physBase` / `selinux_state` 偏移 / 模块 vermagic / 离线符号表 不同而**在「环境检查」被拦住**；
+    例外：只差 `-4k` / `-8k` / `-16k` 页大小后缀的按**同一镜像**处理（`lookupKernel` 会归一化），
+    但也只限已验证过的机型 —— 同镜像不等于同内存布局，能跑通要实测；
   - 想支持别的内核，按 [§6 适配其他内核](#6-适配其他内核换机型--换内核版本) 重做 5 项标定；
 - **Shizuku** 已安装并运行（无线调试启动；重启后需重新启动）；
 - **KernelSU 管理器 App 必须已安装：`v3.3.1`**
@@ -68,7 +70,8 @@ KSU 加载成功后自动跳转 KernelSU。
   **不需要点管理器里的「安装/修复」**——那是解锁后改 boot.img 的注入流程，与本路径无关：
   App 在加载完模块后会自己执行 `libksud.so install`（KernelSU 源码里管理器"安装"按钮的第二步），
   把 `/data/adb/ksud` 放好，`su` 才会被内核劫持出来（`kernel/feature/sucompat.c`）。
-  已实测同内核镜像的其它机型（荣耀 WIN RT2 / BRT-AN00）也能通过 ①–⑦。
+  已实测同内核镜像的其它机型（荣耀 WIN RT2 / BRT-AN00、荣耀 Magic8 Pro / BKQ-AN10）
+  也能通过 ①–⑦（机型清单见 [docs/03-roadmap.md](docs/03-roadmap.md) 顶部状态段）。
 - 本 App 首次运行需在 Shizuku 弹窗里授权。
 
 > 说明：App 以 **shell（uid 2000）** 身份执行（Shizuku 通道），与 `adb shell` 等价；
