@@ -7,6 +7,8 @@
 > 内核构建号与 MLY-AN00 逐字符一致，故 `physBase`/`selinuxStateOffset` 直接复用；整链同样落地
 > （`ksupatch` 225/225 符号、`ml2` `finit ret=0`、`su` 返回 `u:r:ksu:s0`）。
 > 该机型暴露了 `P645_LEFT` 缺失导致的"判据通过但零写入"bug，已修复，见 CHANGELOG。
+>
+> 另有同镜像机型（荣耀 WIN RT2 / BRT-AN00）通过 ①–⑦（未做整链）。
 
 ## 1. 已完成（可复现）
 
