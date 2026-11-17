@@ -1,6 +1,6 @@
 # 变更记录
 
-## 未发布 — BKQ-AN10 适配修复
+## v1.0.18 — 2026-11-17 — BKQ-AN10 适配修复
 - **★ 修 `permissive` 阶段「判据通过但内核零写入」（关键 bug）**：
   载荷构造 `fake_node` 时读的是 `P645_LEFT`（符号 `g_left_arg`，配置结构 `+0xA8`），
   而 `P645_FORCE_LEFT`（`g_force_left`）要更晚一步才回填进同一个字段 —— 但 `fake_node …`
