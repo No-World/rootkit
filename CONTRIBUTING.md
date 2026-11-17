@@ -83,7 +83,27 @@ git checkout main && git pull
 # 1) 改版本：pubspec.yaml 的 version: 1.0.18+10018 与 lib/version.dart 的 kAppVersion 同步改
 # 2) 写 CHANGELOG.md（新段在最上）
 # 3) 提交并走 PR 合并进 main（发版准备也走 PR）
+# 4) notes.md 末尾附「贡献者」段（只列 handle，不写各人做了什么）↓
 gh release create v1.0.18 --title "v1.0.18 —— ..." --notes-file notes.md
+```
+
+**Release notes 必须带贡献者名单**（上一条正式版到本次之间的提交作者，去重）：
+
+```bash
+# 从 GitHub 自动生成的 notes 里只抽 handle（去重、排序）
+gh api repos/No-World/rootkit/releases/generate-notes \
+  -f tag_name=v1.0.18 -f previous_tag_name=v1.0.17 --jq .body \
+  | grep -oE '@[A-Za-z0-9-]+' | sort -u
+```
+
+写成这样即可（**不写谁做了什么**，对比链接自动生成的那行照抄）：
+
+```markdown
+### 贡献者
+- @mayuxiao2021
+- @No-World
+
+**Full Changelog**: https://github.com/No-World/rootkit/compare/v1.0.17...v1.0.18
 ```
 
 - **发布 Release 才会构建签名包**：`build-release.yml` 由 `release: published` 触发，
@@ -91,6 +111,7 @@ gh release create v1.0.18 --title "v1.0.18 —— ..." --notes-file notes.md
 - **只打 tag 不发 Release ⇒ 不会构建**（tag 只是里程碑）。
 - 所以：**先合并进 `main`，再在 `main` 的提交上打 tag**；tag 指向的提交里必须有当版 workflow，
   否则 CI 用的是旧 workflow。
+- 手写的 notes **不会**自动带 GitHub 的 「What's Changed / New Contributors」—— 贡献者段要自己附（见上面的第 4 步）。
 
 ## 6. PR 检查清单
 
