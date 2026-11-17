@@ -80,10 +80,10 @@ PR 模板可点选：`?template=bugfix.md` / `feature.md` / `adaptation.md` / `c
 
 ```bash
 git checkout main && git pull
-# 1) 改版本：pubspec.yaml 的 version: 1.0.17+10017 与 lib/main.dart 的 kAppVersion 同步改
+# 1) 改版本：pubspec.yaml 的 version: 1.0.18+10018 与 lib/version.dart 的 kAppVersion 同步改
 # 2) 写 CHANGELOG.md（新段在最上）
 # 3) 提交并走 PR 合并进 main（发版准备也走 PR）
-gh release create v1.0.17 --title "v1.0.17 —— ..." --notes-file notes.md
+gh release create v1.0.18 --title "v1.0.18 —— ..." --notes-file notes.md
 ```
 
 - **发布 Release 才会构建签名包**：`build-release.yml` 由 `release: published` 触发，
