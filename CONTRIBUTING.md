@@ -25,7 +25,7 @@ git add -A && git commit -m "fix: ..."   # 3. 提交（信息写「改了什么 
 git push -u origin fix/camera-hal-nullptr
 
 gh pr create --base main --fill           # 4. 开 PR（或网页开）
-# 等 CI：build-debug 必须绿（它是唯一门禁：编译 + 8 个载荷齐全 + APK 能出）
+# 等 CI：build-debug 必须绿（它是唯一门禁：单测 + 编译 + 8 个载荷齐全 + APK 能出）
 gh pr merge --squash --delete-branch      # 5. 合并（squash，保持 main 单线可读）
 ```
 
@@ -94,7 +94,8 @@ gh release create v1.0.17 --title "v1.0.17 —— ..." --notes-file notes.md
 
 ## 6. PR 检查清单
 
-- [ ] `flutter analyze` 无新增 error（模板自带的 `test/widget_test.dart` 报错属已知，不影响）
+- [ ] `flutter analyze` 无新增 error（基线里已有的 warning 不算）
+- [ ] `flutter test` 全绿（`build-debug` 也会跑；改 env 串/纯逻辑时先本地跑一遍）
 - [ ] CI `build-debug` 绿
 - [ ] 改了原生载荷（`assets/*.gz`、`module.ko`、`ksu_template.ko`）时，同步说明改动来源与 md5
 - [ ] 改了阶段逻辑时，CHANGELOG 写清「现象 → 根因 → 修法 → 验证判据」
@@ -105,5 +106,6 @@ gh release create v1.0.17 --title "v1.0.17 —— ..." --notes-file notes.md
 - **直推 `main` 曾把带真实收款码的历史推上去**，事后只能重建历史 + 删 tag/Release。
   PR 至少留一次「合并前看得见」的机会。
 - **没有门禁时，改坏的载荷会被直接发出去**：`build-debug` 会检查 8 个载荷是否齐全，
-  少一个立即红。
+  少一个立即红；打 APK 之前还会跑 `flutter test`（纯 Dart，几秒），
+  盯 env 串 / 版本比较这类「编译能过、只在真机上炸」的逻辑。
 - **squash 合并**保证 `main` 每个提交都能独立构建（bisect 才有意义）。

@@ -91,6 +91,11 @@ jobs:
 
       - run: flutter pub get --no-precompile
 
+      # 单测：纯 Dart，不碰 Android SDK，几秒钟 —— 放在打 APK 之前，挂了就别浪费时间构建。
+      # env 串这类“编译能过、只在真机上炸”的问题（例如漏 P645_LEFT），只有这里能挡住。
+      - name: Unit tests
+        run: flutter test --no-pub
+
       # 测试包用 release 构建（AOT）而不是 debug：
       #   实测体积 app-debug.apk 157MB（artifact 71MB） vs app-release.apk 19MB ⇒ 省 3.7 倍
       # PR_TEST_BUILD=1 让 gradle 给 release 版本追加 applicationIdSuffix ".debug"；

@@ -32,8 +32,12 @@
   · permissive 生效后 `kmem_cache_alloc` tracepoint id 与 `/sys/kernel/btf/vmlinux` 才变为可读
     （Enforcing 下均 `Permission denied`）。手动适配时校准要放在 permissive 之后再做；
     App 内的自动校准跑在 env 阶段（permissive 之前），这些项读不到会**回落默认值**（UI 标 `ok`，note 里写明）
-- **整理（无行为变化）**：`_runPermissive` 与 `_runShot` 的 x645 env 串抽成 `_x645StageEnv()` ——
-  这两处以前是手抄的两份，上面那个 `P645_LEFT` 的修复就只落在其中一份上；
+- **整理（无行为变化）**：`_runPermissive` 与 `_runShot` 的 x645 env 串抽成 `lib/x645_env.dart`
+  的 `x645StageEnv()` —— 这两处以前是手抄的两份，上面那个 `P645_LEFT` 的修复就只落在其中一份上；
+  顺带补 `test/x645_env_test.dart`（漏键 / 粘键 / 重复键 / 整串 golden —— 这类问题 build 与 analyze 都发现不了）；
+- **CI 补单测门禁**：`build-debug` 现在在打 APK 之前跑 `flutter test --no-pub`（纯 Dart，几秒）。
+  同时删掉 Flutter 模板遗留的 `test/widget_test.dart`：它 `import 'package:rootkit/main.dart'` 后
+  `const MyApp()` 根本不存在，`flutter test` 直接编译失败 —— 也就是说这份单测**以前从来没跑过**。
   `docs/04-benchmark.md` 的复现命令补 `P645_LEFT`（原文自述"与 App 同一套 env"却缺这一项，
   照抄会复现旧 bug）；README 的已验证机型清单补 BKQ-AN10，并注明 `-4k` 等页大小后缀按同镜像归一化；
   `known_kernels` 的 note 不再硬编码派生值 `selinuxZeroTargetHex`（`physBase`/偏移一改就漂）
